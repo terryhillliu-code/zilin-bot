@@ -72,6 +72,48 @@ def get_history(user_id: str) -> str:
     return "\n".join(lines)
 
 
+def get_quick_status() -> str:
+    """快速获取系统状态"""
+    import subprocess
+    lines = ["📊 系统状态\n"]
+    
+    # Docker 容器
+    try:
+        result = subprocess.run(
+            "docker ps --format '{{.Names}}: {{.Status}}' | head -3",
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        lines.append("**容器:**")
+        for line in result.stdout.strip().split('\n')[:3]:
+            if line:
+                lines.append(f"  • {line}")
+    except:
+        lines.append("  • 容器状态获取失败")
+    
+    # 当前模型
+    try:
+        import json
+        config_path = os.path.expanduser("~/logs/current_model.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                data = json.load(f)
+                lines.append(f"\n**模型:** {data.get('name', '未知')}")
+    except:
+        pass
+    
+    # 磁盘
+    try:
+        result = subprocess.run(
+            "df -h / | tail -1 | awk '{print $4}'",
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        lines.append(f"**磁盘剩余:** {result.stdout.strip()}")
+    except:
+        pass
+    
+    return "\n".join(lines)
+
+
 def check_rate_limit(user_id: str) -> bool:
     """检查是否触发限流，返回 True 表示允许"""
     now = time.time()
@@ -179,9 +221,9 @@ def call_openclaw_agent(message: str, session_id: str, agent: str = "main") -> s
             return response
         else:
             error = result.stderr or result.stdout
-            return f"❌ Agent 调用失败:\n{error[:500]}"
+            return "❌ AI 暂时无法响应，请稍后重试"
     except subprocess.TimeoutExpired:
-        return "❌ 响应超时（5分钟），请稍后重试"
+        return "⏰ 响应超时，请简化问题后重试"
     except Exception as e:
         return f"❌ 调用异常: {str(e)}"
 
@@ -335,7 +377,7 @@ def analyze_image(image_path: str, question: str = None) -> str:
                         break
         
         if not api_key:
-            return "❌ 未找到 API Key"
+            return "❌ 系统配置异常，请联系管理员"
         
         # 使用自定义问题或默认问题
         prompt = question if question else "请分析这张图片，描述内容并提取关键信息。"
@@ -522,21 +564,22 @@ def process_video(text: str, message_id: str = None) -> str:
 def show_help() -> str:
     return """🤖 知微 - OpenClaw Agent
 
-【支持的消息类型】
-✅ 文字 - AI 多轮对话
-✅ 语音 - 自动转文字后对话
-✅ 图片 - AI 图片理解分析
-✅ 视频链接 - 下载并分析
+【支持的消息】
+📝 文字 - AI 多轮对话
+🖼️ 图片 - 图片分析 + 追问
+🌐 网页链接 - 自动抓取总结
+🎬 视频链接 - 抖音/YouTube/B站
 
 【命令】
-• /help - 显示帮助
-• /reset - 重置对话
-• /sync - 查看会话信息
-• m1-m8 - 切换模型
+/help - 显示帮助
+/reset - 重置对话
+/history - 查看对话记录
+/sync - 查看会话ID
+m1-m8 - 切换模型
 
 【模型】
 1-Qwen3.5  2-Coder  3-Max  4-Kimi
-5-GLM5  6-MiniMax  7-Plus  8-Max按量
+5-GLM5  6-MiniMax  7-Plus  8-Max
 
 💡 直接发消息开始对话！"""
 
@@ -615,6 +658,10 @@ def handle_text_async(text: str, user_id: str, message_id: str):
         
         if text_lower in ["/history", "历史", "/记录"]:
             reply_message(message_id, get_history(user_id))
+            return
+        
+        if text_lower in ["/status", "状态", "/状态"]:
+            reply_message(message_id, get_quick_status())
             return
         
         # 模型切换
