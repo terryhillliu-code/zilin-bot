@@ -12,6 +12,33 @@ import tempfile
 import base64
 import threading
 
+# 简单限流
+import time
+from collections import defaultdict
+
+user_last_request = defaultdict(float)
+RATE_LIMIT_SECONDS = 2
+
+# 待确认的语音转录（user_id -> text）
+pending_voice = {}
+
+# 待处理的图片（user_id -> image_path）
+pending_image = {}
+
+
+  # 每用户最少间隔2秒
+
+def check_rate_limit(user_id: str) -> bool:
+    """检查是否触发限流，返回 True 表示允许"""
+    now = time.time()
+    last = user_last_request[user_id]
+    if now - last < RATE_LIMIT_SECONDS:
+        return False
+    user_last_request[user_id] = now
+    return True
+
+
+
 # 应用凭证
 APP_ID = "cli_a9142bd071bd1bd9"
 APP_SECRET = "mlIZdNRvxpaVQIB6VQxHIee6WgW4UcPf"
@@ -47,6 +74,44 @@ def reply_message(message_id: str, text: str):
             print(f"❌ 回复失败: {response.code} - {response.msg}")
     except Exception as e:
         print(f"❌ 回复异常: {e}")
+
+
+def reply_card(message_id: str, title: str, content_text: str):
+    """用飞书卡片回复（Markdown 格式）"""
+    try:
+        if len(content_text) > 3500:
+            content_text = content_text[:3400] + "\n\n...(内容过长已截断)"
+        
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "template": "blue"
+            },
+            "elements": [
+                {"tag": "markdown", "content": content_text}
+            ]
+        }
+        
+        request = ReplyMessageRequest.builder() \
+            .message_id(message_id) \
+            .request_body(ReplyMessageRequestBody.builder()
+                .content(json.dumps(card))
+                .msg_type("interactive")
+                .build()) \
+            .build()
+        
+        response = client.im.v1.message.reply(request)
+        if response.success():
+            print(f"✅ 卡片回复成功")
+        else:
+            # 卡片失败则回退到文本
+            print(f"⚠️ 卡片失败，回退文本: {response.code}")
+            reply_message(message_id, f"{title}\n\n{content_text}")
+    except Exception as e:
+        print(f"❌ 卡片异常: {e}")
+        reply_message(message_id, f"{title}\n\n{content_text}")
+
 
 def get_session_id(user_id: str) -> str:
     return f"feishu-{user_id}"
@@ -121,7 +186,7 @@ def transcribe_audio(audio_path: str) -> str:
         print("🎤 容器内转录中...")
         result = subprocess.run([
             "/usr/local/bin/docker", "exec", "clawdbot",
-            "python3", "/root/workspace/scripts/transcribe.py", container_audio
+            "python3", "/root/workspace/scripts/transcribe_aliyun.py", container_audio
         ], capture_output=True, text=True, timeout=120)
         
         if result.returncode == 0:
@@ -147,7 +212,8 @@ def transcribe_audio(audio_path: str) -> str:
             ], capture_output=True)
 
 def handle_audio_async(message_id: str, file_key: str, user_id: str):
-    """异步处理语音消息（在线程中运行）"""
+    """异步处理语音消息 - 确认模式"""
+    global pending_voice
     try:
         audio_path = download_audio(message_id, file_key)
         if not audio_path:
@@ -159,9 +225,20 @@ def handle_audio_async(message_id: str, file_key: str, user_id: str):
             reply_message(message_id, "❌ 语音转录失败，请重试")
             return
         
-        session_id = get_session_id(user_id)
-        response = call_openclaw_agent(f"[语音转文字] {text}", session_id)
-        reply_message(message_id, response)
+        # 保存待确认内容
+        pending_voice[user_id] = text
+        
+        # 回显转录结果，等待确认
+        confirm_msg = f"""🎤 语音转录结果：
+
+「{text}」
+
+请回复：
+• **ok** 或 **确认** → 执行上述内容
+• **直接输入修改后的文字** → 执行修改后的内容
+• **取消** → 放弃本次语音"""
+        
+        reply_message(message_id, confirm_msg)
     except Exception as e:
         print(f"❌ 语音处理异常: {e}")
         reply_message(message_id, f"❌ 语音处理异常: {str(e)}")
@@ -196,8 +273,8 @@ def download_image(message_id: str, image_key: str) -> str:
         print(f"❌ 图片下载异常: {e}")
         return None
 
-def analyze_image(image_path: str) -> str:
-    """调用 qwen3.5-plus 分析图片"""
+def analyze_image(image_path: str, question: str = None) -> str:
+    """调用 qwen3.5-plus 分析图片，支持自定义提问"""
     try:
         import httpx
         
@@ -216,7 +293,10 @@ def analyze_image(image_path: str) -> str:
         if not api_key:
             return "❌ 未找到 API Key"
         
-        print("🖼️ 调用 qwen3.5-plus 分析图片...")
+        # 使用自定义问题或默认问题
+        prompt = question if question else "请分析这张图片，描述内容并提取关键信息。"
+        
+        print(f"🖼️ 调用 qwen3.5-plus 分析图片... 问题: {prompt[:30]}...")
         response = httpx.post(
             "https://coding.dashscope.aliyuncs.com/v1/chat/completions",
             headers={
@@ -228,7 +308,7 @@ def analyze_image(image_path: str) -> str:
                 "messages": [{
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "请分析这张图片，描述内容并提取关键信息。"},
+                        {"type": "text", "text": prompt},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
                     ]
                 }],
@@ -240,7 +320,7 @@ def analyze_image(image_path: str) -> str:
         if response.status_code == 200:
             result = response.json()["choices"][0]["message"]["content"]
             print(f"✅ 图片分析完成: {len(result)} 字符")
-            return f"🖼️ 图片分析\n\n{result}"
+            return f"**图片分析结果**\n\n{result}"
         else:
             print(f"❌ 图片分析失败: {response.status_code} - {response.text[:200]}")
             return f"❌ 图片分析失败: {response.status_code}"
@@ -252,15 +332,20 @@ def analyze_image(image_path: str) -> str:
             os.remove(image_path)
 
 def handle_image_async(message_id: str, image_key: str, user_id: str):
-    """异步处理图片消息（在线程中运行）"""
+    """异步处理图片消息 - 支持后续追问"""
+    global pending_image
     try:
         image_path = download_image(message_id, image_key)
         if not image_path:
             reply_message(message_id, "❌ 图片下载失败，请重试")
             return
         
+        # 保存图片路径，等待用户提问
+        pending_image[user_id] = image_path
+        
+        # 先做默认分析
         response = analyze_image(image_path)
-        reply_message(message_id, response)
+        reply_message(message_id, response + "\n\n💡 你可以继续针对这张图片提问")
     except Exception as e:
         print(f"❌ 图片处理异常: {e}")
         reply_message(message_id, f"❌ 图片处理异常: {str(e)}")
@@ -281,6 +366,57 @@ def extract_video_url(text: str) -> str:
         if match:
             return match.group(1)
     return None
+
+
+def extract_article_url(text: str) -> str:
+    """提取普通网页 URL（排除视频链接）"""
+    # 排除视频平台
+    video_patterns = ['douyin.com', 'youtube.com', 'youtu.be', 'bilibili.com', 'b23.tv']
+    
+    # 匹配 URL
+    url_pattern = r'(https?://[^\s<>"{}|\^`\[\]]+)'
+    match = re.search(url_pattern, text)
+    if match:
+        url = match.group(1).rstrip('.,;:!?)')
+        # 排除视频链接
+        if not any(v in url.lower() for v in video_patterns):
+            return url
+    return None
+
+def is_article_url(text: str) -> bool:
+    return extract_article_url(text) is not None
+
+def summarize_url(url: str) -> str:
+    """调用 web-summary skill 总结网页"""
+    try:
+        print(f"🌐 抓取网页: {url}")
+        cmd = [
+            "/usr/local/bin/docker", "exec", "clawdbot",
+            "python3", "/root/workspace/skills/web-summary/websummary.py", "fetch", "--url", url
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        
+        if result.returncode != 0:
+            return f"❌ 网页抓取失败: {result.stderr[:200]}"
+        
+        content = result.stdout.strip()
+        if len(content) < 100:
+            return f"❌ 网页内容太少，无法总结"
+        
+        # 截取前8000字符避免超限
+        if len(content) > 8000:
+            content = content[:8000] + "..."
+        
+        print(f"📄 内容长度: {len(content)} 字符，调用 AI 总结...")
+        
+        # 调用 Agent 总结
+        summary_prompt = f"请总结以下网页内容，提取关键信息：\n\n{content}"
+        return summary_prompt  # 返回 prompt，由 handle_text_async 调用 Agent
+        
+    except subprocess.TimeoutExpired:
+        return "❌ 网页抓取超时"
+    except Exception as e:
+        return f"❌ 网页处理异常: {str(e)}"
 
 def is_video_url(text: str) -> bool:
     return extract_video_url(text) is not None
@@ -353,8 +489,54 @@ def show_help() -> str:
 
 def handle_text_async(text: str, user_id: str, message_id: str):
     """异步处理文本消息（在线程中运行）"""
+    global pending_voice
     try:
         text_lower = text.strip().lower()
+        
+        # 检查是否有待确认的语音
+        if user_id in pending_voice:
+            pending_text = pending_voice.pop(user_id)
+            
+            if text_lower in ["取消", "cancel", "算了"]:
+                reply_message(message_id, "✅ 已取消")
+                return
+            
+            if text_lower in ["ok", "确认", "好的", "执行", "是", "yes"]:
+                # 执行原始转录内容
+                session_id = get_session_id(user_id)
+                response = call_openclaw_agent(pending_text, session_id)
+                reply_message(message_id, response)
+                return
+            
+            # 否则使用用户输入的修改内容
+            session_id = get_session_id(user_id)
+            response = call_openclaw_agent(text, session_id)
+            reply_message(message_id, response)
+            return
+        
+        # 检查是否有待处理的图片（图片追问）
+        if user_id in pending_image:
+            image_path = pending_image[user_id]
+            if os.path.exists(image_path):
+                response = analyze_image(image_path, text)
+                reply_message(message_id, response)
+                # 保留图片，可继续追问
+                return
+            else:
+                del pending_image[user_id]
+        
+        # 网页链接（非视频）
+        if is_article_url(text):
+            url = extract_article_url(text)
+            reply_message(message_id, "🌐 正在抓取网页，请稍候...")
+            summary_prompt = summarize_url(url)
+            if summary_prompt.startswith("❌"):
+                reply_message(message_id, summary_prompt)
+                return
+            session_id = get_session_id(user_id)
+            response = call_openclaw_agent(summary_prompt, session_id)
+            reply_card(message_id, "🌐 网页总结", response)
+            return
         
         # 视频链接
         if is_video_url(text):
@@ -414,6 +596,15 @@ def do_p2_im_message_receive_v1(data) -> None:
         if message_id in processed_messages:
             return
         processed_messages.add(message_id)
+        
+        # 限流检查
+        sender = event.sender
+        temp_user_id = "unknown"
+        if sender and sender.sender_id:
+            temp_user_id = sender.sender_id.user_id or sender.sender_id.open_id or "unknown"
+        if not check_rate_limit(temp_user_id):
+            print(f"⚠️ 限流: {temp_user_id}")
+            return
         if len(processed_messages) > 1000:
             processed_messages = set(list(processed_messages)[-500:])
         
@@ -440,11 +631,8 @@ def do_p2_im_message_receive_v1(data) -> None:
                 thread.start()
         
         elif msg_type == "audio":
-            file_key = content_dict.get("file_key", "")
-            print(f"   语音: {file_key[:30]}...")
-            reply_message(message_id, "🎤 正在转录语音，请稍候...")
-            thread = threading.Thread(target=handle_audio_async, args=(message_id, file_key, user_id))
-            thread.start()
+            print(f"   语音: 暂不支持")
+            reply_message(message_id, "🎤 语音识别功能暂时关闭\n\n请直接发送文字消息，或使用飞书自带的语音转文字功能后发送")
         
         elif msg_type == "image":
             image_key = content_dict.get("image_key", "")
