@@ -763,6 +763,29 @@ def handle_text_async(text: str, user_id: str, message_id: str):
             reply_message(message_id, get_quick_status())
             return
         
+        if text_lower in ["/model", "模型", "/模型"]:
+            try:
+                import json
+                config_path = os.path.expanduser("~/logs/current_model.json")
+                if os.path.exists(config_path):
+                    with open(config_path) as f:
+                        data = json.load(f)
+                    msg = f"""🤖 当前模型
+
+**{data.get('name', '未知')}**
+• 模型ID: {data.get('model', '未知')}
+• Provider: {data.get('provider', '未知')}
+
+切换命令: m1-m8
+1-Qwen3.5  2-Coder  3-Max  4-Kimi
+5-GLM5  6-MiniMax  7-Plus  8-Max"""
+                    reply_message(message_id, msg)
+                else:
+                    reply_message(message_id, "❌ 模型配置未找到")
+            except Exception as e:
+                reply_message(message_id, f"❌ 获取模型失败: {e}")
+            return
+        
         # 模型切换
         if len(text_lower) == 2 and text_lower[0] == 'm' and text_lower[1] in "12345678":
             try:
