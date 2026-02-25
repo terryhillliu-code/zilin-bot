@@ -25,8 +25,52 @@ pending_voice = {}
 # 待处理的图片（user_id -> image_path）
 pending_image = {}
 
+# 定期清理过期图片（超过10分钟）
+def cleanup_pending_images():
+    """清理过期的待处理图片"""
+    global pending_image
+    import time
+    current_time = time.time()
+    expired = []
+    for user_id, path in pending_image.items():
+        if os.path.exists(path):
+            file_age = current_time - os.path.getmtime(path)
+            if file_age > 600:  # 10分钟
+                expired.append(user_id)
+                try:
+                    os.remove(path)
+                except:
+                    pass
+    for user_id in expired:
+        del pending_image[user_id]
+
+
 
   # 每用户最少间隔2秒
+
+# 对话历史（user_id -> [(time, role, text), ...]）
+from collections import deque
+chat_history = {}
+MAX_HISTORY = 20
+
+def add_to_history(user_id: str, role: str, text: str):
+    """添加到对话历史"""
+    import time
+    if user_id not in chat_history:
+        chat_history[user_id] = deque(maxlen=MAX_HISTORY)
+    chat_history[user_id].append((time.strftime("%H:%M"), role, text[:100]))
+
+def get_history(user_id: str) -> str:
+    """获取对话历史"""
+    if user_id not in chat_history or not chat_history[user_id]:
+        return "📜 暂无对话记录"
+    
+    lines = ["📜 最近对话记录\n"]
+    for t, role, text in chat_history[user_id]:
+        icon = "👤" if role == "user" else "🤖"
+        lines.append(f"{t} {icon} {text}...")
+    return "\n".join(lines)
+
 
 def check_rate_limit(user_id: str) -> bool:
     """检查是否触发限流，返回 True 表示允许"""
@@ -421,12 +465,21 @@ def summarize_url(url: str) -> str:
 def is_video_url(text: str) -> bool:
     return extract_video_url(text) is not None
 
-def process_video(text: str) -> str:
+def process_video(text: str, message_id: str = None) -> str:
     try:
         url = extract_video_url(text)
         if not url:
             return "❌ 未找到有效的视频链接"
         print(f"🎬 视频链接: {url}")
+        
+        # 进度更新函数
+        def update_progress(step, msg):
+            if message_id:
+                try:
+                    reply_message(message_id, f"🎬 分析中...\n\n⏳ {msg}")
+                except:
+                    pass
+        
         cmd = [
             "/usr/local/bin/docker", "exec", "clawdbot",
             "python3", "/root/workspace/skills/douyin-video-insight/insight.py",
@@ -540,8 +593,8 @@ def handle_text_async(text: str, user_id: str, message_id: str):
         
         # 视频链接
         if is_video_url(text):
-            reply_message(message_id, "🎬 正在分析视频，请稍候...")
-            response = process_video(text)
+            reply_message(message_id, "🎬 开始分析视频...\n\n⏳ 步骤1/4: 下载视频")
+            response = process_video(text, message_id)
             reply_message(message_id, response)
             return
         
@@ -560,6 +613,10 @@ def handle_text_async(text: str, user_id: str, message_id: str):
             reply_message(message_id, f"📌 会话 ID: {session_id}")
             return
         
+        if text_lower in ["/history", "历史", "/记录"]:
+            reply_message(message_id, get_history(user_id))
+            return
+        
         # 模型切换
         if len(text_lower) == 2 and text_lower[0] == 'm' and text_lower[1] in "12345678":
             try:
@@ -574,8 +631,10 @@ def handle_text_async(text: str, user_id: str, message_id: str):
             return
         
         # Agent 对话
+        add_to_history(user_id, "user", text)
         session_id = get_session_id(user_id)
         response = call_openclaw_agent(text, session_id)
+        add_to_history(user_id, "bot", response)
         reply_message(message_id, response)
     except Exception as e:
         print(f"❌ 文本处理异常: {e}")
@@ -591,6 +650,9 @@ def do_p2_im_message_receive_v1(data) -> None:
         event = data.event
         message = event.message
         message_id = message.message_id
+        
+        # 清理过期图片
+        cleanup_pending_images()
         
         # 去重
         if message_id in processed_messages:
