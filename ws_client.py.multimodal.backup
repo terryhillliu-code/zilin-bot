@@ -507,7 +507,23 @@ def do_p2_im_message_receive_v1(data) -> None:
                 response = process_message(text, user_id)
                 reply_message(message_id, response)
         
+        elif msg_type == "audio":
+            content_dict = json.loads(content_str)
+            file_key = content_dict.get("file_key", "")
+            print(f"   语音: {file_key[:30]}...")
+            
+            reply_message(message_id, "🎤 正在转录语音，请稍候...")
+            response = process_audio_message(message_id, file_key, user_id)
+            reply_message(message_id, response)
         
+        elif msg_type == "image":
+            content_dict = json.loads(content_str)
+            image_key = content_dict.get("image_key", "")
+            print(f"   图片: {image_key[:30]}...")
+            
+            reply_message(message_id, "🖼️ 正在分析图片，请稍候...")
+            response = process_image_message(message_id, image_key, user_id)
+            reply_message(message_id, response)
         
         elif msg_type == "media":
             # 视频文件（非链接）
