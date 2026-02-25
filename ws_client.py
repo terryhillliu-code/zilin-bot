@@ -23,24 +23,23 @@ RATE_LIMIT_SECONDS = 2
 pending_voice = {}
 
 # 待处理的图片（user_id -> image_path）
-pending_image = {}
+pending_image = {}  # user_id -> {'base64': data, 'path': path}
 
 # 定期清理过期图片（超过10分钟）
 def cleanup_pending_images():
-    """清理过期的待处理图片"""
+    """清理过期的待处理图片（10分钟过期）"""
     global pending_image
     import time
     current_time = time.time()
     expired = []
-    for user_id, path in pending_image.items():
-        if os.path.exists(path):
-            file_age = current_time - os.path.getmtime(path)
-            if file_age > 600:  # 10分钟
+    for user_id, data in pending_image.items():
+        if isinstance(data, dict):
+            # 新格式：{'base64': ..., 'time': ...}
+            if current_time - data.get("time", 0) > 600:
                 expired.append(user_id)
-                try:
-                    os.remove(path)
-                except:
-                    pass
+        else:
+            # 旧格式：路径字符串，直接清理
+            expired.append(user_id)
     for user_id in expired:
         del pending_image[user_id]
 
@@ -359,6 +358,92 @@ def download_image(message_id: str, image_key: str) -> str:
         print(f"❌ 图片下载异常: {e}")
         return None
 
+
+
+def compress_image_base64(image_path: str, max_size: int = 800) -> str:
+    """压缩图片并返回 base64（减少 API 调用时间）"""
+    try:
+        from PIL import Image
+        import io
+        
+        with Image.open(image_path) as img:
+            # 转换为 RGB（去除 alpha 通道）
+            if img.mode in ('RGBA', 'P'):
+                img = img.convert('RGB')
+            
+            # 等比例缩放
+            ratio = min(max_size / img.width, max_size / img.height)
+            if ratio < 1:
+                new_size = (int(img.width * ratio), int(img.height * ratio))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+            
+            # 压缩为 JPEG
+            buffer = io.BytesIO()
+            img.save(buffer, format='JPEG', quality=85)
+            compressed = buffer.getvalue()
+            
+            print(f"🖼️ 图片压缩: {os.path.getsize(image_path)} → {len(compressed)} bytes")
+            return base64.b64encode(compressed).decode()
+    except ImportError:
+        # 没有 PIL，直接读取原图
+        with open(image_path, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    except Exception as e:
+        print(f"⚠️ 压缩失败，使用原图: {e}")
+        with open(image_path, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+
+def analyze_image_base64(image_base64: str, question: str = None) -> str:
+    """直接用 base64 分析图片"""
+    try:
+        import httpx
+        
+        env_path = os.path.expanduser("~/tanwei-bot/.env")
+        api_key = None
+        if os.path.exists(env_path):
+            with open(env_path) as f:
+                for line in f:
+                    if line.startswith("CODING_PLAN_API_KEY="):
+                        api_key = line.split("=", 1)[1].strip().strip('"\'')
+                        break
+        
+        if not api_key:
+            return "❌ 系统配置异常，请联系管理员"
+        
+        prompt = question if question else "请分析这张图片，描述内容并提取关键信息。"
+        
+        print(f"🖼️ 调用 qwen3.5-plus... 问题: {prompt[:30]}...")
+        response = httpx.post(
+            "https://coding.dashscope.aliyuncs.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "qwen3.5-plus",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+                    ]
+                }],
+                "max_tokens": 2000
+            },
+            timeout=90
+        )
+        
+        if response.status_code == 200:
+            result = response.json()["choices"][0]["message"]["content"]
+            print(f"✅ 图片分析完成: {len(result)} 字符")
+            return f"**图片分析结果**\n\n{result}"
+        else:
+            print(f"❌ 图片分析失败: {response.status_code}")
+            return f"❌ 图片分析失败: {response.status_code}"
+    except Exception as e:
+        print(f"❌ 图片分析异常: {e}")
+        return f"❌ 图片分析异常: {str(e)}"
+
 def analyze_image(image_path: str, question: str = None) -> str:
     """调用 qwen3.5-plus 分析图片，支持自定义提问"""
     try:
@@ -426,11 +511,21 @@ def handle_image_async(message_id: str, image_key: str, user_id: str):
             reply_message(message_id, "❌ 图片下载失败，请重试")
             return
         
-        # 保存图片路径，等待用户提问
-        pending_image[user_id] = image_path
+        # 压缩并保存 base64（用于追问，减少 API 延迟）
+        image_base64 = compress_image_base64(image_path)
+        
+        pending_image[user_id] = {
+            "base64": image_base64,
+            "time": __import__("time").time()
+        }
         
         # 先做默认分析
-        response = analyze_image(image_path)
+        response = analyze_image_base64(image_base64)
+        
+        # 删除临时文件
+        if os.path.exists(image_path):
+            os.remove(image_path)
+        
         reply_message(message_id, response + "\n\n💡 你可以继续针对这张图片提问")
     except Exception as e:
         print(f"❌ 图片处理异常: {e}")
@@ -612,12 +707,16 @@ def handle_text_async(text: str, user_id: str, message_id: str):
         
         # 检查是否有待处理的图片（图片追问）
         if user_id in pending_image:
-            image_path = pending_image[user_id]
-            if os.path.exists(image_path):
-                response = analyze_image(image_path, text)
-                reply_message(message_id, response)
-                # 保留图片，可继续追问
-                return
+            img_data = pending_image[user_id]
+            if isinstance(img_data, dict) and "base64" in img_data:
+                # 检查是否过期（10分钟）
+                if __import__("time").time() - img_data.get("time", 0) < 600:
+                    print(f"🖼️ 图片追问: {text[:30]}...")
+                    response = analyze_image_base64(img_data["base64"], text)
+                    reply_message(message_id, response + "\n\n💡 继续追问或发送新图片")
+                    return
+                else:
+                    del pending_image[user_id]
             else:
                 del pending_image[user_id]
         
