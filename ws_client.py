@@ -10,6 +10,7 @@ import subprocess
 import os
 import tempfile
 import base64
+import threading
 
 # 应用凭证
 APP_ID = "cli_a9142bd071bd1bd9"
@@ -24,14 +25,14 @@ client = lark.Client.builder() \
     .app_secret(APP_SECRET) \
     .build()
 
+# ========== 基础工具 ==========
+
 def reply_message(message_id: str, text: str):
     """回复消息"""
     try:
         if len(text) > 4000:
             text = text[:3900] + "\n\n...(内容过长已截断)"
-        
         content = json.dumps({"text": text})
-        
         request = ReplyMessageRequest.builder() \
             .message_id(message_id) \
             .request_body(ReplyMessageRequestBody.builder()
@@ -39,19 +40,15 @@ def reply_message(message_id: str, text: str):
                 .msg_type("text")
                 .build()) \
             .build()
-        
         response = client.im.v1.message.reply(request)
-        
         if response.success():
             print(f"✅ 回复成功 ({len(text)} 字符)")
         else:
             print(f"❌ 回复失败: {response.code} - {response.msg}")
-            
     except Exception as e:
         print(f"❌ 回复异常: {e}")
 
 def get_session_id(user_id: str) -> str:
-    """获取固定会话 ID"""
     return f"feishu-{user_id}"
 
 def call_openclaw_agent(message: str, session_id: str, agent: str = "main") -> str:
@@ -65,79 +62,116 @@ def call_openclaw_agent(message: str, session_id: str, agent: str = "main") -> s
             "--session-id", session_id,
             "--timeout", "300"
         ]
-        
         print(f"🤖 调用 Agent: {agent}, session: {session_id}")
-        print(f"   消息: {message[:50]}...")
-        
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300
-        )
-        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode == 0:
             response = result.stdout.strip()
             print(f"✅ Agent 响应: {len(response)} 字符")
             return response
         else:
             error = result.stderr or result.stdout
-            print(f"❌ Agent 错误: {error[:200]}")
             return f"❌ Agent 调用失败:\n{error[:500]}"
-            
     except subprocess.TimeoutExpired:
         return "❌ 响应超时（5分钟），请稍后重试"
     except Exception as e:
-        print(f"❌ 调用异常: {e}")
         return f"❌ 调用异常: {str(e)}"
 
-def reset_session(user_id: str) -> str:
-    """重置会话"""
-    session_id = get_session_id(user_id)
-    return f"✅ 会话已重置\n\n新会话 ID: {session_id}"
+# ========== 语音处理 ==========
 
-# ========== 文件下载 ==========
-
-def download_feishu_file(file_key: str, file_type: str = "file") -> str:
-    """下载飞书文件，返回本地路径"""
+def download_audio(message_id: str, file_key: str) -> str:
+    """下载飞书语音文件"""
     try:
         from lark_oapi.api.im.v1 import GetMessageResourceRequest
-        
-        # 创建临时文件
-        suffix = ".opus" if file_type == "audio" else ".tmp"
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".opus")
         tmp_path = tmp_file.name
         tmp_file.close()
         
-        # 下载文件
         request = GetMessageResourceRequest.builder() \
-            .message_id(file_key.split(":")[0] if ":" in file_key else "dummy") \
+            .message_id(message_id) \
             .file_key(file_key) \
-            .type(file_type) \
+            .type("file") \
             .build()
-        
         response = client.im.v1.message_resource.get(request)
         
         if response.success():
             with open(tmp_path, "wb") as f:
                 f.write(response.file.read())
-            print(f"✅ 文件下载成功: {tmp_path}")
+            size = os.path.getsize(tmp_path)
+            print(f"✅ 语音下载成功: {tmp_path} ({size} bytes)")
             return tmp_path
         else:
-            print(f"❌ 下载失败: {response.code} - {response.msg}")
+            print(f"❌ 语音下载失败: {response.code} - {response.msg}")
             return None
-            
     except Exception as e:
-        print(f"❌ 下载异常: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ 语音下载异常: {e}")
         return None
 
-def download_feishu_image(message_id: str, image_key: str) -> str:
+def transcribe_audio(audio_path: str) -> str:
+    """转录语音：复制到容器 -> ffmpeg转格式 -> faster-whisper转录"""
+    container_audio = None
+    try:
+        print(f"🎤 开始转录语音: {audio_path}")
+        
+        container_audio = f"/tmp/feishu_audio_{os.path.basename(audio_path)}"
+        subprocess.run([
+            "/usr/local/bin/docker", "cp",
+            audio_path, f"clawdbot:{container_audio}"
+        ], check=True, timeout=10)
+        
+        print("🎤 容器内转录中...")
+        result = subprocess.run([
+            "/usr/local/bin/docker", "exec", "clawdbot",
+            "python3", "/root/workspace/scripts/transcribe.py", container_audio
+        ], capture_output=True, text=True, timeout=120)
+        
+        if result.returncode == 0:
+            text = result.stdout.strip()
+            print(f"✅ 转录完成: {len(text)} 字符 - {text[:50]}...")
+            return text
+        else:
+            error = result.stderr[:300] if result.stderr else "未知错误"
+            print(f"❌ 转录失败: {error}")
+            return None
+    except subprocess.TimeoutExpired:
+        print("❌ 转录超时（120秒）")
+        return None
+    except Exception as e:
+        print(f"❌ 转录异常: {e}")
+        return None
+    finally:
+        if audio_path and os.path.exists(audio_path):
+            os.remove(audio_path)
+        if container_audio:
+            subprocess.run([
+                "/usr/local/bin/docker", "exec", "clawdbot", "rm", "-f", container_audio
+            ], capture_output=True)
+
+def handle_audio_async(message_id: str, file_key: str, user_id: str):
+    """异步处理语音消息（在线程中运行）"""
+    try:
+        audio_path = download_audio(message_id, file_key)
+        if not audio_path:
+            reply_message(message_id, "❌ 语音下载失败，请重试")
+            return
+        
+        text = transcribe_audio(audio_path)
+        if not text:
+            reply_message(message_id, "❌ 语音转录失败，请重试")
+            return
+        
+        session_id = get_session_id(user_id)
+        response = call_openclaw_agent(f"[语音转文字] {text}", session_id)
+        reply_message(message_id, response)
+    except Exception as e:
+        print(f"❌ 语音处理异常: {e}")
+        reply_message(message_id, f"❌ 语音处理异常: {str(e)}")
+
+# ========== 图片处理 ==========
+
+def download_image(message_id: str, image_key: str) -> str:
     """下载飞书图片"""
     try:
         from lark_oapi.api.im.v1 import GetMessageResourceRequest
-        
         tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
         tmp_path = tmp_file.name
         tmp_file.close()
@@ -147,130 +181,29 @@ def download_feishu_image(message_id: str, image_key: str) -> str:
             .file_key(image_key) \
             .type("image") \
             .build()
-        
         response = client.im.v1.message_resource.get(request)
         
         if response.success():
             with open(tmp_path, "wb") as f:
                 f.write(response.file.read())
-            print(f"✅ 图片下载成功: {tmp_path}")
+            size = os.path.getsize(tmp_path)
+            print(f"✅ 图片下载成功: {tmp_path} ({size} bytes)")
             return tmp_path
         else:
             print(f"❌ 图片下载失败: {response.code} - {response.msg}")
             return None
-            
     except Exception as e:
         print(f"❌ 图片下载异常: {e}")
         return None
 
-# ========== 语音处理 ==========
-
-def transcribe_audio(audio_path: str) -> str:
-    """使用 faster-whisper 转录语音"""
+def analyze_image(image_path: str) -> str:
+    """调用 qwen3.5-plus 分析图片"""
     try:
-        print(f"🎤 开始转录语音: {audio_path}")
+        import httpx
         
-        # 复制文件到容器
-        container_path = f"/tmp/audio_{os.path.basename(audio_path)}"
-        subprocess.run([
-            "/usr/local/bin/docker", "cp", 
-            audio_path, f"clawdbot:{container_path}"
-        ], check=True, timeout=30)
-        
-        # 在容器内转录
-        cmd = [
-            "/usr/local/bin/docker", "exec", "clawdbot",
-            "python3", "-c", f'''
-import json
-from faster_whisper import WhisperModel
-model = WhisperModel("small", device="cpu", compute_type="int8")
-segments, _ = model.transcribe("{container_path}", language="zh", vad_filter=True)
-text = " ".join([seg.text.strip() for seg in segments])
-print(text)
-'''
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        
-        # 清理容器内文件
-        subprocess.run([
-            "/usr/local/bin/docker", "exec", "clawdbot", "rm", "-f", container_path
-        ], capture_output=True)
-        
-        if result.returncode == 0:
-            text = result.stdout.strip()
-            print(f"✅ 转录完成: {len(text)} 字符")
-            return text
-        else:
-            print(f"❌ 转录失败: {result.stderr}")
-            return None
-            
-    except subprocess.TimeoutExpired:
-        return None
-    except Exception as e:
-        print(f"❌ 转录异常: {e}")
-        return None
-    finally:
-        # 清理本地文件
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-
-def process_audio_message(message_id: str, file_key: str, user_id: str) -> str:
-    """处理语音消息"""
-    print(f"🎤 处理语音消息: {file_key[:30]}...")
-    
-    # 使用正确的方式下载语音文件
-    try:
-        from lark_oapi.api.im.v1 import GetMessageResourceRequest
-        
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".opus")
-        tmp_path = tmp_file.name
-        tmp_file.close()
-        
-        # 飞书语音文件下载
-        request = GetMessageResourceRequest.builder()             .message_id(message_id)             .file_key(file_key)             .type("file")             .build()
-        
-        response = client.im.v1.message_resource.get(request)
-        
-        if response.success():
-            with open(tmp_path, "wb") as f:
-                f.write(response.file.read())
-            print(f"✅ 语音下载成功: {tmp_path}")
-        else:
-            print(f"❌ 语音下载失败: {response.code} - {response.msg}")
-            return "❌ 语音下载失败，请重试"
-    except Exception as e:
-        print(f"❌ 语音下载异常: {e}")
-        return f"❌ 语音下载异常: {str(e)}"
-    
-    # 转录
-    text = transcribe_audio(tmp_path)
-    if not text:
-        return "❌ 语音转录失败，请重试"
-    
-    # 发送给 Agent
-    session_id = get_session_id(user_id)
-    return call_openclaw_agent(f"[语音转文字] {text}", session_id)
-
-
-def process_image_message(message_id: str, image_key: str, user_id: str) -> str:
-    """处理图片消息 - 调用支持图片的模型"""
-    print(f"🖼️ 处理图片消息: {image_key[:30]}...")
-    
-    # 下载图片
-    image_path = download_feishu_image(message_id, image_key)
-    if not image_path:
-        return "❌ 图片下载失败，请重试"
-    
-    try:
-        # 读取图片并转 base64
         with open(image_path, "rb") as f:
             image_data = base64.b64encode(f.read()).decode()
         
-        # 调用支持图片的模型 (qwen3.5-plus)
-        import httpx
-        
-        # 读取 API Key
         env_path = os.path.expanduser("~/tanwei-bot/.env")
         api_key = None
         if os.path.exists(env_path):
@@ -284,7 +217,6 @@ def process_image_message(message_id: str, image_key: str, user_id: str) -> str:
             return "❌ 未找到 API Key"
         
         print("🖼️ 调用 qwen3.5-plus 分析图片...")
-        
         response = httpx.post(
             "https://coding.dashscope.aliyuncs.com/v1/chat/completions",
             headers={
@@ -293,42 +225,49 @@ def process_image_message(message_id: str, image_key: str, user_id: str) -> str:
             },
             json={
                 "model": "qwen3.5-plus",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "请分析这张图片，描述图片内容，并提取关键信息。"},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
-                        ]
-                    }
-                ],
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "请分析这张图片，描述内容并提取关键信息。"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
+                    ]
+                }],
                 "max_tokens": 1000
             },
             timeout=60
         )
         
         if response.status_code == 200:
-            data = response.json()
-            result = data["choices"][0]["message"]["content"]
+            result = response.json()["choices"][0]["message"]["content"]
             print(f"✅ 图片分析完成: {len(result)} 字符")
             return f"🖼️ 图片分析\n\n{result}"
         else:
             print(f"❌ 图片分析失败: {response.status_code} - {response.text[:200]}")
             return f"❌ 图片分析失败: {response.status_code}"
-            
     except Exception as e:
-        print(f"❌ 图片处理异常: {e}")
-        import traceback
-        traceback.print_exc()
-        return f"❌ 图片处理异常: {str(e)}"
+        print(f"❌ 图片分析异常: {e}")
+        return f"❌ 图片分析异常: {str(e)}"
     finally:
         if os.path.exists(image_path):
             os.remove(image_path)
 
-# ========== 视频链接处理 ==========
+def handle_image_async(message_id: str, image_key: str, user_id: str):
+    """异步处理图片消息（在线程中运行）"""
+    try:
+        image_path = download_image(message_id, image_key)
+        if not image_path:
+            reply_message(message_id, "❌ 图片下载失败，请重试")
+            return
+        
+        response = analyze_image(image_path)
+        reply_message(message_id, response)
+    except Exception as e:
+        print(f"❌ 图片处理异常: {e}")
+        reply_message(message_id, f"❌ 图片处理异常: {str(e)}")
+
+# ========== 视频链接 ==========
 
 def extract_video_url(text: str) -> str:
-    """从文本中提取视频链接"""
     patterns = [
         r'(https?://v\.douyin\.com/[A-Za-z0-9]+/?)',
         r'(https?://www\.douyin\.com/video/\d+)',
@@ -337,7 +276,6 @@ def extract_video_url(text: str) -> str:
         r'(https?://(?:www\.)?bilibili\.com/video/[A-Za-z0-9]+)',
         r'(https?://b23\.tv/[A-Za-z0-9]+)'
     ]
-    
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
@@ -348,63 +286,49 @@ def is_video_url(text: str) -> bool:
     return extract_video_url(text) is not None
 
 def process_video(text: str) -> str:
-    """处理视频链接"""
     try:
         url = extract_video_url(text)
         if not url:
             return "❌ 未找到有效的视频链接"
-        
-        print(f"🎬 提取到视频链接: {url}")
-        
+        print(f"🎬 视频链接: {url}")
         cmd = [
             "/usr/local/bin/docker", "exec", "clawdbot",
             "python3", "/root/workspace/skills/douyin-video-insight/insight.py",
-            "--url", url,
-            "--whisper-model", "small"
+            "--url", url, "--whisper-model", "small"
         ]
-        
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        
         if result.returncode != 0:
-            error = result.stderr or result.stdout
-            return f"❌ 视频分析失败\n\n{error[:500]}"
-        
+            return f"❌ 视频分析失败\n\n{(result.stderr or result.stdout)[:500]}"
         output = result.stdout
-        
-        # 找报告
         timestamp_match = re.search(r'(\d{8}_\d{6})', output)
         if timestamp_match:
             timestamp = timestamp_match.group(1)
         else:
-            find_cmd = ["/usr/local/bin/docker", "exec", "clawdbot", "ls", "-t", "/root/workspace/data/douyin_cache"]
-            find_result = subprocess.run(find_cmd, capture_output=True, text=True)
+            find_result = subprocess.run(
+                ["/usr/local/bin/docker", "exec", "clawdbot", "ls", "-t", "/root/workspace/data/douyin_cache"],
+                capture_output=True, text=True
+            )
             dirs = find_result.stdout.strip().split('\n')
             timestamp = dirs[0] if dirs else None
-        
         if not timestamp:
             return "❌ 未找到分析报告"
-        
-        report_path = f"/root/workspace/data/douyin_cache/{timestamp}/report.md"
         cat_result = subprocess.run(
-            ["/usr/local/bin/docker", "exec", "clawdbot", "cat", report_path],
+            ["/usr/local/bin/docker", "exec", "clawdbot", "cat",
+             f"/root/workspace/data/douyin_cache/{timestamp}/report.md"],
             capture_output=True, text=True
         )
-        
         if cat_result.returncode != 0:
-            return f"❌ 无法读取报告"
-        
+            return "❌ 无法读取报告"
         report = cat_result.stdout
         if len(report) > 3800:
             report = report[:3700] + "\n\n...(内容过长已截断)"
-        
         return f"🎬 视频分析报告\n\n{report}"
-        
     except subprocess.TimeoutExpired:
         return "❌ 视频分析超时（10分钟）"
     except Exception as e:
         return f"❌ 视频处理异常: {str(e)}"
 
-# ========== 帮助信息 ==========
+# ========== 文本命令 ==========
 
 def show_help() -> str:
     return """🤖 知微 - OpenClaw Agent
@@ -422,52 +346,63 @@ def show_help() -> str:
 • m1-m8 - 切换模型
 
 【模型】
-1-Qwen3.5  2-Coder  3-Max  4-Kimi  
+1-Qwen3.5  2-Coder  3-Max  4-Kimi
 5-GLM5  6-MiniMax  7-Plus  8-Max按量
 
 💡 直接发消息开始对话！"""
 
-def show_sync_info(user_id: str) -> str:
-    session_id = get_session_id(user_id)
-    return f"📌 会话 ID: {session_id}"
+def handle_text_async(text: str, user_id: str, message_id: str):
+    """异步处理文本消息（在线程中运行）"""
+    try:
+        text_lower = text.strip().lower()
+        
+        # 视频链接
+        if is_video_url(text):
+            reply_message(message_id, "🎬 正在分析视频，请稍候...")
+            response = process_video(text)
+            reply_message(message_id, response)
+            return
+        
+        # 命令
+        if text_lower in ["/help", "帮助", "/帮助"]:
+            reply_message(message_id, show_help())
+            return
+        
+        if text_lower in ["/reset", "重置", "/重置", "新对话"]:
+            session_id = get_session_id(user_id)
+            reply_message(message_id, f"✅ 会话已重置\n\n新会话 ID: {session_id}")
+            return
+        
+        if text_lower in ["/sync", "同步", "/session", "会话"]:
+            session_id = get_session_id(user_id)
+            reply_message(message_id, f"📌 会话 ID: {session_id}")
+            return
+        
+        # 模型切换
+        if len(text_lower) == 2 and text_lower[0] == 'm' and text_lower[1] in "12345678":
+            try:
+                result = subprocess.run(
+                    ['/usr/local/bin/ocmodel', text_lower[1]],
+                    capture_output=True, text=True, timeout=5
+                )
+                msg = f"✅ {result.stdout.strip()}" if result.returncode == 0 else f"❌ {result.stderr}"
+                reply_message(message_id, msg)
+            except Exception as e:
+                reply_message(message_id, f"❌ 切换异常: {e}")
+            return
+        
+        # Agent 对话
+        session_id = get_session_id(user_id)
+        response = call_openclaw_agent(text, session_id)
+        reply_message(message_id, response)
+    except Exception as e:
+        print(f"❌ 文本处理异常: {e}")
+        reply_message(message_id, f"❌ 处理异常: {str(e)}")
 
-# ========== 消息处理 ==========
-
-def process_message(text: str, user_id: str) -> str:
-    """处理文本消息"""
-    text_lower = text.strip().lower()
-    
-    # 视频链接
-    if is_video_url(text):
-        return process_video(text)
-    
-    # 命令
-    if text_lower in ["/help", "帮助", "/帮助"]:
-        return show_help()
-    
-    if text_lower in ["/reset", "重置", "/重置", "新对话"]:
-        return reset_session(user_id)
-    
-    if text_lower in ["/sync", "同步", "/session", "会话"]:
-        return show_sync_info(user_id)
-    
-    # 模型切换
-    if len(text_lower) == 2 and text_lower[0] == 'm' and text_lower[1] in "12345678":
-        try:
-            result = subprocess.run(
-                ['/usr/local/bin/ocmodel', text_lower[1]],
-                capture_output=True, text=True, timeout=5
-            )
-            return f"✅ {result.stdout.strip()}" if result.returncode == 0 else f"❌ {result.stderr}"
-        except Exception as e:
-            return f"❌ 切换异常: {e}"
-    
-    # Agent 对话
-    session_id = get_session_id(user_id)
-    return call_openclaw_agent(text, session_id)
+# ========== 消息分发 ==========
 
 def do_p2_im_message_receive_v1(data) -> None:
-    """处理收到的消息"""
+    """处理收到的消息（快速返回，重活交给线程）"""
     global processed_messages
     
     try:
@@ -479,11 +414,9 @@ def do_p2_im_message_receive_v1(data) -> None:
         if message_id in processed_messages:
             return
         processed_messages.add(message_id)
-        
         if len(processed_messages) > 1000:
             processed_messages = set(list(processed_messages)[-500:])
         
-        # 获取消息信息
         msg_type = message.message_type
         content_str = message.content
         
@@ -494,30 +427,37 @@ def do_p2_im_message_receive_v1(data) -> None:
             user_id = sender.sender_id.user_id or sender.sender_id.open_id or sender.sender_id.union_id or "unknown"
         
         print(f"\n{'='*50}")
-        print(f"📨 [{msg_type}] 用户: {user_id}...")
+        print(f"📨 [{msg_type}] 用户: {str(user_id)[:10]}...")
         
-        # 根据消息类型处理
+        content_dict = json.loads(content_str)
+        
         if msg_type == "text":
-            content_dict = json.loads(content_str)
             text = content_dict.get("text", "")
             text = re.sub(r'@_user_\d+\s*', '', text).strip()
             print(f"   文本: {text[:50]}...")
-            
             if text:
-                response = process_message(text, user_id)
-                reply_message(message_id, response)
+                thread = threading.Thread(target=handle_text_async, args=(text, user_id, message_id))
+                thread.start()
         
+        elif msg_type == "audio":
+            file_key = content_dict.get("file_key", "")
+            print(f"   语音: {file_key[:30]}...")
+            reply_message(message_id, "🎤 正在转录语音，请稍候...")
+            thread = threading.Thread(target=handle_audio_async, args=(message_id, file_key, user_id))
+            thread.start()
         
+        elif msg_type == "image":
+            image_key = content_dict.get("image_key", "")
+            print(f"   图片: {image_key[:30]}...")
+            reply_message(message_id, "🖼️ 正在分析图片，请稍候...")
+            thread = threading.Thread(target=handle_image_async, args=(message_id, image_key, user_id))
+            thread.start()
         
-        elif msg_type == "media":
-            # 视频文件（非链接）
-            reply_message(message_id, "📹 暂不支持直接发送视频文件\n\n请发送视频链接（抖音/YouTube/B站）")
-        
-        elif msg_type == "file":
-            reply_message(message_id, "📁 暂不支持文件处理\n\n支持：文字 | 语音 | 图片 | 视频链接")
+        elif msg_type in ["media", "file"]:
+            reply_message(message_id, "📁 暂不支持该文件类型\n\n支持：文字 | 语音 | 图片 | 视频链接")
         
         else:
-            print(f"   ⏭️ 不支持的消息类型: {msg_type}")
+            print(f"   ⏭️ 不支持: {msg_type}")
         
         print(f"{'='*50}")
         
