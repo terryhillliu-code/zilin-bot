@@ -1,9 +1,9 @@
-from openclaw_api import OpenClawClient
 """
-知微 v2.1 - OpenClaw Agent 飞书机器人 (RAG 增强版)
-新增特性：
-- 📚 知识库检索 (RAG)：支持 /ask 命令和智能触发
-- 🧠 集成 klib 向量数据库
+知微 v2.0 - OpenClaw Agent 飞书机器人
+改造内容：
+- 三层记忆系统（工作记忆 + 摘要 + 持久记忆）
+- 意图路由（自动分发到合适的 Agent）
+- 任务日志（持久化记录）
 """
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
@@ -44,40 +44,6 @@ memory_cache = {}
 
 # 消息去重
 processed_messages = set()
-
-# ========== RAG 知识库功能 (Phase 4 新增) ==========
-
-def query_knowledge_base(query: str) -> str:
-    """调用本地知识库 (klib) 进行检索"""
-    try:
-        print(f"📚 RAG 检索: {query}")
-        # 调用 klib_query.py
-        # 注意：这里假设 klib_query.py 位于 ~/Documents/Library/
-        cmd = [
-            "python3",
-            os.path.expanduser("~/Documents/Library/klib_query.py"),
-            query
-        ]
-        
-        # 增加超时保护，防止死锁
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        
-        if result.returncode == 0:
-            output = result.stdout.strip()
-            # 简单的结果过滤
-            if "No relevant results found" in output or not output:
-                return None
-            return output
-        else:
-            print(f"❌ RAG 检索失败: {result.stderr[:200]}")
-            return None
-            
-    except subprocess.TimeoutExpired:
-        print("❌ RAG 检索超时")
-        return None
-    except Exception as e:
-        print(f"❌ RAG 调用异常: {e}")
-        return None
 
 # ========== 应用配置 ==========
 
@@ -142,7 +108,7 @@ def check_rate_limit(user_id: str) -> bool:
 
 
 def get_quick_status() -> str:
-    lines = ["📊 系统状态 (v2.1 RAG版)\n"]
+    lines = ["📊 系统状态\n"]
 
     # Docker
     try:
@@ -166,19 +132,14 @@ def get_quick_status() -> str:
                 lines.append(f"\n**模型:** {data.get('name', '未知')}")
     except:
         pass
-        
-    # 知识库状态
+
+    # 磁盘
     try:
-        lines.append("\n**知识库:**")
-        cmd = [
-            "python3", "-c",
-            "import sys,os; sys.path.append(os.path.expanduser('~/Documents/Library')); import klib_db; c=klib_db.get_db_connection(); print(c.execute('SELECT count(*) FROM books').fetchone()[0]); c.close()"
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        if res.returncode == 0:
-            lines.append(f"  • 收录书籍: {res.stdout.strip()} 本")
-        else:
-            lines.append("  • 状态未知")
+        result = subprocess.run(
+            "df -h / | tail -1 | awk '{print $4}'",
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        lines.append(f"**磁盘剩余:** {result.stdout.strip()}")
     except:
         pass
 
@@ -610,32 +571,38 @@ def transcribe_audio(audio_path: str) -> str:
 # ========== 帮助信息 ==========
 
 def show_help() -> str:
-    return """🤖 知微 v2.1 - AI 助手 (RAG增强版)
+    return """🤖 知微 v2.0 - AI 助手
 
 【智能分工】
 📝 普通对话 → 知微直接回答
-📚 知识库 → 自动触发或用 /ask
 🔍 研究分析 → 自动转给探微
 💻 编程开发 → 自动转给筑微
 📢 推送运营 → 自动转给通微
 
-【新增命令】
-/ask <问题> - 强制查询本地知识库
-/status - 查看知识库收录状态
-
-【原有支持】
+【支持的消息】
 📝 文字 - AI 多轮对话（带记忆）
 🖼️ 图片 - 图片分析 + 追问
 🌐 网页链接 - 自动抓取总结
 🎬 视频链接 - 抖音/YouTube/B站
 
-💡 直接发消息，我会自动判断是否查资料！"""
+【命令】
+/help - 显示帮助
+/reset - 重置对话和记忆
+/history - 查看对话记录
+/memory - 查看记忆状态
+/tasks - 查看任务记录
+/route <消息> - 测试路由
+/status - 系统状态
+/model - 当前模型
+m1-m8 - 切换模型
+
+💡 直接发消息开始对话！"""
 
 
 # ========== 核心：文本消息处理 ==========
 
 def handle_text_async(text: str, user_id: str, message_id: str):
-    """异步处理文本消息 - 带记忆、路由和RAG"""
+    """异步处理文本消息 - 带记忆和路由"""
     try:
         text_stripped = text.strip()
         text_lower = text_stripped.lower()
@@ -668,18 +635,6 @@ def handle_text_async(text: str, user_id: str, message_id: str):
 
         if text_lower in ["/help", "帮助", "/帮助"]:
             reply_message(message_id, show_help())
-            return
-
-        # Phase 4 新增: RAG 强制查询
-        if text_lower.startswith("/ask ") or text_lower.startswith("查 "):
-            query = text_stripped.split(" ", 1)[1]
-            reply_message(message_id, f"🔍 正在检索知识库：{query}...")
-            
-            rag_result = query_knowledge_base(query)
-            if rag_result:
-                reply_message(message_id, f"📚 **知识库结果**\n\n{rag_result}")
-            else:
-                reply_message(message_id, "❌ 知识库中未找到相关内容")
             return
 
         if text_lower in ["/reset", "重置", "/重置", "新对话"]:
@@ -779,7 +734,8 @@ def handle_text_async(text: str, user_id: str, message_id: str):
         # 6b. 获取记忆上下文
         memory = get_memory(user_id)
         context_prompt = memory.build_context_prompt()
-        
+
+
         # 6b-2. 协作链检测
         chain_name = detect_chain_intent(text_stripped)
         if chain_name:
@@ -795,32 +751,14 @@ def handle_text_async(text: str, user_id: str, message_id: str):
                 reply_message(message_id, f"❌ 协作链执行失败: {e}")
                 return
 
-        # Phase 4 新增: 智能 RAG 触发 (检测关键词)
-        # 如果问题中包含明显查资料意图，或者涉及知识库关键词，自动补充 RAG 结果
-        rag_context = ""
-        rag_triggers = ["查一下", "搜一下", "知识库", "库里", "文档", "书中", "书里"]
-        if any(keyword in text_stripped for keyword in rag_triggers):
-            reply_message(message_id, "🔍 正在自动检索知识库...")
-            rag_result = query_knowledge_base(text_stripped)
-            if rag_result:
-                rag_context = f"\n\n【本地知识库参考资料】\n{rag_result}\n"
-                print("✅ 智能 RAG 触发成功")
-
         # 6c. 意图路由
         target_agent = IntentRouter.route(text_stripped)
 
-        # 6d. 构建增强消息 (上下文 + RAG + 问题)
-        enriched_message = ""
+        # 6d. 构建增强消息
         if context_prompt:
-            enriched_message += f"{context_prompt}\n\n"
-        if rag_context:
-            enriched_message += f"{rag_context}\n\n"
-        
-        enriched_message += f"---\n当前问题: {text_stripped}"
-        
-        # 如果有 RAG 内容，强制提示 Agent 使用
-        if rag_context:
-            enriched_message += "\n(请结合参考资料回答)"
+            enriched_message = f"{context_prompt}\n\n---\n当前问题: {text_stripped}"
+        else:
+            enriched_message = text_stripped
 
         # 6e. 调用 Agent
         session_id = get_session_id(user_id)
@@ -954,19 +892,10 @@ def main():
         log_level=lark.LogLevel.INFO
     )
 
-    # P5 优化：monkey-patch _configure，防止服务端覆盖 ping 间隔
-    _original_configure = cli._configure
-    def _patched_configure(conf):
-        _original_configure(conf)
-        cli._ping_interval = 30
-        cli._reconnect_interval = 10
-        cli._reconnect_nonce = 5
-    cli._configure = _patched_configure
-
-    print("🤖 知微 v2.1 启动 (RAG增强版)")
-    print("   新增: 知识库检索 (/ask 或 '查一下')")
-    print("   特性: 三层记忆 | 意图路由 | 任务日志")
+    print("🤖 知微 v2.0 启动")
+    print("   新增: 三层记忆 | 意图路由 | 任务日志")
     print("   支持: 文字 | 图片 | 网页链接 | 视频链接")
+    print("   命令: /help | /reset | /memory | /tasks | /route")
     print("-" * 50)
 
     cli.start()
