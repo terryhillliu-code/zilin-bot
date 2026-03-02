@@ -1,0 +1,13 @@
+
+*.db
+
+*.pyc
+
+.env
+
+venv/
+
+outputs/
+
+backups/
+

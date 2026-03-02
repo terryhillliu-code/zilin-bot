@@ -1,0 +1,372 @@
+"""
+媒体处理模块
+处理图片、视频、语音和URL相关功能
+"""
+
+import os
+import re
+import tempfile
+import base64
+import threading
+import subprocess
+from typing import Optional
+
+# 导入依赖（由 ws_client.py 初始化）
+client = None
+reply_message = None
+TaskLogger = None
+pending_image = None
+time = None
+
+
+def init_media_handler(global_client, global_reply_message, global_task_logger, global_pending_image, global_time):
+    """初始化媒体处理模块的全局依赖"""
+    global client, reply_message, TaskLogger, pending_image, time
+    client = global_client
+    reply_message = global_reply_message
+    TaskLogger = global_task_logger
+    pending_image = global_pending_image
+    time = global_time
+
+
+# ========== 图片处理 ==========
+
+def download_image(message_id: str, image_key: str) -> str:
+    """下载飞书图片"""
+    try:
+        from lark_oapi.api.im.v1 import GetMessageResourceRequest
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+        tmp_path = tmp_file.name
+        tmp_file.close()
+
+        request = GetMessageResourceRequest.builder() \
+            .message_id(message_id) \
+            .file_key(image_key) \
+            .type("image") \
+            .build()
+        response = client.im.v1.message_resource.get(request)
+
+        if response.success():
+            with open(tmp_path, "wb") as f:
+                f.write(response.file.read())
+            size = os.path.getsize(tmp_path)
+            print(f"✅ 图片下载成功: {tmp_path} ({size} bytes)")
+            return tmp_path
+        else:
+            print(f"❌ 图片下载失败: {response.code} - {response.msg}")
+            return None
+    except Exception as e:
+        print(f"❌ 图片下载异常: {e}")
+        return None
+
+
+def compress_image_base64(image_path: str, max_size: int = 800) -> str:
+    """压缩图片为 base64"""
+    try:
+        from PIL import Image
+        import io
+
+        with Image.open(image_path) as img:
+            if img.mode in ('RGBA', 'P'):
+                img = img.convert('RGB')
+
+            ratio = min(max_size / img.width, max_size / img.height)
+            if ratio < 1:
+                new_size = (int(img.width * ratio), int(img.height * ratio))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+            buffer = io.BytesIO()
+            img.save(buffer, format='JPEG', quality=85)
+            compressed = buffer.getvalue()
+
+            print(f"🖼️ 图片压缩: {os.path.getsize(image_path)} → {len(compressed)} bytes")
+            return base64.b64encode(compressed).decode()
+    except ImportError:
+        with open(image_path, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    except Exception as e:
+        print(f"⚠️ 压缩失败，使用原图: {e}")
+        with open(image_path, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+
+
+def analyze_image_base64(image_base64: str, question: str = None) -> str:
+    """调用 DashScope API 分析图片"""
+    try:
+        import httpx
+
+        env_path = os.path.expanduser("~/tanwei-bot/.env")
+        api_key = None
+        if os.path.exists(env_path):
+            with open(env_path) as f:
+                for line in f:
+                    if line.startswith("CODING_PLAN_API_KEY="):
+                        api_key = line.split("=", 1)[1].strip().strip('"\'')
+                        break
+
+        if not api_key:
+            return "❌ 系统配置异常，请联系管理员"
+
+        prompt = question if question else "请分析这张图片，描述内容并提取关键信息。"
+
+        print(f"🖼️ 调用 qwen3.5-plus... 问题: {prompt[:30]}...")
+        response = httpx.post(
+            "https://coding.dashscope.aliyuncs.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "qwen3.5-plus",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+                    ]
+                }],
+                "max_tokens": 2000
+            },
+            timeout=90
+        )
+
+        if response.status_code == 200:
+            result = response.json()["choices"][0]["message"]["content"]
+            print(f"✅ 图片分析完成: {len(result)} 字符")
+            return f"🖼️ **图片分析结果**\n\n{result}"
+        else:
+            print(f"❌ 图片分析失败: {response.status_code}")
+            return f"❌ 图片分析失败: {response.status_code}"
+    except Exception as e:
+        print(f"❌ 图片分析异常: {e}")
+        return f"❌ 图片分析异常: {str(e)}"
+
+
+def handle_image_async(message_id: str, image_key: str, user_id: str):
+    """异步处理图片"""
+    try:
+        image_path = download_image(message_id, image_key)
+        if not image_path:
+            reply_message(message_id, "❌ 图片下载失败，请重试")
+            return
+
+        image_base64 = compress_image_base64(image_path)
+
+        pending_image[user_id] = {
+            "base64": image_base64,
+            "time": time.time()
+        }
+
+        response = analyze_image_base64(image_base64)
+
+        if os.path.exists(image_path):
+            os.remove(image_path)
+
+        reply_message(message_id, response + "\n\n💡 你可以继续针对这张图片提问")
+    except Exception as e:
+        print(f"❌ 图片处理异常: {e}")
+        reply_message(message_id, f"❌ 图片处理异常: {str(e)}")
+
+
+# ========== 视频链接 ==========
+
+def extract_video_url(text: str) -> str:
+    """提取视频 URL"""
+    patterns = [
+        r'(https?://v\.douyin\.com/[A-Za-z0-9]+/?)',
+        r'(https?://www\.douyin\.com/video/\d+)',
+        r'(https?://(?:www\.)?youtube\.com/watch\?v=[A-Za-z0-9_-]+)',
+        r'(https?://youtu\.be/[A-Za-z0-9_-]+)',
+        r'(https?://(?:www\.)?bilibili\.com/video/[A-Za-z0-9]+)',
+        r'(https?://b23\.tv/[A-Za-z0-9]+)'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return None
+
+
+def extract_article_url(text: str) -> str:
+    """提取文章 URL（非视频）"""
+    video_patterns = ['douyin.com', 'youtube.com', 'youtu.be', 'bilibili.com', 'b23.tv']
+    url_pattern = r'(https?://[^\s<>"{}|\^`\[\]]+)'
+    match = re.search(url_pattern, text)
+    if match:
+        url = match.group(1).rstrip('.,;:!?)')
+        if not any(v in url.lower() for v in video_patterns):
+            return url
+    return None
+
+
+def is_article_url(text: str) -> bool:
+    """判断是否为文章 URL"""
+    return extract_article_url(text) is not None
+
+
+def is_video_url(text: str) -> bool:
+    """判断是否为视频 URL"""
+    return extract_video_url(text) is not None
+
+
+def summarize_url(url: str) -> str:
+    """总结网页 URL"""
+    try:
+        print(f"🌐 抓取网页: {url}")
+        cmd = [
+            "/usr/local/bin/docker", "exec", "clawdbot",
+            "python3", "/root/workspace/skills/web-summary/websummary.py", "fetch", "--url", url
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+        if result.returncode != 0:
+            return f"❌ 网页抓取失败: {result.stderr[:200]}"
+
+        content = result.stdout.strip()
+        if len(content) < 100:
+            return f"❌ 网页内容太少，无法总结"
+
+        if len(content) > 8000:
+            content = content[:8000] + "..."
+
+        print(f"📄 内容长度: {len(content)} 字符，调用 AI 总结...")
+        summary_prompt = f"请总结以下网页内容，提取关键信息：\n\n{content}"
+        return summary_prompt
+
+    except subprocess.TimeoutExpired:
+        return "❌ 网页抓取超时"
+    except Exception as e:
+        return f"❌ 网页处理异常: {str(e)}"
+
+
+def handle_video_async(text: str, message_id: str, user_id: str):
+    """异步处理视频分析"""
+    def _process():
+        try:
+            response = process_video(text, message_id)
+            reply_message(message_id, response)
+            TaskLogger.log_task("视频分析", "完成", extract_video_url(text))
+        except Exception as e:
+            print(f"❌ 视频分析异步处理异常: {e}")
+            reply_message(message_id, f"❌ 视频分析失败: {str(e)}")
+
+    thread = threading.Thread(target=_process, daemon=True)
+    thread.start()
+
+
+def process_video(text: str, message_id: str = None) -> str:
+    """处理视频分析"""
+    try:
+        url = extract_video_url(text)
+        if not url:
+            return "❌ 未找到有效的视频链接"
+        print(f"🎬 视频链接: {url}")
+
+        cmd = [
+            "/usr/local/bin/docker", "exec", "clawdbot",
+            "python3", "/root/workspace/skills/douyin-video-insight/insight.py",
+            "--url", url, "--whisper-model", "small"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+        if result.returncode != 0:
+            return f"❌ 视频分析失败\n\n{(result.stderr or result.stdout)[:500]}"
+
+        output = result.stdout
+        timestamp_match = re.search(r'(\d{8}_\d{6})', output)
+        if timestamp_match:
+            timestamp = timestamp_match.group(1)
+        else:
+            find_result = subprocess.run(
+                ["/usr/local/bin/docker", "exec", "clawdbot", "ls", "-t",
+                 "/root/workspace/data/douyin_cache"],
+                capture_output=True, text=True
+            )
+            dirs = find_result.stdout.strip().split('\n')
+            timestamp = dirs[0] if dirs else None
+
+        if not timestamp:
+            return "❌ 未找到分析报告"
+
+        cat_result = subprocess.run(
+            ["/usr/local/bin/docker", "exec", "clawdbot", "cat",
+             f"/root/workspace/data/douyin_cache/{timestamp}/report.md"],
+            capture_output=True, text=True
+        )
+        if cat_result.returncode != 0:
+            return "❌ 无法读取报告"
+
+        report = cat_result.stdout
+        if len(report) > 3800:
+            report = report[:3700] + "\n\n...(内容过长已截断)"
+        return f"🎬 视频分析报告\n\n{report}"
+
+    except subprocess.TimeoutExpired:
+        return "❌ 视频分析超时（10分钟）"
+    except Exception as e:
+        return f"❌ 视频处理异常: {str(e)}"
+
+
+# ========== 语音处理 ==========
+
+def download_audio(message_id: str, file_key: str) -> str:
+    """下载飞书语音文件"""
+    try:
+        from lark_oapi.api.im.v1 import GetMessageResourceRequest
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".opus")
+        tmp_path = tmp_file.name
+        tmp_file.close()
+
+        request = GetMessageResourceRequest.builder() \
+            .message_id(message_id) \
+            .file_key(file_key) \
+            .type("file") \
+            .build()
+        response = client.im.v1.message_resource.get(request)
+
+        if response.success():
+            with open(tmp_path, "wb") as f:
+                f.write(response.file.read())
+            print(f"✅ 语音下载成功: {tmp_path} ({os.path.getsize(tmp_path)} bytes)")
+            return tmp_path
+        else:
+            print(f"❌ 语音下载失败: {response.code}")
+            return None
+    except Exception as e:
+        print(f"❌ 语音下载异常: {e}")
+        return None
+
+
+def transcribe_audio(audio_path: str) -> str:
+    """转录语音文件为文字"""
+    container_audio = None
+    try:
+        container_audio = f"/tmp/feishu_audio_{os.path.basename(audio_path)}"
+        subprocess.run([
+            "/usr/local/bin/docker", "cp",
+            audio_path, f"clawdbot:{container_audio}"
+        ], check=True, timeout=10)
+
+        result = subprocess.run([
+            "/usr/local/bin/docker", "exec", "clawdbot",
+            "python3", "/root/workspace/scripts/transcribe_aliyun.py", container_audio
+        ], capture_output=True, text=True, timeout=120)
+
+        if result.returncode == 0:
+            text = result.stdout.strip()
+            print(f"✅ 转录完成: {len(text)} 字符")
+            return text
+        else:
+            print(f"❌ 转录失败: {result.stderr[:300]}")
+            return None
+    except subprocess.TimeoutExpired:
+        return None
+    except Exception as e:
+        print(f"❌ 转录异常: {e}")
+        return None
+    finally:
+        if audio_path and os.path.exists(audio_path):
+            os.remove(audio_path)
+        if container_audio:
+            subprocess.run([
+                "/usr/local/bin/docker", "exec", "clawdbot", "rm", "-f", container_audio
+            ], capture_output=True)

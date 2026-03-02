@@ -153,7 +153,7 @@ class MemoryManager:
                 self.summary = ""
 
     def _get_api_key(self) -> str:
-        env_path = os.path.expanduser("~/tanwei-bot/.env")
+        env_path = os.path.expanduser("~/zhiwei-bot/.env")
         if os.path.exists(env_path):
             with open(env_path) as f:
                 for line in f:

@@ -15,6 +15,7 @@ import tempfile
 import base64
 import threading
 import time
+from pathlib import Path
 from collections import defaultdict, deque
 
 # 导入新模块
@@ -22,6 +23,20 @@ from memory_manager import MemoryManager
 from task_logger import TaskLogger
 from agent_chain import detect_chain_intent, execute_chain
 from intent_router import IntentRouter
+
+# 导入飞书 API 模块
+from feishu_api import reply_message, reply_card
+
+# 导入媒体处理模块
+from media_handler import (
+    download_image, compress_image_base64, handle_image_async,
+    extract_video_url, extract_article_url, is_article_url, is_video_url, summarize_url,
+    handle_video_async, process_video,
+    download_audio, transcribe_audio
+)
+
+# 导入命令处理模块
+from command_handler import handle_text_async, show_help, get_session_id, get_quick_status, check_rate_limit
 
 # ========== 全局状态 ==========
 
@@ -45,33 +60,61 @@ memory_cache = {}
 # 消息去重
 processed_messages = set()
 
+# 审批待确认 (T-056)
+pending_review = {}  # user_id -> task_id
+
+# 最近活跃用户 (T-056) — 持久化到文件
+FEISHU_USER_FILE = os.path.expanduser("~/tasks/.feishu_user_id")
+last_active_user = {"user_id": None}
+
+
+def save_active_user(user_id: str):
+    """持久化飞书用户 ID"""
+    last_active_user["user_id"] = user_id
+    try:
+        with open(FEISHU_USER_FILE, "w") as f:
+            f.write(user_id)
+    except Exception:
+        pass
+
+
+def load_active_user() -> str:
+    """从文件加载飞书用户 ID"""
+    try:
+        if os.path.exists(FEISHU_USER_FILE):
+            with open(FEISHU_USER_FILE) as f:
+                uid = f.read().strip()
+                if uid:
+                    last_active_user["user_id"] = uid
+                    return uid
+    except Exception:
+        pass
+    return None
+
+
 # ========== RAG 知识库功能 (Phase 4 新增) ==========
 
 def query_knowledge_base(query: str) -> str:
     """调用本地知识库 (klib) 进行检索"""
     try:
         print(f"📚 RAG 检索: {query}")
-        # 调用 klib_query.py
-        # 注意：这里假设 klib_query.py 位于 ~/Documents/Library/
         cmd = [
             "python3",
             os.path.expanduser("~/Documents/Library/klib_query.py"),
             query
         ]
-        
-        # 增加超时保护，防止死锁
+
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        
+
         if result.returncode == 0:
             output = result.stdout.strip()
-            # 简单的结果过滤
             if "No relevant results found" in output or not output:
                 return None
             return output
         else:
             print(f"❌ RAG 检索失败: {result.stderr[:200]}")
             return None
-            
+
     except subprocess.TimeoutExpired:
         print("❌ RAG 检索超时")
         return None
@@ -89,7 +132,14 @@ client = lark.Client.builder() \
     .app_secret(APP_SECRET) \
     .build()
 
-# ========== 记忆系统 ==========
+# 初始化飞书 API 模块
+from feishu_api import init_feishu_api
+init_feishu_api(client)
+
+# 初始化媒体处理模块
+from media_handler import init_media_handler
+init_media_handler(client, reply_message, TaskLogger, pending_image, time)
+
 
 def get_memory(user_id: str) -> MemoryManager:
     """获取或创建用户的记忆管理器"""
@@ -112,8 +162,6 @@ def cleanup_pending_images():
         del pending_image[user_id]
 
 
-# ========== 对话历史（轻量级展示用） ==========
-
 def add_to_history(user_id: str, role: str, text: str):
     if user_id not in chat_history:
         chat_history[user_id] = deque(maxlen=MAX_HISTORY)
@@ -129,125 +177,6 @@ def get_history(user_id: str) -> str:
         lines.append(f"{t} {icon} {text}")
     return "\n".join(lines)
 
-
-# ========== 工具函数 ==========
-
-def check_rate_limit(user_id: str) -> bool:
-    now = time.time()
-    last = user_last_request[user_id]
-    if now - last < RATE_LIMIT_SECONDS:
-        return False
-    user_last_request[user_id] = now
-    return True
-
-
-def get_quick_status() -> str:
-    lines = ["📊 系统状态 (v2.1 RAG版)\n"]
-
-    # Docker
-    try:
-        result = subprocess.run(
-            "docker ps --format '{{.Names}}: {{.Status}}' | head -3",
-            shell=True, capture_output=True, text=True, timeout=5
-        )
-        lines.append("**容器:**")
-        for line in result.stdout.strip().split('\n')[:3]:
-            if line:
-                lines.append(f"  • {line}")
-    except:
-        lines.append("  • 容器状态获取失败")
-
-    # 模型
-    try:
-        config_path = os.path.expanduser("~/logs/current_model.json")
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                data = json.load(f)
-                lines.append(f"\n**模型:** {data.get('name', '未知')}")
-    except:
-        pass
-        
-    # 知识库状态
-    try:
-        lines.append("\n**知识库:**")
-        cmd = [
-            "python3", "-c",
-            "import sys,os; sys.path.append(os.path.expanduser('~/Documents/Library')); import klib_db; c=klib_db.get_db_connection(); print(c.execute('SELECT count(*) FROM books').fetchone()[0]); c.close()"
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        if res.returncode == 0:
-            lines.append(f"  • 收录书籍: {res.stdout.strip()} 本")
-        else:
-            lines.append("  • 状态未知")
-    except:
-        pass
-
-    return "\n".join(lines)
-
-
-def get_session_id(user_id: str) -> str:
-    return f"feishu-{user_id}"
-
-
-# ========== 消息回复 ==========
-
-def reply_message(message_id: str, text: str):
-    try:
-        if len(text) > 4000:
-            text = text[:3900] + "\n\n...(内容过长已截断)"
-        content = json.dumps({"text": text})
-        request = ReplyMessageRequest.builder() \
-            .message_id(message_id) \
-            .request_body(ReplyMessageRequestBody.builder()
-                .content(content)
-                .msg_type("text")
-                .build()) \
-            .build()
-        response = client.im.v1.message.reply(request)
-        if response.success():
-            print(f"✅ 回复成功 ({len(text)} 字符)")
-        else:
-            print(f"❌ 回复失败: {response.code} - {response.msg}")
-    except Exception as e:
-        print(f"❌ 回复异常: {e}")
-
-
-def reply_card(message_id: str, title: str, content_text: str):
-    try:
-        if len(content_text) > 3500:
-            content_text = content_text[:3400] + "\n\n...(内容过长已截断)"
-
-        card = {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": title},
-                "template": "blue"
-            },
-            "elements": [
-                {"tag": "markdown", "content": content_text}
-            ]
-        }
-
-        request = ReplyMessageRequest.builder() \
-            .message_id(message_id) \
-            .request_body(ReplyMessageRequestBody.builder()
-                .content(json.dumps(card))
-                .msg_type("interactive")
-                .build()) \
-            .build()
-
-        response = client.im.v1.message.reply(request)
-        if response.success():
-            print(f"✅ 卡片回复成功")
-        else:
-            print(f"⚠️ 卡片失败，回退文本: {response.code}")
-            reply_message(message_id, f"{title}\n\n{content_text}")
-    except Exception as e:
-        print(f"❌ 卡片异常: {e}")
-        reply_message(message_id, f"{title}\n\n{content_text}")
-
-
-# ========== OpenClaw Agent 调用 ==========
 
 def call_openclaw_agent(message: str, session_id: str, agent: str = "main") -> str:
     """调用 OpenClaw Agent"""
@@ -276,591 +205,17 @@ def call_openclaw_agent(message: str, session_id: str, agent: str = "main") -> s
         return f"❌ 调用异常: {str(e)}"
 
 
-# ========== 图片处理 ==========
-
-def download_image(message_id: str, image_key: str) -> str:
-    try:
-        from lark_oapi.api.im.v1 import GetMessageResourceRequest
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-        tmp_path = tmp_file.name
-        tmp_file.close()
-
-        request = GetMessageResourceRequest.builder() \
-            .message_id(message_id) \
-            .file_key(image_key) \
-            .type("image") \
-            .build()
-        response = client.im.v1.message_resource.get(request)
-
-        if response.success():
-            with open(tmp_path, "wb") as f:
-                f.write(response.file.read())
-            size = os.path.getsize(tmp_path)
-            print(f"✅ 图片下载成功: {tmp_path} ({size} bytes)")
-            return tmp_path
-        else:
-            print(f"❌ 图片下载失败: {response.code} - {response.msg}")
-            return None
-    except Exception as e:
-        print(f"❌ 图片下载异常: {e}")
-        return None
-
-
-def compress_image_base64(image_path: str, max_size: int = 800) -> str:
-    try:
-        from PIL import Image
-        import io
-
-        with Image.open(image_path) as img:
-            if img.mode in ('RGBA', 'P'):
-                img = img.convert('RGB')
-
-            ratio = min(max_size / img.width, max_size / img.height)
-            if ratio < 1:
-                new_size = (int(img.width * ratio), int(img.height * ratio))
-                img = img.resize(new_size, Image.Resampling.LANCZOS)
-
-            buffer = io.BytesIO()
-            img.save(buffer, format='JPEG', quality=85)
-            compressed = buffer.getvalue()
-
-            print(f"🖼️ 图片压缩: {os.path.getsize(image_path)} → {len(compressed)} bytes")
-            return base64.b64encode(compressed).decode()
-    except ImportError:
-        with open(image_path, "rb") as f:
-            return base64.b64encode(f.read()).decode()
-    except Exception as e:
-        print(f"⚠️ 压缩失败，使用原图: {e}")
-        with open(image_path, "rb") as f:
-            return base64.b64encode(f.read()).decode()
-
-
-def analyze_image_base64(image_base64: str, question: str = None) -> str:
-    try:
-        import httpx
-
-        env_path = os.path.expanduser("~/tanwei-bot/.env")
-        api_key = None
-        if os.path.exists(env_path):
-            with open(env_path) as f:
-                for line in f:
-                    if line.startswith("CODING_PLAN_API_KEY="):
-                        api_key = line.split("=", 1)[1].strip().strip('"\'')
-                        break
-
-        if not api_key:
-            return "❌ 系统配置异常，请联系管理员"
-
-        prompt = question if question else "请分析这张图片，描述内容并提取关键信息。"
-
-        print(f"🖼️ 调用 qwen3.5-plus... 问题: {prompt[:30]}...")
-        response = httpx.post(
-            "https://coding.dashscope.aliyuncs.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "qwen3.5-plus",
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
-                    ]
-                }],
-                "max_tokens": 2000
-            },
-            timeout=90
-        )
-
-        if response.status_code == 200:
-            result = response.json()["choices"][0]["message"]["content"]
-            print(f"✅ 图片分析完成: {len(result)} 字符")
-            return f"🖼️ **图片分析结果**\n\n{result}"
-        else:
-            print(f"❌ 图片分析失败: {response.status_code}")
-            return f"❌ 图片分析失败: {response.status_code}"
-    except Exception as e:
-        print(f"❌ 图片分析异常: {e}")
-        return f"❌ 图片分析异常: {str(e)}"
-
-
-def handle_image_async(message_id: str, image_key: str, user_id: str):
-    try:
-        image_path = download_image(message_id, image_key)
-        if not image_path:
-            reply_message(message_id, "❌ 图片下载失败，请重试")
-            return
-
-        image_base64 = compress_image_base64(image_path)
-
-        pending_image[user_id] = {
-            "base64": image_base64,
-            "time": time.time()
-        }
-
-        response = analyze_image_base64(image_base64)
-
-        if os.path.exists(image_path):
-            os.remove(image_path)
-
-        reply_message(message_id, response + "\n\n💡 你可以继续针对这张图片提问")
-    except Exception as e:
-        print(f"❌ 图片处理异常: {e}")
-        reply_message(message_id, f"❌ 图片处理异常: {str(e)}")
-
-
-# ========== 视频链接 ==========
-
-def extract_video_url(text: str) -> str:
-    patterns = [
-        r'(https?://v\.douyin\.com/[A-Za-z0-9]+/?)',
-        r'(https?://www\.douyin\.com/video/\d+)',
-        r'(https?://(?:www\.)?youtube\.com/watch\?v=[A-Za-z0-9_-]+)',
-        r'(https?://youtu\.be/[A-Za-z0-9_-]+)',
-        r'(https?://(?:www\.)?bilibili\.com/video/[A-Za-z0-9]+)',
-        r'(https?://b23\.tv/[A-Za-z0-9]+)'
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            return match.group(1)
-    return None
-
-
-def extract_article_url(text: str) -> str:
-    video_patterns = ['douyin.com', 'youtube.com', 'youtu.be', 'bilibili.com', 'b23.tv']
-    url_pattern = r'(https?://[^\s<>"{}|\^`\[\]]+)'
-    match = re.search(url_pattern, text)
-    if match:
-        url = match.group(1).rstrip('.,;:!?)')
-        if not any(v in url.lower() for v in video_patterns):
-            return url
-    return None
-
-
-def is_article_url(text: str) -> bool:
-    return extract_article_url(text) is not None
-
-
-def is_video_url(text: str) -> bool:
-    return extract_video_url(text) is not None
-
-
-def summarize_url(url: str) -> str:
-    try:
-        print(f"🌐 抓取网页: {url}")
-        cmd = [
-            "/usr/local/bin/docker", "exec", "clawdbot",
-            "python3", "/root/workspace/skills/web-summary/websummary.py", "fetch", "--url", url
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-
-        if result.returncode != 0:
-            return f"❌ 网页抓取失败: {result.stderr[:200]}"
-
-        content = result.stdout.strip()
-        if len(content) < 100:
-            return f"❌ 网页内容太少，无法总结"
-
-        if len(content) > 8000:
-            content = content[:8000] + "..."
-
-        print(f"📄 内容长度: {len(content)} 字符，调用 AI 总结...")
-        summary_prompt = f"请总结以下网页内容，提取关键信息：\n\n{content}"
-        return summary_prompt
-
-    except subprocess.TimeoutExpired:
-        return "❌ 网页抓取超时"
-    except Exception as e:
-        return f"❌ 网页处理异常: {str(e)}"
-
-
-
-def handle_video_async(text: str, message_id: str, user_id: str):
-    """异步处理视频分析，避免阻塞主线程导致WebSocket断连"""
-    def _process():
-        try:
-            response = process_video(text, message_id)
-            reply_message(message_id, response)
-            TaskLogger.log_task("视频分析", "完成", extract_video_url(text))
-        except Exception as e:
-            print(f"❌ 视频分析异步处理异常: {e}")
-            reply_message(message_id, f"❌ 视频分析失败: {str(e)}")
-    
-    thread = threading.Thread(target=_process, daemon=True)
-    thread.start()
-
-def process_video(text: str, message_id: str = None) -> str:
-    try:
-        url = extract_video_url(text)
-        if not url:
-            return "❌ 未找到有效的视频链接"
-        print(f"🎬 视频链接: {url}")
-
-        cmd = [
-            "/usr/local/bin/docker", "exec", "clawdbot",
-            "python3", "/root/workspace/skills/douyin-video-insight/insight.py",
-            "--url", url, "--whisper-model", "small"
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
-        if result.returncode != 0:
-            return f"❌ 视频分析失败\n\n{(result.stderr or result.stdout)[:500]}"
-
-        output = result.stdout
-        timestamp_match = re.search(r'(\d{8}_\d{6})', output)
-        if timestamp_match:
-            timestamp = timestamp_match.group(1)
-        else:
-            find_result = subprocess.run(
-                ["/usr/local/bin/docker", "exec", "clawdbot", "ls", "-t",
-                 "/root/workspace/data/douyin_cache"],
-                capture_output=True, text=True
-            )
-            dirs = find_result.stdout.strip().split('\n')
-            timestamp = dirs[0] if dirs else None
-
-        if not timestamp:
-            return "❌ 未找到分析报告"
-
-        cat_result = subprocess.run(
-            ["/usr/local/bin/docker", "exec", "clawdbot", "cat",
-             f"/root/workspace/data/douyin_cache/{timestamp}/report.md"],
-            capture_output=True, text=True
-        )
-        if cat_result.returncode != 0:
-            return "❌ 无法读取报告"
-
-        report = cat_result.stdout
-        if len(report) > 3800:
-            report = report[:3700] + "\n\n...(内容过长已截断)"
-        return f"🎬 视频分析报告\n\n{report}"
-
-    except subprocess.TimeoutExpired:
-        return "❌ 视频分析超时（10分钟）"
-    except Exception as e:
-        return f"❌ 视频处理异常: {str(e)}"
-
-
-# ========== 语音处理 ==========
-
-def download_audio(message_id: str, file_key: str) -> str:
-    try:
-        from lark_oapi.api.im.v1 import GetMessageResourceRequest
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".opus")
-        tmp_path = tmp_file.name
-        tmp_file.close()
-
-        request = GetMessageResourceRequest.builder() \
-            .message_id(message_id) \
-            .file_key(file_key) \
-            .type("file") \
-            .build()
-        response = client.im.v1.message_resource.get(request)
-
-        if response.success():
-            with open(tmp_path, "wb") as f:
-                f.write(response.file.read())
-            print(f"✅ 语音下载成功: {tmp_path} ({os.path.getsize(tmp_path)} bytes)")
-            return tmp_path
-        else:
-            print(f"❌ 语音下载失败: {response.code}")
-            return None
-    except Exception as e:
-        print(f"❌ 语音下载异常: {e}")
-        return None
-
-
-def transcribe_audio(audio_path: str) -> str:
-    container_audio = None
-    try:
-        container_audio = f"/tmp/feishu_audio_{os.path.basename(audio_path)}"
-        subprocess.run([
-            "/usr/local/bin/docker", "cp",
-            audio_path, f"clawdbot:{container_audio}"
-        ], check=True, timeout=10)
-
-        result = subprocess.run([
-            "/usr/local/bin/docker", "exec", "clawdbot",
-            "python3", "/root/workspace/scripts/transcribe_aliyun.py", container_audio
-        ], capture_output=True, text=True, timeout=120)
-
-        if result.returncode == 0:
-            text = result.stdout.strip()
-            print(f"✅ 转录完成: {len(text)} 字符")
-            return text
-        else:
-            print(f"❌ 转录失败: {result.stderr[:300]}")
-            return None
-    except subprocess.TimeoutExpired:
-        return None
-    except Exception as e:
-        print(f"❌ 转录异常: {e}")
-        return None
-    finally:
-        if audio_path and os.path.exists(audio_path):
-            os.remove(audio_path)
-        if container_audio:
-            subprocess.run([
-                "/usr/local/bin/docker", "exec", "clawdbot", "rm", "-f", container_audio
-            ], capture_output=True)
-
-
-# ========== 帮助信息 ==========
-
-def show_help() -> str:
-    return """🤖 知微 v2.1 - AI 助手 (RAG增强版)
-
-【智能分工】
-📝 普通对话 → 知微直接回答
-📚 知识库 → 自动触发或用 /ask
-🔍 研究分析 → 自动转给探微
-💻 编程开发 → 自动转给筑微
-📢 推送运营 → 自动转给通微
-
-【新增命令】
-/ask <问题> - 强制查询本地知识库
-/status - 查看知识库收录状态
-
-【原有支持】
-📝 文字 - AI 多轮对话（带记忆）
-🖼️ 图片 - 图片分析 + 追问
-🌐 网页链接 - 自动抓取总结
-🎬 视频链接 - 抖音/YouTube/B站
-
-💡 直接发消息，我会自动判断是否查资料！"""
-
-
-# ========== 核心：文本消息处理 ==========
-
-def handle_text_async(text: str, user_id: str, message_id: str):
-    """异步处理文本消息 - 带记忆、路由和RAG"""
-    try:
-        text_stripped = text.strip()
-        text_lower = text_stripped.lower()
-
-        # ===== 1. 语音确认流程 =====
-        if user_id in pending_voice:
-            pending_text = pending_voice.pop(user_id)
-            if text_lower in ["取消", "cancel", "算了"]:
-                reply_message(message_id, "✅ 已取消")
-                return
-            if text_lower in ["ok", "确认", "好的", "执行", "是", "yes"]:
-                text_stripped = pending_text
-            # 否则使用用户修改后的内容
-
-        # ===== 2. 图片追问 =====
-        if user_id in pending_image:
-            img_data = pending_image[user_id]
-            if isinstance(img_data, dict) and "base64" in img_data:
-                if time.time() - img_data.get("time", 0) < 600:
-                    # 不是命令才走图片追问
-                    if not text_lower.startswith("/") and not (len(text_lower) == 2 and text_lower[0] == 'm'):
-                        print(f"🖼️ 图片追问: {text_stripped[:30]}...")
-                        response = analyze_image_base64(img_data["base64"], text_stripped)
-                        reply_message(message_id, response + "\n\n💡 继续追问或发新图片")
-                        return
-                else:
-                    del pending_image[user_id]
-
-        # ===== 3. 命令处理 =====
-
-        if text_lower in ["/help", "帮助", "/帮助"]:
-            reply_message(message_id, show_help())
-            return
-
-        # Phase 4 新增: RAG 强制查询
-        if text_lower.startswith("/ask ") or text_lower.startswith("查 "):
-            query = text_stripped.split(" ", 1)[1]
-            reply_message(message_id, f"🔍 正在检索知识库：{query}...")
-            
-            rag_result = query_knowledge_base(query)
-            if rag_result:
-                reply_message(message_id, f"📚 **知识库结果**\n\n{rag_result}")
-            else:
-                reply_message(message_id, "❌ 知识库中未找到相关内容")
-            return
-
-        if text_lower in ["/reset", "重置", "/重置", "新对话"]:
-            memory = get_memory(user_id)
-            memory.reset()
-            if user_id in pending_image:
-                del pending_image[user_id]
-            reply_message(message_id, "✅ 会话和记忆已重置\n\n开始新对话吧！")
-            return
-
-        if text_lower in ["/history", "历史", "/记录"]:
-            reply_message(message_id, get_history(user_id))
-            return
-
-        if text_lower in ["/memory", "记忆", "/记忆"]:
-            memory = get_memory(user_id)
-            reply_message(message_id, f"🧠 记忆状态\n\n{memory.get_stats()}")
-            return
-
-        if text_lower in ["/tasks", "任务", "/任务"]:
-            reply_message(message_id, TaskLogger.get_recent(5))
-            return
-
-        if text_lower.startswith("/route "):
-            test_msg = text_stripped[7:]
-            result = IntentRouter.explain(test_msg)
-            reply_message(message_id, f"🔀 路由测试\n\n{result}")
-            return
-
-        if text_lower in ["/sync", "同步", "/session", "会话"]:
-            session_id = get_session_id(user_id)
-            reply_message(message_id, f"📌 会话 ID: {session_id}")
-            return
-
-        if text_lower in ["/status", "状态", "/状态"]:
-            reply_message(message_id, get_quick_status())
-            return
-
-        if text_lower in ["/model", "模型", "/模型"]:
-            try:
-                config_path = os.path.expanduser("~/logs/current_model.json")
-                if os.path.exists(config_path):
-                    with open(config_path) as f:
-                        data = json.load(f)
-                    msg = f"""🤖 当前模型
-
-**{data.get('name', '未知')}**
-• 模型ID: {data.get('model', '未知')}
-• Provider: {data.get('provider', '未知')}
-
-切换: m1-m8"""
-                    reply_message(message_id, msg)
-                else:
-                    reply_message(message_id, "❌ 模型配置未找到")
-            except Exception as e:
-                reply_message(message_id, f"❌ 获取模型失败: {e}")
-            return
-
-        # 模型切换
-        if len(text_lower) == 2 and text_lower[0] == 'm' and text_lower[1] in "12345678":
-            try:
-                result = subprocess.run(
-                    ['/usr/local/bin/ocmodel', text_lower[1]],
-                    capture_output=True, text=True, timeout=5
-                )
-                msg = f"✅ {result.stdout.strip()}" if result.returncode == 0 else f"❌ {result.stderr}"
-                reply_message(message_id, msg)
-            except Exception as e:
-                reply_message(message_id, f"❌ 切换异常: {e}")
-            return
-
-        # ===== 4. 网页链接 =====
-        if is_article_url(text_stripped):
-            url = extract_article_url(text_stripped)
-            reply_message(message_id, "🌐 正在抓取网页，请稍候...")
-            summary_prompt = summarize_url(url)
-            if summary_prompt.startswith("❌"):
-                reply_message(message_id, summary_prompt)
-                return
-            session_id = get_session_id(user_id)
-            response = call_openclaw_agent(summary_prompt, session_id)
-            reply_card(message_id, "🌐 网页总结", response)
-            TaskLogger.log_task("网页总结", "完成", url)
-            return
-
-        # ===== 5. 视频链接 =====
-        if is_video_url(text_stripped):
-            reply_message(message_id, "🎬 开始分析视频...\n\n⏳ 预计需要3-5分钟，完成后自动回复")
-            handle_video_async(text_stripped, message_id, user_id)
-            return
-
-        # ===== 6. 核心：带记忆的 Agent 对话 =====
-
-        # 6a. 记录到轻量历史
-        add_to_history(user_id, "user", text_stripped)
-
-        # 6b. 获取记忆上下文
-        memory = get_memory(user_id)
-        context_prompt = memory.build_context_prompt()
-        
-        # 6b-2. 协作链检测
-        chain_name = detect_chain_intent(text_stripped)
-        if chain_name:
-            reply_message(message_id, f"🔗 检测到协作链任务，开始执行...")
-            try:
-                session_id = get_session_id(user_id)
-                chain_response = execute_chain(chain_name, text_stripped, session_id)
-                reply_message(message_id, chain_response)
-                TaskLogger.log_task("协作链", chain_name, text_stripped[:50])
-                return
-            except Exception as e:
-                print(f"❌ 协作链异常: {e}")
-                reply_message(message_id, f"❌ 协作链执行失败: {e}")
-                return
-
-        # Phase 4 新增: 智能 RAG 触发 (检测关键词)
-        # 如果问题中包含明显查资料意图，或者涉及知识库关键词，自动补充 RAG 结果
-        rag_context = ""
-        rag_triggers = ["查一下", "搜一下", "知识库", "库里", "文档", "书中", "书里"]
-        if any(keyword in text_stripped for keyword in rag_triggers):
-            reply_message(message_id, "🔍 正在自动检索知识库...")
-            rag_result = query_knowledge_base(text_stripped)
-            if rag_result:
-                rag_context = f"\n\n【本地知识库参考资料】\n{rag_result}\n"
-                print("✅ 智能 RAG 触发成功")
-
-        # 6c. 意图路由
-        target_agent = IntentRouter.route(text_stripped)
-
-        # 6d. 构建增强消息 (上下文 + RAG + 问题)
-        enriched_message = ""
-        if context_prompt:
-            enriched_message += f"{context_prompt}\n\n"
-        if rag_context:
-            enriched_message += f"{rag_context}\n\n"
-        
-        enriched_message += f"---\n当前问题: {text_stripped}"
-        
-        # 如果有 RAG 内容，强制提示 Agent 使用
-        if rag_context:
-            enriched_message += "\n(请结合参考资料回答)"
-
-        # 6e. 调用 Agent
-        session_id = get_session_id(user_id)
-        response = call_openclaw_agent(enriched_message, session_id, agent=target_agent)
-
-        # 6f. 如果路由到其他Agent，加标注
-        if target_agent != "main":
-            agent_names = {
-                "researcher": "探微",
-                "developer": "筑微",
-                "operator": "通微"
-            }
-            agent_label = agent_names.get(target_agent, target_agent)
-            response = f"🔀 *已转交{agent_label}处理*\n\n{response}"
-
-        # 6g. 更新记忆
-        memory.add_turn(text_stripped, response)
-        
-        # 自动提取重要信息到持久记忆
-        try:
-            from memory_manager import extract_important_info
-            important = extract_important_info(text_stripped, response)
-            if important:
-                memory.save_persistent(important["key"], important["value"])
-                print(f"💾 自动保存: {important['key']}")
-        except Exception as e:
-            pass  # 静默失败
-
-        # 6h. 记录到轻量历史
-        add_to_history(user_id, "bot", response)
-
-        # 6i. 回复
-        reply_message(message_id, response)
-
-    except Exception as e:
-        print(f"❌ 文本处理异常: {e}")
-        import traceback
-        traceback.print_exc()
-        reply_message(message_id, f"❌ 处理异常，请重试")
-
+# 初始化命令处理模块（需要 call_openclaw_agent 已定义）
+from command_handler import init_command_handler
+init_command_handler(
+    reply_message, reply_card, call_openclaw_agent, query_knowledge_base,
+    get_memory, add_to_history, get_history,
+    is_article_url, is_video_url, summarize_url, handle_video_async,
+    extract_video_url, TaskLogger, detect_chain_intent, execute_chain,
+    IntentRouter, save_active_user, load_active_user,
+    chat_history, pending_voice, pending_image, pending_review,
+    MAX_HISTORY, RATE_LIMIT_SECONDS, user_last_request, memory_cache
+)
 
 # ========== 消息分发 ==========
 
@@ -899,6 +254,9 @@ def do_p2_im_message_receive_v1(data) -> None:
 
         print(f"\n{'=' * 50}")
         print(f"📨 [{msg_type}] 用户: {str(user_id)[:10]}...")
+
+        # T-056: 持久化最近活跃用户
+        save_active_user(user_id)
 
         content_dict = json.loads(content_str)
 
@@ -968,6 +326,193 @@ def main():
     print("   特性: 三层记忆 | 意图路由 | 任务日志")
     print("   支持: 文字 | 图片 | 网页链接 | 视频链接")
     print("-" * 50)
+
+    # T-056: 审批通知轮询线程
+    def poll_review_notifications():
+        """轮询 ~/tasks/review/*.notify 文件，推送交互式卡片到飞书"""
+        review_dir = os.path.expanduser("~/tasks/review")
+        os.makedirs(review_dir, exist_ok=True)
+        load_active_user()
+
+        while True:
+            try:
+                for fname in os.listdir(review_dir):
+                    if not fname.endswith(".notify"):
+                        continue
+
+                    notify_path = os.path.join(review_dir, fname)
+                    try:
+                        with open(notify_path) as f:
+                            notify_data = json.load(f)
+
+                        task_id = notify_data.get("task_id", "")
+                        message = notify_data.get("message", "")
+                        risk_level = notify_data.get("risk_level", "medium")
+
+                        if not message:
+                            continue
+
+                        target_user = last_active_user.get("user_id") or load_active_user()
+                        if not target_user:
+                            print(f"⏳ 审批通知 {task_id} 等待活跃用户...")
+                            continue
+
+                        # 构建交互式卡片
+                        risk_color = "red" if risk_level == "high" else "orange"
+                        card = {
+                            "config": {"wide_screen_mode": True},
+                            "header": {
+                                "title": {"tag": "plain_text", "content": "🔔 开发任务待审批"},
+                                "template": risk_color
+                            },
+                            "elements": [
+                                {
+                                    "tag": "markdown",
+                                    "content": message.replace("回复「批准", "点击按钮").replace("」执行 | 回复「取消", "").replace("」放弃", "")
+                                },
+                                {
+                                    "tag": "action",
+                                    "actions": [
+                                        {
+                                            "tag": "button",
+                                            "text": {"tag": "plain_text", "content": "✅ 批准执行"},
+                                            "type": "primary",
+                                            "value": {"action": "approve", "task_id": task_id}
+                                        },
+                                        {
+                                            "tag": "button",
+                                            "text": {"tag": "plain_text", "content": "❌ 取消任务"},
+                                            "type": "danger",
+                                            "value": {"action": "reject", "task_id": task_id}
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+
+                        # 发送卡片消息
+                        try:
+                            from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+                            content = json.dumps(card)
+                            request = CreateMessageRequest.builder() \
+                                .receive_id_type("user_id") \
+                                .request_body(CreateMessageRequestBody.builder()
+                                    .receive_id(target_user)
+                                    .content(content)
+                                    .msg_type("interactive")
+                                    .build()) \
+                                .build()
+                            response = client.im.v1.message.create(request)
+                            if response.success():
+                                print(f"✅ 审批卡片已推送: {task_id}")
+                                pending_review[target_user] = task_id
+                                os.remove(notify_path)
+                            else:
+                                print(f"❌ 卡片推送失败: {response.code} - {response.msg}")
+                        except Exception as e:
+                            print(f"❌ 卡片推送异常: {e}")
+
+                    except Exception as e:
+                        print(f"❌ 处理通知文件异常: {e}")
+            except Exception as e:
+                pass
+
+            time.sleep(5)
+
+    # T-055: 任务完成通知轮询线程
+    def poll_task_notifications():
+        """轮询 ~/tasks/notify/*.json 文件，推送任务结果到飞书"""
+        notify_dir = os.path.expanduser("~/tasks/notify")
+        os.makedirs(notify_dir, exist_ok=True)
+        load_active_user()
+
+        while True:
+            try:
+                for fname in os.listdir(notify_dir):
+                    if not fname.endswith(".json"):
+                        continue
+
+                    notify_path = os.path.join(notify_dir, fname)
+                    try:
+                        with open(notify_path) as f:
+                            notify_data = json.load(f)
+
+                        task_id = notify_data.get("task_id", "")
+                        feishu_user_id = notify_data.get("feishu_user_id", "")
+                        status = notify_data.get("status", "unknown")
+                        title = notify_data.get("title", "开发任务")
+                        summary = notify_data.get("summary", "任务已完成")
+
+                        if not task_id:
+                            continue
+
+                        # 使用任务中指定的飞书用户ID，如果没有则使用最近活跃用户
+                        target_user = feishu_user_id or last_active_user.get("user_id") or load_active_user()
+                        if not target_user:
+                            print(f"⏳ 任务通知 {task_id} 等待飞书用户...")
+                            continue
+
+                        # 构建结果卡片
+                        status_emoji = "✅" if status == "success" else "❌"
+                        status_color = "green" if status == "success" else "red"
+                        status_text = "已完成" if status == "success" else "失败"
+
+                        card = {
+                            "config": {"wide_screen_mode": True},
+                            "header": {
+                                "title": {"tag": "plain_text", "content": f"{status_emoji} 任务 {status_text}"},
+                                "template": status_color
+                            },
+                            "elements": [
+                                {
+                                    "tag": "div",
+                                    "text": {"tag": "plain_text", "content": f"📋 任务ID: {task_id}"}
+                                },
+                                {
+                                    "tag": "div",
+                                    "text": {"tag": "plain_text", "content": f"📌 标题: {title}"}
+                                },
+                                {
+                                    "tag": "div",
+                                    "text": {"tag": "plain_text", "content": f"📝 结果: {summary[:200]}"}
+                                }
+                            ]
+                        }
+
+                        # 发送卡片消息
+                        try:
+                            from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+                            content = json.dumps(card)
+                            request = CreateMessageRequest.builder() \
+                                .receive_id_type("user_id") \
+                                .request_body(CreateMessageRequestBody.builder()
+                                    .receive_id(target_user)
+                                    .content(content)
+                                    .msg_type("interactive")
+                                    .build()) \
+                                .build()
+                            response = client.im.v1.message.create(request)
+                            if response.success():
+                                print(f"✅ 任务通知已推送: {task_id}")
+                                os.remove(notify_path)
+                            else:
+                                print(f"❌ 任务通知推送失败: {response.code} - {response.msg}")
+                        except Exception as e:
+                            print(f"❌ 任务通知推送异常: {e}")
+
+                    except Exception as e:
+                        print(f"❌ 处理任务通知文件异常: {e}")
+            except Exception as e:
+                pass
+
+            time.sleep(5)
+
+    poll_thread = threading.Thread(target=poll_review_notifications, daemon=True)
+    poll_thread.start()
+
+    # T-055: 启动任务通知轮询线程
+    task_notify_thread = threading.Thread(target=poll_task_notifications, daemon=True)
+    task_notify_thread.start()
 
     cli.start()
 
