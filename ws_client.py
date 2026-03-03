@@ -60,6 +60,9 @@ memory_cache = {}
 # 消息去重
 processed_messages = set()
 
+# 连接状态监控 (ISSUE-003)
+connection_status = {"connected": True, "last_event": time.time()}
+
 # 审批待确认 (T-056)
 pending_review = {}  # user_id -> task_id
 
@@ -221,6 +224,11 @@ init_command_handler(
 
 def do_p2_im_message_receive_v1(data) -> None:
     global processed_messages
+    # 更新最后事件时间以监控连接状态
+    from ws_client import connection_status
+    connection_status["last_event"] = time.time()
+    connection_status["connected"] = True  # 确保在收到消息时设置为连接状态
+
     try:
         event = data.event
         message = event.message
@@ -316,9 +324,11 @@ def main():
     _original_configure = cli._configure
     def _patched_configure(conf):
         _original_configure(conf)
-        cli._ping_interval = 30
-        cli._reconnect_interval = 10
-        cli._reconnect_nonce = 5
+        # ISSUE-003 优化：缩短 ping 间隔以避免超时断连
+        cli._ping_interval = 15  # 从 30 秒缩短到 15 秒
+        cli._reconnect_interval = 15  # 增加重连间隔以减少频率
+        cli._reconnect_nonce = 8  # 增加重试次数
+        print(f"🔄 WebSocket 配置更新: ping间隔={cli._ping_interval}s, 重连间隔={cli._reconnect_interval}s")
     cli._configure = _patched_configure
 
     print("🤖 知微 v2.1 启动 (RAG增强版)")
@@ -326,6 +336,38 @@ def main():
     print("   特性: 三层记忆 | 意图路由 | 任务日志")
     print("   支持: 文字 | 图片 | 网页链接 | 视频链接")
     print("-" * 50)
+
+    # ISSUE-003: 断连监控和告警线程
+    import threading
+    import time
+    from datetime import datetime
+
+    # 全局变量用于监控连接状态
+    connection_status = {"connected": True, "last_event": time.time()}
+
+    def connection_monitor():
+        """监控连接状态，检测异常断连"""
+        last_status = True
+        disconnect_count = 0
+
+        while True:
+            current_time = time.time()
+            # 如果超过60秒没有收到任何事件，则认为可能有问题
+            if current_time - connection_status["last_event"] > 60:
+                if connection_status["connected"]:
+                    print(f"⚠️ 检测到可能的连接问题 - 超过60秒无事件")
+                    # 这里可以增加更多诊断逻辑
+                    connection_status["connected"] = False
+                    disconnect_count += 1
+                    # 记录到日志用于分析
+                    with open(os.path.expanduser("~/logs/connection_monitor.log"), "a") as f:
+                        f.write(f"{datetime.now().isoformat()}: Possible disconnection detected. Disconnect count: {disconnect_count}\n")
+
+            time.sleep(30)  # 每30秒检查一次
+
+    # 启动监控线程
+    monitor_thread = threading.Thread(target=connection_monitor, daemon=True)
+    monitor_thread.start()
 
     # T-056: 审批通知轮询线程
     def poll_review_notifications():

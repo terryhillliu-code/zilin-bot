@@ -10,6 +10,7 @@ import tempfile
 import time
 import re
 import threading
+import datetime
 import sys
 from collections import deque
 
@@ -52,6 +53,12 @@ memory_cache = None
 # PDF 解析模块依赖
 pdf_parser = None
 
+# 文章写作模块依赖
+article_writer = None
+
+# 技术对比模块依赖
+tech_compare = None
+
 
 def init_command_handler(
     global_reply_message, global_reply_card, global_call_openclaw_agent, global_query_knowledge_base,
@@ -60,7 +67,8 @@ def init_command_handler(
     global_extract_video_url, global_TaskLogger, global_detect_chain_intent, global_execute_chain,
     global_IntentRouter, global_save_active_user, global_load_active_user,
     global_chat_history, global_pending_voice, global_pending_image, global_pending_review,
-    global_MAX_HISTORY, global_RATE_LIMIT_SECONDS, global_user_last_request, global_memory_cache
+    global_MAX_HISTORY, global_RATE_LIMIT_SECONDS, global_user_last_request, global_memory_cache,
+    global_article_writer=None, global_tech_compare=None
 ):
     """初始化命令处理模块的全局依赖"""
     global reply_message, reply_card, call_openclaw_agent, query_knowledge_base
@@ -70,7 +78,7 @@ def init_command_handler(
     global save_active_user, load_active_user
     global chat_history, pending_voice, pending_image, pending_review
     global MAX_HISTORY, RATE_LIMIT_SECONDS, user_last_request, memory_cache
-    global pdf_parser
+    global pdf_parser, article_writer, tech_compare
 
     reply_message = global_reply_message
     reply_card = global_reply_card
@@ -98,6 +106,8 @@ def init_command_handler(
     RATE_LIMIT_SECONDS = global_RATE_LIMIT_SECONDS
     user_last_request = global_user_last_request
     memory_cache = global_memory_cache
+    article_writer = global_article_writer
+    tech_compare = global_tech_compare
 
 
 # ========== 帮助信息 ==========
@@ -117,6 +127,8 @@ def show_help() -> str:
 /收录 <URL> - 收录网页到知识库
 /ask <问题> - 强制查询本地知识库
 /pdf <file_key> - 解析飞书PDF文档（异步）
+/写稿 <主题> - 撰写文章（自动检索 + AI生成）
+/对比 A vs B - 技术对比（生成对比表格）
 /status - 查看知识库收录状态
 回复「好」或「不要」 - 审批开发任务
 
@@ -312,6 +324,87 @@ def handle_text_async(text: str, user_id: str, message_id: str):
             thread.start()
             return
 
+        # T-069: /写稿 命令 - 生成文章
+        if text_lower.startswith("/写稿 ") or text_lower.startswith("写稿 "):
+            topic = text_stripped.split(" ", 1)[1] if " " in text_stripped else ""
+            if not topic:
+                reply_message(message_id, "❌ 请提供文章主题\n\n用法: /写稿 AI Agent 技术趋势")
+                return
+
+            # 发送确认消息，告知已开始生成
+            reply_message(message_id, f"✅ /写稿 任务已接收，主题：「{topic}」\n\n📝 文章生成中，请稍候...\n⏰ 预计2-3分钟，完成后将主动推送给您")
+
+            # 传递用户ID，用于后续主动推送结果
+            user_id_for_callback = user_id
+
+            # 异步调用文章写作模块
+            def _process_article_task():
+                try:
+                    _add_scheduler_path()
+                    # 动态导入 article_writer 模块
+                    import article_writer as aw
+
+                    # 调用修改后的 write_article，传入用户ID用于回调
+                    article = aw.write_article(topic, user_id_for_callback)
+
+                    # 不再使用 reply_message，因为是在后台线程中执行
+                    # 结果将由 article_writer 通过 send_direct_message 主动推送
+                except Exception as e:
+                    print(f"❌ 文章写作异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # 发送错误信息给用户
+                    from feishu_api import send_direct_message
+                    send_direct_message(user_id_for_callback, f"❌ 文章生成失败: {str(e)}")
+
+            thread = threading.Thread(target=_process_article_task, daemon=True)
+            thread.start()
+            return
+
+        # T-071: /对比 命令 - 技术对比
+        if text_lower.startswith("/对比 ") or text_lower.startswith("对比 "):
+            comparison_text = text_stripped.split(" ", 1)[1] if " " in text_stripped else ""
+            if not comparison_text:
+                reply_message(message_id, "❌ 请提供对比项\n\n用法: /对比 React vs Vue")
+                reply_message(message_id, "支持格式: /对比 A vs B / 对比 A vs B / 对比 A 与 B")
+                return
+
+            # 立即回复用户，告知已开始生成
+            reply_message(message_id, f"📊 已开始生成「{comparison_text}」对比\n\n⏳ 预计2-3分钟，完成后将主动推送结果")
+
+            # 启动后台线程处理对比任务
+            def _process_compare_task():
+                try:
+                    _add_scheduler_path()
+                    # 动态导入 tech_compare 模块
+                    import tech_compare as tc
+
+                    # 先解析对比项
+                    item_a, item_b = tc.parse_comparison(comparison_text)
+                    if not item_b:
+                        reply_message(message_id, "❌ 无法解析对比项，请使用 'A vs B' 格式")
+                        return
+
+                    # 调用对比函数并传入用户ID以便主动推送结果
+                    result = tc.compare_tech(item_a, item_b, user_id)
+
+                    # 如果推送失败，可以提供一个备用的反馈
+                    print(f"📊 技术对比任务完成，结果已推送给用户 {user_id}")
+                except Exception as e:
+                    print(f"❌ 技术对比异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # 尝试推送错误信息给用户
+                    try:
+                        from feishu_api import send_direct_message
+                        send_direct_message(user_id, f"❌ 对比生成失败: {str(e)}")
+                    except:
+                        reply_message(message_id, f"❌ 对比生成失败: {str(e)}")
+
+            thread = threading.Thread(target=_process_compare_task, daemon=True)
+            thread.start()
+            return
+
         # T-065: 收录网页到知识库 — 调用 knowledge-collect Skill
         if text_lower.startswith("/收录 ") or text_lower.startswith("收录 ") or text_lower.startswith("收录:"):
             # 提取 URL 和可选标签
@@ -347,11 +440,72 @@ def handle_text_async(text: str, user_id: str, message_id: str):
                     try:
                         data = _json.loads(result.stdout.strip())
                         if data.get("status") == "ok":
+                            # 获取收录成功的标题，用于创建 Obsidian 笔记
+                            title = data.get('title', '未知名称')
+
+                            # 在后台线程中创建 Obsidian 笔记
+                            def _create_obsidian_note():
+                                try:
+                                    # 将特殊字符替换为适合文件名的形式
+                                    import re
+                                    safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
+                                    safe_title = safe_title[:50]  # 限制长度
+
+                                    # 构建 Obsidian 笔记内容
+                                    note_content = f"""# {title}
+
+URL: {url}
+
+## 摘要
+{data.get('summary', '无摘要')}
+
+## 标签
+{tags if tags else '无'}
+
+## 收录时间
+{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+
+                                    # 调用 Obsidian CLI 创建笔记
+                                    obs_cmd = f'/opt/homebrew/bin/obsidian-cli create "Inbox/{safe_title}.md" --vault="~/Documents/ZhiweiVault" --content="{note_content.replace(chr(10), "\\n").replace(chr(9), "\\t")}"'
+                                    obs_result = subprocess.run(obs_cmd, shell=True, capture_output=True, text=True, timeout=30)
+
+                                    if obs_result.returncode == 0:
+                                        print(f"✅ Obsidian 笔记创建成功: {safe_title}")
+
+                                        # 调用自动链接功能（异步处理，避免阻塞主线程）
+                                        def _link_related_notes():
+                                            try:
+                                                from obsidian_linker import link_new_note
+                                                import time
+                                                # 等待文件创建完成
+                                                time.sleep(2)
+                                                note_path = Path.home() / "Documents" / "ZhiweiVault" / f"Inbox/{safe_title}.md"
+                                                link_new_note(note_path, note_content)
+                                            except ImportError:
+                                                print("⚠️ 未能导入 obsidian_linker，跳过自动链接")
+                                            except Exception as e:
+                                                print(f"❌ 自动链接过程中出错: {e}")
+
+                                        # 在后台线程中处理链接
+                                        link_thread = threading.Thread(target=_link_related_notes, daemon=True)
+                                        link_thread.start()
+                                    else:
+                                        print(f"❌ Obsidian 笔记创建失败: {obs_result.stderr}")
+
+                                except Exception as e:
+                                    print(f"❌ 创建 Obsidian 笔记时出错: {e}")
+
+                            # 启动后台线程创建 Obsidian 笔记
+                            obs_thread = threading.Thread(target=_create_obsidian_note, daemon=True)
+                            obs_thread.start()
+
                             reply_message(message_id,
                                 f"✅ 已收录到知识库\n"
                                 f"📄 标题: {data.get('title', '未知')}\n"
                                 f"📏 字数: {data.get('word_count', 0)}\n"
-                                f"📁 位置: knowledge-inbox/unsorted/")
+                                f"📁 位置: knowledge-inbox/unsorted/\n"
+                                f"📘 同步创建 Obsidian 笔记中...")
                         else:
                             reply_message(message_id, f"❌ 收录失败: {data.get('message', '未知错误')}")
                     except _json.JSONDecodeError:
