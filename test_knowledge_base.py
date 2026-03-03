@@ -12,7 +12,15 @@ import tempfile
 import shutil
 
 # 添加项目路径到sys.path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 添加Documents目录到路径
+documents_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'Documents', 'Library')
+sys.path.insert(0, documents_path)
+
+# 添加zhiwei-bot目录到路径
+bot_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'zhiwei-bot')
+sys.path.insert(0, bot_path)
 
 # 尝试导入相关模块
 try:
@@ -59,8 +67,8 @@ class TestKnowledgeBase(unittest.TestCase):
         # 测试连接函数存在
         self.assertTrue(callable(get_db_connection))
 
-        # 使用临时数据库路径测试连接
-        conn = get_db_connection(self.test_db_path)
+        # 使用默认数据库路径测试连接（由于get_db_connection不接受路径参数）
+        conn = get_db_connection()
         self.assertIsNotNone(conn)
         conn.close()
 
