@@ -9,7 +9,11 @@ import tempfile
 import base64
 import threading
 import subprocess
+import logging
 from typing import Optional
+
+# 设置日志
+logger = logging.getLogger(__name__)
 
 # 导入依赖（由 ws_client.py 初始化）
 client = None
@@ -209,23 +213,65 @@ def is_video_url(text: str) -> bool:
     return extract_video_url(text) is not None
 
 
-def summarize_url(url: str) -> str:
-    """总结网页 URL"""
+def fetch_url_content(url: str, timeout: int = 30) -> tuple[bool, str]:
+    """
+    抓取 URL 内容，优先使用 defuddle，失败后降级到 web-summary
+    返回: (success, content)
+    """
+    # 1. 先尝试 defuddle
     try:
-        print(f"🌐 抓取网页: {url}")
+        result = subprocess.run(
+            ["defuddle", "parse", url, "--md"],
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            logger.info(f"✅ defuddle 抓取成功: {url[:50]}")
+            return True, result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        logger.warning(f"⚠️ defuddle 超时: {url[:50]}")
+    except Exception as e:
+        logger.warning(f"⚠️ defuddle 失败: {e}")
+
+    # 2. 降级到原 web-summary
+    logger.info(f"↩️ 降级到 web-summary: {url[:50]}")
+    try:
         cmd = [
             "/usr/local/bin/docker", "exec", "clawdbot",
             "python3", "/root/workspace/skills/web-summary/websummary.py", "fetch", "--url", url
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
         if result.returncode != 0:
-            return f"❌ 网页抓取失败: {result.stderr[:200]}"
+            logger.error(f"❌ web-summary 抓取失败: {result.stderr[:200]}")
+            return False, f"❌ 网页抓取失败: {result.stderr[:200]}"
 
         content = result.stdout.strip()
         if len(content) < 100:
-            return f"❌ 网页内容太少，无法总结"
+            logger.warning(f"⚠️ 网页内容太少: {url[:50]}")
+            return False, f"❌ 网页内容太少，无法总结"
 
+        return True, content
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"❌ web-summary 抓取超时: {url[:50]}")
+        return False, "❌ 网页抓取超时"
+    except Exception as e:
+        logger.error(f"❌ web-summary 抓取异常: {e}")
+        return False, f"❌ 网页处理异常: {str(e)}"
+
+
+def summarize_url(url: str) -> str:
+    """总结网页 URL"""
+    try:
+        print(f"🌐 抓取网页: {url}")
+
+        success, content = fetch_url_content(url, timeout=60)
+        if not success:
+            return content  # 返回错误信息
+
+        # 处理成功获取的内容
         if len(content) > 8000:
             content = content[:8000] + "..."
 
@@ -233,8 +279,6 @@ def summarize_url(url: str) -> str:
         summary_prompt = f"请总结以下网页内容，提取关键信息：\n\n{content}"
         return summary_prompt
 
-    except subprocess.TimeoutExpired:
-        return "❌ 网页抓取超时"
     except Exception as e:
         return f"❌ 网页处理异常: {str(e)}"
 
