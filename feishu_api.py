@@ -76,7 +76,7 @@ def send_direct_message(user_id: str, text: str) -> bool:
             content = json.dumps({"text": text})
 
             request = CreateMessageRequest.builder() \
-                .receive_id_type("user_id") \
+                .receive_id_type("open_id") \
                 .request_body(CreateMessageRequestBody.builder()
                     .receive_id(user_id)
                     .content(content)
@@ -91,10 +91,13 @@ def send_direct_message(user_id: str, text: str) -> bool:
                 return True
             else:
                 print(f"❌ 主动推送失败: {response.code} - {response.msg}")
+                print(f"   错误详情: {response.error or '无详情'}")
                 # 飞书业务错误不重试（如无效的 user_id）
                 return False
         except Exception as e:
             print(f"❌ 主动推送异常 (attempt {attempt+1}): {e}")
+            import traceback
+            traceback.print_exc()
             # 网络异常继续重试
 
     print(f"❌ send_direct_message 最终失败，已重试 {max_retries-1} 次")

@@ -152,54 +152,38 @@ def handle_text_async(text: str, user_id: str, message_id: str):
         # ===== 0. 审批确认流程 (T-056) =====
         if user_id in pending_review:
             task_id = pending_review[user_id]
-            review_file = os.path.expanduser(f"~/tasks/review/{task_id}.json")
 
             if text_lower in ["好", "可以", "执行", "ok", "yes", "同意", "批准", "行", "执行吧", "没问题", "approve"]:
-                if os.path.exists(review_file):
-                    # 读取任务文件，添加 approved 标记
-                    with open(review_file) as f:
-                        task_data = json.load(f)
-                    task_data["approved"] = True
-                    task_data["approved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                    task_data["status"] = "pending"
-                    task_data.pop("_file", None)
-
-                    # 写入 pending 目录
-                    pending_file = os.path.expanduser(f"~/tasks/pending/{task_id}.json")
-                    with open(pending_file, "w") as f:
-                        json.dump(task_data, f, ensure_ascii=False, indent=2)
-
-                    # 删除 review 文件
-                    os.remove(review_file)
-
-                    # 清理通知文件
-                    notify_file = os.path.expanduser(f"~/tasks/review/{task_id}.notify")
-                    if os.path.exists(notify_file):
-                        os.remove(notify_file)
+                # 添加项目路径
+                import os as _os
+                import sys as _sys
+                if _os.path.expanduser("~/zhiwei-dev") not in _sys.path:
+                    _sys.path.insert(0, _os.path.expanduser("~/zhiwei-dev"))
+                from task_store import TaskStore
+                store = TaskStore()
+                
+                if store.approve(task_id):
                     del pending_review[user_id]
-                    reply_message(message_id, f"✅ 任务 {task_id} 已批准，开始执行...\n\n完成后会推送结果。")
+                    reply_message(message_id, f"✅ 任务 #{task_id} 已批准，开始执行...\n\n完成后会推送结果。")
                 else:
                     del pending_review[user_id]
-                    reply_message(message_id, f"⚠️ 任务 {task_id} 已不在审批队列中")
+                    reply_message(message_id, f"⚠️ 任务 #{task_id} 审批失败 (可能已被取消或已执行)")
                 return
 
             elif text_lower in ["不要", "取消", "不", "no", "拒绝", "算了", "不行", "reject"]:
-                if os.path.exists(review_file):
-                    failed_file = os.path.expanduser(f"~/tasks/failed/{task_id}.json")
-                    # 读取并标记为拒绝
-                    with open(review_file) as f:
-                        task_data = json.load(f)
-                    task_data["status"] = "rejected"
-                    task_data["rejected_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                    with open(failed_file, "w") as f:
-                        json.dump(task_data, f, ensure_ascii=False, indent=2)
-                    os.remove(review_file)
-                    # 清理通知文件
-                    notify_file = os.path.expanduser(f"~/tasks/review/{task_id}.notify")
-                    if os.path.exists(notify_file):
-                        os.remove(notify_file)
+                import os as _os
+                import sys as _sys
+                if _os.path.expanduser("~/zhiwei-dev") not in _sys.path:
+                    _sys.path.insert(0, _os.path.expanduser("~/zhiwei-dev"))
+                from task_store import TaskStore
+                store = TaskStore()
+                
+                if store.reject(task_id):
+                    reply_message(message_id, f"❌ 任务 #{task_id} 已取消")
+                else:
+                    reply_message(message_id, f"⚠️ 任务 #{task_id} 取消失败 (可能状态已变)")
+                    
                 del pending_review[user_id]
-                reply_message(message_id, f"❌ 任务 {task_id} 已取消")
                 return
 
             # 不是审批回复，保留状态，继续正常处理
@@ -235,50 +219,78 @@ def handle_text_async(text: str, user_id: str, message_id: str):
             return
 
         # 开发任务显式触发 (T-052: 绕过 OpenClaw LLM 路由)
+        # 新版开发系统集成 (zhiwei-dev)
         if text_lower.startswith("/dev ") or text_lower.startswith("@开发 "):
             requirement = text_stripped.split(" ", 1)[1] if " " in text_stripped else ""
             if not requirement:
                 reply_message(message_id, "❌ 请提供需求描述\n\n用法: /dev 把早报时间改成8点30分")
                 return
 
-            reply_message(message_id, f"📝 正在启动开发协作系统...\n\n需求: {requirement}")
+            # 添加项目路径（显式 import os 避免闭包作用域 UnboundLocalError）
+            import os as _os
+            import sys as _sys
+            sys.path.insert(0, _os.path.expanduser("~/zhiwei-dev"))
 
-            # 异步调用 dev_coordinator
-            def _process_dev_task():
-                try:
-                    _add_scheduler_path()
-                    from dev_coordinator import DevCoordinator
+            try:
+                from task_store import TaskStore
+                store = TaskStore()
+                # 根据风险评估决定是否进入审批流 (v32.4 优化)
+                from worker import Worker
+                w = Worker()
+                risk_level = w._assess_risk(requirement)
+                
+                # 如果是 auto 或者是来自 scheduler 的计划，直接 pending 执行
+                initial_status = "pending" if risk_level == "auto" else "review"
+                
+                task_id = store.enqueue(requirement, message_id=message_id, initial_status=initial_status)
 
-                    coordinator = DevCoordinator()
-                    result = coordinator.process_task(requirement, source="feishu")
+                # 获取当天序号
+                daily_seq = store.get_daily_seq(task_id)
 
-                    # 汇总结果
-                    status_emoji = "✅" if result["status"] == "success" else "❌"
-                    status_text = "完成" if result["status"] == "success" else "失败"
+                # 记录 user_id 到文件，供后续通知使用（新版 MessageBus 也会读取）
+                import json
+                from pathlib import Path
 
-                    summary_lines = [
-                        f"📋 **开发任务 {status_text}**",
-                        f"**任务ID**: {result['task_id']}",
-                        f"**耗时**: {result['duration_ms']/1000:.1f}s",
-                        f"**摘要**: {result['summary']}",
-                        "",
-                        "**步骤明细**:"
-                    ]
+                user_mappings_dir = _os.path.expanduser("~/zhiwei-dev/user_mappings")
+                _os.makedirs(user_mappings_dir, exist_ok=True)
+                
+                user_file = _os.path.join(user_mappings_dir, f"task_{task_id}_user.json")
+                with open(user_file, "w") as f:
+                    json.dump({
+                        "user_id": user_id, 
+                        "message_id": message_id,
+                        "source": "feishu",
+                        "via": "message_bus_v2"
+                    }, f)
 
-                    for step in result["steps"]:
-                        step_status = "✅" if step["success"] else "❌"
-                        step_name = step.get("step", "unknown")
-                        summary_lines.append(f"{step_status} {step_name}")
+                # 将路由信息也尝试存入 Task 存储（如果 TaskStore 支持 metadata 字段，目前逻辑主要在 enqueue 后的上下文）
 
-                    reply_message(message_id, "\n".join(summary_lines))
-                except Exception as e:
-                    print(f"❌ dev_coordinator 异常: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    reply_message(message_id, f"❌ 开发任务执行失败: {str(e)}")
-
-            thread = threading.Thread(target=_process_dev_task, daemon=True)
-            thread.start()
+                # 如果需要审批
+                if initial_status == "review":
+                    # 记录待审批状态在内存，等待用户确认
+                    pending_review[user_id] = task_id
+                    
+                    risk_msg = "⚠️ 包含敏感操作或受保护文件" if risk_level == "approve" else "ℹ️ 需确认执行范围"
+                    
+                    reply_message(
+                        message_id,
+                        f"👋 收到开发需求\n\n"
+                        f"📌 {requirement}\n\n"
+                        f"🕒 风险判定: {risk_level} ({risk_msg})\n"
+                        f"👉 请回复「批准」执行，或回复「取消」放弃"
+                    )
+                else:
+                    reply_message(
+                        message_id,
+                        f"👋 收到开发需求\n"
+                        f"✅ 风险判定[安全]，直接加入队列\n\n"
+                        f"任务 日常#{daily_seq} 已排队，请耐心等待~"
+                    )
+                    
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                reply_message(message_id, f"❌ 投递任务失败: {e}")
             return
 
         # Phase 4 新增: RAG 强制查询

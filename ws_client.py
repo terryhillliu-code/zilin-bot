@@ -35,8 +35,12 @@ from media_handler import (
     download_audio, transcribe_audio
 )
 
-# 导入命令处理模块
 from command_handler import handle_text_async, show_help, get_session_id, get_quick_status, check_rate_limit
+
+import sys
+import os
+sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
+from message_bus import MessageBus
 
 # ========== 全局状态 ==========
 
@@ -127,8 +131,20 @@ def query_knowledge_base(query: str) -> str:
 
 # ========== 应用配置 ==========
 
-APP_ID = "cli_a9142bd071bd1bd9"
-APP_SECRET = "mlIZdNRvxpaVQIB6VQxHIee6WgW4UcPf"
+# ========== 应用配置 ==========
+
+# ========== 应用配置 ==========
+
+APP_ID = os.environ.get("FEISHU_APP_ID", "cli_a9142bd071bd1bd9")
+APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "mlIZdNRvxpaVQIB6VQxHIee6WgW4UcPf")
+
+# 兜底：如果被错误清空，再次写死兜底
+if not APP_ID or not APP_SECRET:
+    APP_ID = "cli_a9142bd071bd1bd9"
+    APP_SECRET = "mlIZdNRvxpaVQIB6VQxHIee6WgW4UcPf"
+
+if not APP_ID or not APP_SECRET:
+    print("❌ 错误: 未能在环境变量或 settings.yaml 中找到 FEISHU_APP_ID/SECRET")
 
 client = lark.Client.builder() \
     .app_id(APP_ID) \
@@ -223,9 +239,8 @@ init_command_handler(
 # ========== 消息分发 ==========
 
 def do_p2_im_message_receive_v1(data) -> None:
-    global processed_messages
+    global processed_messages, connection_status
     # 更新最后事件时间以监控连接状态
-    from ws_client import connection_status
     connection_status["last_event"] = time.time()
     connection_status["connected"] = True  # 确保在收到消息时设置为连接状态
 
@@ -308,9 +323,44 @@ def do_p2_im_message_receive_v1(data) -> None:
         traceback.print_exc()
 
 
+def do_p2_card_action_trigger_v1(data) -> None:
+    """处理卡片交互事件 (审批按钮)"""
+    try:
+        action = data.action
+        value = action.value  # 这是一个 dict，包含在卡片定义中
+        user_id = data.operator.user_id
+        
+        action_type = value.get("action")
+        task_id = value.get("task_id")
+        plan_name = value.get("plan_name")
+        
+        print(f"🔘 卡片交互: {action_type} for {plan_name or task_id} by {user_id}")
+        
+        if action_type in ["approve", "reject"]:
+            # 发送响应消息到 MessageBus
+            mb = MessageBus()
+            mb.publish(
+                sender=f"bot_{user_id}",
+                topic="plan_approval",
+                content=action_type,
+                metadata={
+                    "task_id": task_id,
+                    "plan_name": plan_name,
+                    "user_id": user_id,
+                    "timestamp": time.time()
+                }
+            )
+            
+            # 更新卡片状态（可选，这里先简单回复一条消息）
+            reply_message(data.context.open_message_id, f"✅ 已收到您的「{ '批准' if action_type == 'approve' else '拒绝' }」操作。正在处理中...")
+            
+    except Exception as e:
+        print(f"❌ 处理卡片回调失败: {e}")
+
 def main():
     event_handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(do_p2_im_message_receive_v1) \
+        .register_p2_card_action_trigger(do_p2_card_action_trigger_v1) \
         .build()
 
     cli = lark.ws.Client(
@@ -325,10 +375,11 @@ def main():
     def _patched_configure(conf):
         _original_configure(conf)
         # ISSUE-003 优化：缩短 ping 间隔以避免超时断连
-        cli._ping_interval = 15  # 从 30 秒缩短到 15 秒
-        cli._reconnect_interval = 15  # 增加重连间隔以减少频率
-        cli._reconnect_nonce = 8  # 增加重试次数
-        print(f"🔄 WebSocket 配置更新: ping间隔={cli._ping_interval}s, 重连间隔={cli._reconnect_interval}s")
+        # 根据最近的连接日志分析，将 ping 间隔进一步调整为 10 秒以应对高延迟网络
+        cli._ping_interval = 10  # 从 15 秒缩短到 10 秒，提供更频繁的心跳
+        cli._reconnect_interval = 8  # 调整重连间隔以平衡重连速度和服务器压力
+        cli._reconnect_nonce = 10  # 增加重试次数，允许更多重连尝试
+        print(f"🔄 WebSocket 配置更新: ping间隔={cli._ping_interval}s, 重连间隔={cli._reconnect_interval}s, 重连次数={cli._reconnect_nonce}")
     cli._configure = _patched_configure
 
     print("🤖 知微 v2.1 启动 (RAG增强版)")
@@ -369,192 +420,74 @@ def main():
     monitor_thread = threading.Thread(target=connection_monitor, daemon=True)
     monitor_thread.start()
 
+    # 原 poll_review_notifications 和 poll_task_notifications 已废弃
+    # 逻辑整合入 poll_message_bus
+
     # T-056: 审批通知轮询线程
-    def poll_review_notifications():
-        """轮询 ~/tasks/review/*.notify 文件，推送交互式卡片到飞书"""
-        review_dir = os.path.expanduser("~/tasks/review")
-        os.makedirs(review_dir, exist_ok=True)
-        load_active_user()
-
-        while True:
-            try:
-                for fname in os.listdir(review_dir):
-                    if not fname.endswith(".notify"):
-                        continue
-
-                    notify_path = os.path.join(review_dir, fname)
-                    try:
-                        with open(notify_path) as f:
-                            notify_data = json.load(f)
-
-                        task_id = notify_data.get("task_id", "")
-                        message = notify_data.get("message", "")
-                        risk_level = notify_data.get("risk_level", "medium")
-
-                        if not message:
-                            continue
-
-                        target_user = last_active_user.get("user_id") or load_active_user()
-                        if not target_user:
-                            print(f"⏳ 审批通知 {task_id} 等待活跃用户...")
-                            continue
-
-                        # 构建交互式卡片
-                        risk_color = "red" if risk_level == "high" else "orange"
-                        card = {
-                            "config": {"wide_screen_mode": True},
-                            "header": {
-                                "title": {"tag": "plain_text", "content": "🔔 开发任务待审批"},
-                                "template": risk_color
-                            },
-                            "elements": [
-                                {
-                                    "tag": "markdown",
-                                    "content": message.replace("回复「批准", "点击按钮").replace("」执行 | 回复「取消", "").replace("」放弃", "")
-                                },
-                                {
-                                    "tag": "action",
-                                    "actions": [
-                                        {
-                                            "tag": "button",
-                                            "text": {"tag": "plain_text", "content": "✅ 批准执行"},
-                                            "type": "primary",
-                                            "value": {"action": "approve", "task_id": task_id}
-                                        },
-                                        {
-                                            "tag": "button",
-                                            "text": {"tag": "plain_text", "content": "❌ 取消任务"},
-                                            "type": "danger",
-                                            "value": {"action": "reject", "task_id": task_id}
-                                        }
-                                    ]
-                                }
-                            ]
-                        }
-
-                        # 发送卡片消息
-                        try:
-                            from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
-                            content = json.dumps(card)
-                            request = CreateMessageRequest.builder() \
-                                .receive_id_type("user_id") \
-                                .request_body(CreateMessageRequestBody.builder()
-                                    .receive_id(target_user)
-                                    .content(content)
-                                    .msg_type("interactive")
-                                    .build()) \
-                                .build()
-                            response = client.im.v1.message.create(request)
-                            if response.success():
-                                print(f"✅ 审批卡片已推送: {task_id}")
-                                pending_review[target_user] = task_id
-                                os.remove(notify_path)
-                            else:
-                                print(f"❌ 卡片推送失败: {response.code} - {response.msg}")
-                        except Exception as e:
-                            print(f"❌ 卡片推送异常: {e}")
-
-                    except Exception as e:
-                        print(f"❌ 处理通知文件异常: {e}")
-            except Exception as e:
-                pass
-
-            time.sleep(5)
-
-    # T-055: 任务完成通知轮询线程
-    def poll_task_notifications():
-        """轮询 ~/tasks/notify/*.json 文件，推送任务结果到飞书"""
-        notify_dir = os.path.expanduser("~/tasks/notify")
-        os.makedirs(notify_dir, exist_ok=True)
-        load_active_user()
-
-        while True:
-            try:
-                for fname in os.listdir(notify_dir):
-                    if not fname.endswith(".json"):
-                        continue
-
-                    notify_path = os.path.join(notify_dir, fname)
-                    try:
-                        with open(notify_path) as f:
-                            notify_data = json.load(f)
-
-                        task_id = notify_data.get("task_id", "")
-                        feishu_user_id = notify_data.get("feishu_user_id", "")
-                        status = notify_data.get("status", "unknown")
-                        title = notify_data.get("title", "开发任务")
-                        summary = notify_data.get("summary", "任务已完成")
-
-                        if not task_id:
-                            continue
-
-                        # 使用任务中指定的飞书用户ID，如果没有则使用最近活跃用户
-                        target_user = feishu_user_id or last_active_user.get("user_id") or load_active_user()
-                        if not target_user:
-                            print(f"⏳ 任务通知 {task_id} 等待飞书用户...")
-                            continue
-
-                        # 构建结果卡片
-                        status_emoji = "✅" if status == "success" else "❌"
-                        status_color = "green" if status == "success" else "red"
-                        status_text = "已完成" if status == "success" else "失败"
-
-                        card = {
-                            "config": {"wide_screen_mode": True},
-                            "header": {
-                                "title": {"tag": "plain_text", "content": f"{status_emoji} 任务 {status_text}"},
-                                "template": status_color
-                            },
-                            "elements": [
-                                {
-                                    "tag": "div",
-                                    "text": {"tag": "plain_text", "content": f"📋 任务ID: {task_id}"}
-                                },
-                                {
-                                    "tag": "div",
-                                    "text": {"tag": "plain_text", "content": f"📌 标题: {title}"}
-                                },
-                                {
-                                    "tag": "div",
-                                    "text": {"tag": "plain_text", "content": f"📝 结果: {summary[:200]}"}
-                                }
-                            ]
-                        }
-
-                        # 发送卡片消息
-                        try:
-                            from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
-                            content = json.dumps(card)
-                            request = CreateMessageRequest.builder() \
-                                .receive_id_type("user_id") \
-                                .request_body(CreateMessageRequestBody.builder()
-                                    .receive_id(target_user)
-                                    .content(content)
-                                    .msg_type("interactive")
-                                    .build()) \
-                                .build()
-                            response = client.im.v1.message.create(request)
-                            if response.success():
-                                print(f"✅ 任务通知已推送: {task_id}")
-                                os.remove(notify_path)
-                            else:
-                                print(f"❌ 任务通知推送失败: {response.code} - {response.msg}")
-                        except Exception as e:
-                            print(f"❌ 任务通知推送异常: {e}")
-
-                    except Exception as e:
-                        print(f"❌ 处理任务通知文件异常: {e}")
-            except Exception as e:
-                pass
-
-            time.sleep(5)
-
-    poll_thread = threading.Thread(target=poll_review_notifications, daemon=True)
-    poll_thread.start()
+    # poll_thread = threading.Thread(target=poll_review_notifications, daemon=True)
+    # poll_thread.start()
 
     # T-055: 启动任务通知轮询线程
-    task_notify_thread = threading.Thread(target=poll_task_notifications, daemon=True)
-    task_notify_thread.start()
+    # task_notify_thread = threading.Thread(target=poll_task_notifications, daemon=True)
+    # task_notify_thread.start()
+
+    # 启动统一的 MessageBus 消费线程 (取代原有的文件轮询)
+    def poll_message_bus():
+        import feishu_api as _feishu_api_mod
+        mb = MessageBus()
+        print("💡 MessageBus 消费线程已启动")
+        while True:
+            try:
+                # 消费飞书通知和审批主题
+                topics = ["feishu_notification", "feishu_card_notification"]
+                for topic in topics:
+                    messages = mb.consume_pending(topic=topic, limit=5)
+                    if messages:
+                        print(f"📥 MessageBus: 发现 {len(messages)} 条新消息 ({topic})")
+                    for msg in messages:
+                        print(f"🔄 MessageBus: 正在处理消息 {msg['id']}...")
+                        try:
+                            meta = json.loads(msg["metadata"] or "{}")
+                            target_user = meta.get("user_id") or last_active_user.get("user_id") or load_active_user()
+                            
+                            if not target_user:
+                                print(f"⚠️ MessageBus: 消息 {msg['id']} 找不到目标飞书用户")
+                                continue
+
+                            if topic == "feishu_notification":
+                                # 普通文本消息
+                                success = _feishu_api_mod.send_direct_message(target_user, msg["content"])
+                            else:
+                                # 卡片消息 (metadata 中包含卡片 JSON)
+                                card_content = msg["content"]
+                                try:
+                                    from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+                                    request = CreateMessageRequest.builder() \
+                                        .receive_id_type("open_id") \
+                                        .request_body(CreateMessageRequestBody.builder()
+                                            .receive_id(target_user)
+                                            .content(card_content)
+                                            .msg_type("interactive")
+                                            .build()) \
+                                        .build()
+                                    response = client.im.v1.message.create(request)
+                                    success = response.success()
+                                except: success = False
+
+                            if success:
+                                mb.mark_sent(msg["id"])
+                                print(f"✅ MessageBus: [{topic}] 消息 {msg['id']} 已推送到飞书")
+                            else:
+                                mb.mark_failed(msg["id"], "Feishu API delivery failed")
+                        except Exception as e:
+                            print(f"❌ 处理 MessageBus 消息异常: {e}")
+                time.sleep(2)
+            except Exception as e:
+                print(f"❌ MessageBus 消费异常: {e}")
+                time.sleep(5)
+
+    msg_bus_thread = threading.Thread(target=poll_message_bus, daemon=True)
+    msg_bus_thread.start()
 
     cli.start()
 
