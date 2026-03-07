@@ -1,0 +1,12 @@
+🤖 知微 v2.1 启动 (RAG增强版)
+   新增: 知识库检索 (/ask 或 '查一下')
+   特性: 三层记忆 | 意图路由 | 任务日志
+   支持: 文字 | 图片 | 网页链接 | 视频链接
+--------------------------------------------------
+💡 MessageBus 消费线程已启动
+📥 MessageBus: 发现 1 条新消息 (feishu_notification)
+🔄 MessageBus: 正在处理消息 37...
+🔄 WebSocket 配置更新: ping间隔=10s, 重连间隔=8s, 重连次数=10
+❌ 主动推送失败: 99992351 - The request you send is not a valid {open_id} or not exists, and the example value is {ou_da5****************dfe}. Invalid ids: [ou_b3240292b0051e5e01614f0896796328] . Please see field_violations for details and refer to API documentation to correct accordingly and resubmit
+   错误详情: {'message': 'Refer to the documentation to fix the error: https://open.feishu.cn/document/uAjLw4CM/ugTN1YjL4UTN24CO1UjN/trouble-shooting/how-to-obtain-openid', 'log_id': '202603071536289D59A9943643F6D123EA', 'troubleshooter': '排查建议查看(Troubleshooting suggestions): https://open.feishu.cn/search?from=openapi&log_id=202603071536289D59A9943643F6D123EA&code=99992351&method_id=6936075528891154460', 'field_violations': [{'field': 'receive_id', 'value': 'ou_b3240292b0051e5e01614f0896796328', 'description': 'id not exist'}]}
+[Lark] [2026-03-07 15:36:29,579] [INFO] connected to wss://msg-frontier.feishu.cn/ws/v2?fpid=493&aid=552564&device_id=7614414315685629121&access_key=afa7c30ed029c6ac78f97ac17cd6eb70&service_id=33554678&ticket=6799cd29-6a87-4e25-8f3c-a73ecf11015c [conn_id=7614414315685629121]
