@@ -14,6 +14,13 @@ import datetime
 import sys
 from collections import deque
 
+# 导入 RAG 桥接
+try:
+    from rag_bridge import get_context as get_rag_context, is_available as rag_is_available
+except ImportError:
+    def get_rag_context(query, top_k=5): return ""
+    def rag_is_available(): return False
+
 # 添加 scheduler 目录到路径
 sys_path_added = False
 def _add_scheduler_path():
@@ -298,9 +305,17 @@ def handle_text_async(text: str, user_id: str, message_id: str):
             query = text_stripped.split(" ", 1)[1]
             reply_message(message_id, f"🔍 正在检索知识库：{query}...")
 
+            # 优先使用新 RAG
+            if rag_is_available():
+                rag_result = get_rag_context(query, top_k=5)
+                if rag_result:
+                    reply_message(message_id, f"🚀 **zhiwei-rag (三轨精排) 结果**\n\n{rag_result}")
+                    return
+
+            # 降级到旧方案
             rag_result = query_knowledge_base(query)
             if rag_result:
-                reply_message(message_id, f"📚 **知识库结果**\n\n{rag_result}")
+                reply_message(message_id, f"📚 **知识库结果 (旧)**\n\n{rag_result}")
             else:
                 reply_message(message_id, "❌ 知识库中未找到相关内容")
             return
