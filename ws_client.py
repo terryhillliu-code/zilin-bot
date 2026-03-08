@@ -108,6 +108,7 @@ def query_knowledge_base(query: str) -> str:
         cmd = [
             "python3",
             os.path.expanduser("~/Documents/Library/klib_query.py"),
+            "search",
             query
         ]
 
