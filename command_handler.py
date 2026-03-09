@@ -13,6 +13,8 @@ import threading
 import datetime
 import sys
 from collections import deque
+import traceback
+from pathlib import Path
 
 # 导入 RAG 桥接
 try:
@@ -162,10 +164,8 @@ def handle_text_async(text: str, user_id: str, message_id: str):
 
             if text_lower in ["好", "可以", "执行", "ok", "yes", "同意", "批准", "行", "执行吧", "没问题", "approve"]:
                 # 添加项目路径
-                import os as _os
-                import sys as _sys
-                if _os.path.expanduser("~/zhiwei-dev") not in _sys.path:
-                    _sys.path.insert(0, _os.path.expanduser("~/zhiwei-dev"))
+                if os.path.expanduser("~/zhiwei-dev") not in sys.path:
+                    sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
                 from task_store import TaskStore
                 store = TaskStore()
                 
@@ -178,10 +178,8 @@ def handle_text_async(text: str, user_id: str, message_id: str):
                 return
 
             elif text_lower in ["不要", "取消", "不", "no", "拒绝", "算了", "不行", "reject"]:
-                import os as _os
-                import sys as _sys
-                if _os.path.expanduser("~/zhiwei-dev") not in _sys.path:
-                    _sys.path.insert(0, _os.path.expanduser("~/zhiwei-dev"))
+                if os.path.expanduser("~/zhiwei-dev") not in sys.path:
+                    sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
                 from task_store import TaskStore
                 store = TaskStore()
                 
@@ -233,10 +231,7 @@ def handle_text_async(text: str, user_id: str, message_id: str):
                 reply_message(message_id, "❌ 请提供需求描述\n\n用法: /dev 把早报时间改成8点30分")
                 return
 
-            # 添加项目路径（显式 import os 避免闭包作用域 UnboundLocalError）
-            import os as _os
-            import sys as _sys
-            sys.path.insert(0, _os.path.expanduser("~/zhiwei-dev"))
+            sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
 
             try:
                 from task_store import TaskStore
@@ -255,13 +250,10 @@ def handle_text_async(text: str, user_id: str, message_id: str):
                 daily_seq = store.get_daily_seq(task_id)
 
                 # 记录 user_id 到文件，供后续通知使用（新版 MessageBus 也会读取）
-                import json
-                from pathlib import Path
-
-                user_mappings_dir = _os.path.expanduser("~/zhiwei-dev/user_mappings")
-                _os.makedirs(user_mappings_dir, exist_ok=True)
+                user_mappings_dir = os.path.expanduser("~/zhiwei-dev/user_mappings")
+                os.makedirs(user_mappings_dir, exist_ok=True)
                 
-                user_file = _os.path.join(user_mappings_dir, f"task_{task_id}_user.json")
+                user_file = os.path.join(user_mappings_dir, f"task_{task_id}_user.json")
                 with open(user_file, "w") as f:
                     json.dump({
                         "user_id": user_id, 
@@ -295,7 +287,6 @@ def handle_text_async(text: str, user_id: str, message_id: str):
                     )
                     
             except Exception as e:
-                import traceback
                 traceback.print_exc()
                 reply_message(message_id, f"❌ 投递任务失败: {e}")
             return
@@ -342,8 +333,6 @@ def handle_text_async(text: str, user_id: str, message_id: str):
 
                     pdf_mod.handle_pdf_async(message_id, file_key, user_id)
                 except Exception as e:
-                    print(f"❌ PDF 处理初始化异常: {e}")
-                    import traceback
                     traceback.print_exc()
                     reply_message(message_id, f"❌ PDF 解析异常: {str(e)}")
 
@@ -378,7 +367,6 @@ def handle_text_async(text: str, user_id: str, message_id: str):
                     # 结果将由 article_writer 通过 send_direct_message 主动推送
                 except Exception as e:
                     print(f"❌ 文章写作异常: {e}")
-                    import traceback
                     traceback.print_exc()
                     # 发送错误信息给用户
                     from feishu_api import send_direct_message
@@ -419,7 +407,6 @@ def handle_text_async(text: str, user_id: str, message_id: str):
                     print(f"📊 技术对比任务完成，结果已推送给用户 {user_id}")
                 except Exception as e:
                     print(f"❌ 技术对比异常: {e}")
-                    import traceback
                     traceback.print_exc()
                     # 尝试推送错误信息给用户
                     try:
@@ -463,9 +450,8 @@ def handle_text_async(text: str, user_id: str, message_id: str):
                 result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
 
                 if result.returncode == 0:
-                    import json as _json
                     try:
-                        data = _json.loads(result.stdout.strip())
+                        data = json.loads(result.stdout.strip())
                         if data.get("status") == "ok":
                             # 获取收录成功的标题，用于创建 Obsidian 笔记
                             title = data.get('title', '未知名称')
@@ -535,7 +521,7 @@ URL: {url}
                                 f"📘 同步创建 Obsidian 笔记中...")
                         else:
                             reply_message(message_id, f"❌ 收录失败: {data.get('message', '未知错误')}")
-                    except _json.JSONDecodeError:
+                    except json.JSONDecodeError:
                         reply_message(message_id, f"⚠️ 收录完成但返回格式异常:\n{result.stdout[:200]}")
                 else:
                     reply_message(message_id, f"❌ 收录失败:\n{result.stderr[:200]}")
@@ -720,7 +706,6 @@ URL: {url}
 
     except Exception as e:
         print(f"❌ 文本处理异常: {e}")
-        import traceback
         traceback.print_exc()
         reply_message(message_id, f"❌ 处理异常，请重试")
 
