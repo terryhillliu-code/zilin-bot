@@ -5,6 +5,17 @@ from openclaw_api import OpenClawClient
 - 📚 知识库检索 (RAG)：支持 /ask 命令和智能触发
 - 🧠 集成 klib 向量数据库
 """
+
+# 加载环境变量文件 (必须在最前面，在导入其他模块之前)
+from dotenv import load_dotenv
+from pathlib import Path
+env_path = Path(__file__).parent / ".env"
+if env_path.exists():
+    load_dotenv(env_path)
+    print(f"✅ 已加载环境变量：{env_path}")
+else:
+    print(f"⚠️ 未找到 .env 文件，使用默认配置：{env_path}")
+
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
 import json
