@@ -76,11 +76,10 @@ memory_cache = {}
 processed_messages = set()
 
 # 连接状态监控 (ISSUE-003 / ISSUE-027 修复)
-# 区分心跳事件和业务事件，避免把"没有用户消息"误判为连接断开
+# 简化版：仅监控业务事件，避免误判
 connection_status = {
     "connected": True,
     "last_event": time.time(),       # 业务事件（收到消息）
-    "last_heartbeat": time.time(),   # 心跳事件（ping/pong）
 }
 
 # 审批待确认 (T-056)
@@ -405,27 +404,13 @@ def main():
     # P5 优化：monkey-patch _configure，防止服务端覆盖 ping 间隔
     _original_configure = cli._configure
     
-    # 保存原始的 _send_ping 方法
-    _original_send_ping = None
-    
     def _patched_configure(conf):
-        global _original_send_ping
         _original_configure(conf)
         # ISSUE-003 优化：缩短 ping 间隔以避免超时断连
-        # 根据最近的连接日志分析，将 ping 间隔进一步调整为 10 秒以应对高延迟网络
-        cli._ping_interval = 10  # 从 15 秒缩短到 10 秒，提供更频繁的心跳
-        cli._reconnect_interval = 8  # 调整重连间隔以平衡重连速度和服务器压力
-        cli._reconnect_nonce = 10  # 增加重试次数，允许更多重连尝试
-        print(f"🔄 WebSocket 配置更新：ping 间隔={cli._ping_interval}s, 重连间隔={cli._reconnect_interval}s, 重连次数={cli._reconnect_nonce}")
-        
-        # ISSUE-027 修复：monkey-patch _send_ping 和 _on_pong，更新心跳时间
-        if hasattr(cli, '_send_ping') and _original_send_ping is None:
-            _original_send_ping = cli._send_ping
-            def _patched_send_ping():
-                _original_send_ping()
-                # 发送 ping 后更新心跳时间
-                connection_status["last_heartbeat"] = time.time()
-            cli._send_ping = _patched_send_ping
+        cli._ping_interval = 10 
+        cli._reconnect_interval = 8
+        cli._reconnect_nonce = 10
+        print(f"🔄 WebSocket 配置更新：ping 间隔={cli._ping_interval}s, 重连间隔={cli._reconnect_interval}s")
     
     cli._configure = _patched_configure
 
@@ -443,59 +428,24 @@ def main():
     # 全局变量用于监控连接状态
 
     def connection_monitor():
-        """监控连接状态，检测异常断连 (ISSUE-027 修复版)
-        
-        修复：区分心跳事件和业务事件
-        - 心跳超时 = 真的断了 → 触发重启
-        - 业务消息空闲 = 正常 → 只告警不重启
-        """
-        last_status = True
-        disconnect_count = 0
-        last_reconnect_time = 0
-        RECONNECT_COOLDOWN = 1800  # 重连冷却时间 30 分钟（防止频繁重启）
-
+        """连接监控线程 - 简化版 (ISSUE-027)"""
         while True:
-            time.sleep(30)
+            time.sleep(60)  # 每分钟检查一次
             now = time.time()
-            
-            # 分别检查心跳和业务事件
-            heartbeat_idle = now - connection_status.get("last_heartbeat", now)
             event_idle = now - connection_status.get("last_event", now)
             
-            # 心跳超时 120 秒 → 真的断了，触发重启
-            # ⚠️ 临时禁用自动重启，防止循环重启 (2026-03-10 紧急止血)
-            if heartbeat_idle > 120:
-                # 检查冷却时间
-                if now - last_reconnect_time < RECONNECT_COOLDOWN:
-                    print(f"🟠 连接监控：处于重连冷却期，跳过强制重连（心跳超时 {heartbeat_idle:.0f}s）")
-                    continue
-                    
-                print(f"🔴 连接监控：心跳超时 {heartbeat_idle:.0f}秒，但暂不自动重启（需人工检查）")
-                last_reconnect_time = now
-                disconnect_count += 1
-                
-                # 记录到日志
-                with open(os.path.expanduser("~/logs/connection_monitor.log"), "a") as f:
-                    f.write(f"{datetime.now().isoformat()}: HEARTBEAT TIMEOUT {heartbeat_idle:.0f}s - AUTO RESTART DISABLED. Disconnect count: {disconnect_count}\n")
-                
-                # ⚠️ 临时禁用自动重启，只打印日志
-                # os.system("launchctl kickstart -k gui/$(id -u)/com.zhiwei.bot")
-                print("   → 已禁用自动重启，请人工检查连接状态")
-            
-            # 业务消息空闲 5 分钟 → 只告警，不重启
-            elif event_idle > 300:
+            if event_idle > 600:  # 10 分钟无业务消息
                 if connection_status["connected"]:
-                    print(f"🟡 连接监控：业务消息空闲 5 分钟，连接正常 (心跳={heartbeat_idle:.0f}s)")
-                    connection_status["connected"] = False  # 标记为空闲状态
+                    print(f"🟡 业务消息空闲 {int(event_idle)}s，连接可能异常（仅告警）")
+                    connection_status["connected"] = False
                     
+                    # 记录到日志
                     with open(os.path.expanduser("~/logs/connection_monitor.log"), "a") as f:
-                        f.write(f"{datetime.now().isoformat()}: Business idle 5min - connection OK (heartbeat={heartbeat_idle:.0f}s)\n")
-            
-            # 连接恢复
-            elif event_idle <= 60 or heartbeat_idle <= 60:
+                        f.write(f"{datetime.now().isoformat()}: Business idle {int(event_idle)}s - Possible disconnect\n")
+            else:
                 if not connection_status["connected"]:
                     connection_status["connected"] = True
-                    print(f"✅ 连接监控：连接已恢复 (业务 idle={event_idle:.0f}s, 心跳 idle={heartbeat_idle:.0f}s)")
+                    print(f"✅ 业务消息已恢复，连接正常")
 
     # 启动监控线程
     monitor_thread = threading.Thread(target=connection_monitor, daemon=True)
