@@ -463,28 +463,24 @@ def main():
             event_idle = now - connection_status.get("last_event", now)
             
             # 心跳超时 120 秒 → 真的断了，触发重启
+            # ⚠️ 临时禁用自动重启，防止循环重启 (2026-03-10 紧急止血)
             if heartbeat_idle > 120:
                 # 检查冷却时间
                 if now - last_reconnect_time < RECONNECT_COOLDOWN:
                     print(f"🟠 连接监控：处于重连冷却期，跳过强制重连（心跳超时 {heartbeat_idle:.0f}s）")
                     continue
                     
-                print(f"🔴 连接监控：心跳超时 {heartbeat_idle:.0f}秒，触发强制重启")
+                print(f"🔴 连接监控：心跳超时 {heartbeat_idle:.0f}秒，但暂不自动重启（需人工检查）")
                 last_reconnect_time = now
                 disconnect_count += 1
                 
                 # 记录到日志
                 with open(os.path.expanduser("~/logs/connection_monitor.log"), "a") as f:
-                    f.write(f"{datetime.now().isoformat()}: Force reconnect - heartbeat timeout {heartbeat_idle:.0f}s. Disconnect count: {disconnect_count}\n")
+                    f.write(f"{datetime.now().isoformat()}: HEARTBEAT TIMEOUT {heartbeat_idle:.0f}s - AUTO RESTART DISABLED. Disconnect count: {disconnect_count}\n")
                 
-                # 触发进程重启
-                try:
-                    print("🔄 执行 launchctl kickstart 重启服务...")
-                    os.system("launchctl kickstart -k gui/$(id -u)/com.zhiwei.bot")
-                    # 重启命令发出后退出当前监控线程
-                    break
-                except Exception as e:
-                    print(f"❌ 重启失败：{e}")
+                # ⚠️ 临时禁用自动重启，只打印日志
+                # os.system("launchctl kickstart -k gui/$(id -u)/com.zhiwei.bot")
+                print("   → 已禁用自动重启，请人工检查连接状态")
             
             # 业务消息空闲 5 分钟 → 只告警，不重启
             elif event_idle > 300:
