@@ -31,7 +31,7 @@ def retrieve_from_knowledge_base(topic: str, top_k: int = 3) -> list[dict]:
     Returns:
         检索结果列表
     """
-    print(f"🔍 知识库检索: {topic}")
+    print(f"🔍 知识库检索：{topic}")
     results = hybrid_search(topic, top_k=top_k)
 
     if not results:
@@ -52,7 +52,7 @@ def retrieve_from_web(topic: str) -> list[str]:
     Returns:
         空列表（暂未实现）
     """
-    print(f"🌐 网络搜索: (功能暂未启用)")
+    print(f"🌐 网络搜索：(功能暂未启用)")
     return []
 
 
@@ -123,14 +123,14 @@ def generate_article(topic: str, context: dict) -> str:
             print("   ✅ 文章生成成功")
             return article
         else:
-            print(f"   ❌ 生成失败: {result.stderr[:200]}")
+            print(f"   ❌ 生成失败：{result.stderr[:200]}")
             return f"# {topic}\n\n生成失败：{result.stderr[:200]}"
 
     except subprocess.TimeoutExpired:
         print("   ❌ 生成超时")
-        return f"# {topic}\n\n生成超时（超过60秒）"
+        return f"# {topic}\n\n生成超时（超过 180 秒）"
     except Exception as e:
-        print(f"   ❌ 生成异常: {e}")
+        print(f"   ❌ 生成异常：{e}")
         return f"# {topic}\n\n生成异常：{str(e)}"
 
 
@@ -199,7 +199,7 @@ def write_article(topic: str, user_id: str = None) -> str:
 
     Args:
         topic: 文章主题
-        user_id: 用户ID（用于主动推送结果，可选）
+        user_id: 用户 ID（用于主动推送结果，可选）
 
     Returns:
         生成的文章（完整 Markdown 格式）
@@ -228,7 +228,7 @@ def write_article(topic: str, user_id: str = None) -> str:
     print("=" * 50)
     print(f"📝 文章撰写完成")
 
-    # 如果提供了用户ID，通过飞书主动推送结果
+    # 如果提供了用户 ID，通过飞书主动推送结果
     if user_id:
         try:
             from feishu_api import send_direct_message
@@ -241,15 +241,15 @@ def write_article(topic: str, user_id: str = None) -> str:
         except ImportError:
             print("⚠️ 无法导入 send_direct_message，无法推送结果")
         except Exception as e:
-            print(f"❌ 推送时发生异常: {e}")
+            print(f"❌ 推送时发生异常：{e}")
 
     return article
 
 
 def main():
     if len(sys.argv) < 2:
-        print("用法: python3 article_writer.py <主题>")
-        print("示例: python3 article_writer.py AI Agent 技术趋势")
+        print("用法：python3 article_writer.py <主题>")
+        print("示例：python3 article_writer.py AI Agent 技术趋势")
         sys.exit(1)
 
     topic = " ".join(sys.argv[1:])

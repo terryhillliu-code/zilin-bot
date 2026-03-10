@@ -70,6 +70,40 @@ article_writer = None
 tech_compare = None
 
 
+# ========== ISSUE-029: 异步任务超时兜底 ==========
+
+def run_with_timeout(func, args=(), timeout=300, task_name="任务"):
+    """带超时的线程执行器 (ISSUE-029)
+    
+    Args:
+        func: 要执行的函数
+        args: 函数参数
+        timeout: 超时时间 (秒)
+        task_name: 任务名称 (用于错误提示)
+    
+    Returns:
+        (result, error): 成功时 result 为返回值，失败时 error 为错误信息
+    """
+    result = {"done": False, "error": None, "output": None}
+    
+    def wrapper():
+        try:
+            result["output"] = func(*args)
+            result["done"] = True
+        except Exception as e:
+            result["error"] = str(e)
+    
+    thread = threading.Thread(target=wrapper, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    
+    if not result["done"]:
+        return None, f"⏰ {task_name}超时（超过 {timeout} 秒），请稍后重试"
+    elif result["error"]:
+        return None, f"❌ {task_name}失败：{result['error']}"
+    return result["output"], None
+
+
 def init_command_handler(
     global_reply_message, global_reply_card, global_call_openclaw_agent, global_query_knowledge_base,
     global_get_memory, global_add_to_history, global_get_history,
@@ -341,54 +375,57 @@ def handle_text_async(text: str, user_id: str, message_id: str):
             thread.start()
             return
 
-        # T-069: /写稿 命令 - 生成文章
+        # T-069: /写稿 命令 - 生成文章 (ISSUE-029: 添加超时兜底)
         if text_lower.startswith("/写稿 ") or text_lower.startswith("写稿 "):
             topic = text_stripped.split(" ", 1)[1] if " " in text_stripped else ""
             if not topic:
-                reply_message(message_id, "❌ 请提供文章主题\n\n用法: /写稿 AI Agent 技术趋势")
+                reply_message(message_id, "❌ 请提供文章主题\n\n用法：/写稿 AI Agent 技术趋势")
                 return
 
             # 发送确认消息，告知已开始生成
-            reply_message(message_id, f"✅ /写稿 任务已接收，主题：「{topic}」\n\n📝 文章生成中，请稍候...\n⏰ 预计2-3分钟，完成后将主动推送给您")
+            reply_message(message_id, f"✅ /写稿 任务已接收，主题：「{topic}」\n\n📝 文章生成中，请稍候...\n⏰ 预计 2-3 分钟，完成后将主动推送给您")
 
-            # 传递用户ID，用于后续主动推送结果
+            # 传递用户 ID，用于后续主动推送结果
             user_id_for_callback = user_id
 
-            # 异步调用文章写作模块
+            # 异步调用文章写作模块 (ISSUE-029: 使用 run_with_timeout 包装)
             def _process_article_task():
                 try:
                     _add_scheduler_path()
                     # 动态导入 article_writer 模块
                     import article_writer as aw
 
-                    # 调用修改后的 write_article，传入用户ID用于回调
+                    # 调用修改后的 write_article，传入用户 ID 用于回调
                     article = aw.write_article(topic, user_id_for_callback)
 
                     # 不再使用 reply_message，因为是在后台线程中执行
                     # 结果将由 article_writer 通过 send_direct_message 主动推送
                 except Exception as e:
-                    print(f"❌ 文章写作异常: {e}")
+                    print(f"❌ 文章写作异常：{e}")
                     traceback.print_exc()
                     # 发送错误信息给用户
                     from feishu_api import send_direct_message
-                    send_direct_message(user_id_for_callback, f"❌ 文章生成失败: {str(e)}")
+                    send_direct_message(user_id_for_callback, f"❌ 文章生成失败：{str(e)}")
 
-            thread = threading.Thread(target=_process_article_task, daemon=True)
-            thread.start()
+            # ISSUE-029: 使用超时包装，180 秒超时
+            result, error = run_with_timeout(_process_article_task, timeout=180, task_name="写稿")
+            if error:
+                from feishu_api import send_direct_message
+                send_direct_message(user_id_for_callback, error)
             return
 
-        # T-071: /对比 命令 - 技术对比
+        # T-071: /对比 命令 - 技术对比 (ISSUE-029: 添加超时兜底)
         if text_lower.startswith("/对比 ") or text_lower.startswith("对比 "):
             comparison_text = text_stripped.split(" ", 1)[1] if " " in text_stripped else ""
             if not comparison_text:
-                reply_message(message_id, "❌ 请提供对比项\n\n用法: /对比 React vs Vue")
-                reply_message(message_id, "支持格式: /对比 A vs B / 对比 A vs B / 对比 A 与 B")
+                reply_message(message_id, "❌ 请提供对比项\n\n用法：/对比 React vs Vue")
+                reply_message(message_id, "支持格式：/对比 A vs B / 对比 A vs B / 对比 A 与 B")
                 return
 
             # 立即回复用户，告知已开始生成
-            reply_message(message_id, f"📊 已开始生成「{comparison_text}」对比\n\n⏳ 预计2-3分钟，完成后将主动推送结果")
+            reply_message(message_id, f"📊 已开始生成「{comparison_text}」对比\n\n⏳ 预计 2-3 分钟，完成后将主动推送结果")
 
-            # 启动后台线程处理对比任务
+            # 启动后台线程处理对比任务 (ISSUE-029: 使用 run_with_timeout 包装)
             def _process_compare_task():
                 try:
                     _add_scheduler_path()
@@ -401,23 +438,26 @@ def handle_text_async(text: str, user_id: str, message_id: str):
                         reply_message(message_id, "❌ 无法解析对比项，请使用 'A vs B' 格式")
                         return
 
-                    # 调用对比函数并传入用户ID以便主动推送结果
+                    # 调用对比函数并传入用户 ID 以便主动推送结果
                     result = tc.compare_tech(item_a, item_b, user_id)
 
                     # 如果推送失败，可以提供一个备用的反馈
                     print(f"📊 技术对比任务完成，结果已推送给用户 {user_id}")
                 except Exception as e:
-                    print(f"❌ 技术对比异常: {e}")
+                    print(f"❌ 技术对比异常：{e}")
                     traceback.print_exc()
                     # 尝试推送错误信息给用户
                     try:
                         from feishu_api import send_direct_message
-                        send_direct_message(user_id, f"❌ 对比生成失败: {str(e)}")
+                        send_direct_message(user_id, f"❌ 对比生成失败：{str(e)}")
                     except:
-                        reply_message(message_id, f"❌ 对比生成失败: {str(e)}")
+                        reply_message(message_id, f"❌ 对比生成失败：{str(e)}")
 
-            thread = threading.Thread(target=_process_compare_task, daemon=True)
-            thread.start()
+            # ISSUE-029: 使用超时包装，90 秒超时
+            result, error = run_with_timeout(_process_compare_task, timeout=90, task_name="对比")
+            if error:
+                from feishu_api import send_direct_message
+                send_direct_message(user_id, error)
             return
 
         # T-065: 收录网页到知识库 — 调用 knowledge-collect Skill
