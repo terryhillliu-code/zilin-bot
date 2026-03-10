@@ -4,6 +4,7 @@
 """
 
 import os
+import sqlite3
 import json
 import subprocess
 import tempfile
@@ -219,7 +220,7 @@ def handle_text_async(text: str, user_id: str, message_id: str):
 
         # ===== 3. 命令处理 =====
 
-        if text_lower in ["/help", "帮助", "/帮助"]:
+        if text_lower.startswith("/help") or text_lower in ["帮助", "/帮助"] or text_lower == "help":
             reply_message(message_id, show_help())
             return
 
@@ -531,7 +532,7 @@ URL: {url}
                 reply_message(message_id, f"❌ 收录异常: {str(e)}")
             return
 
-        if text_lower in ["/reset", "重置", "/重置", "新对话"]:
+        if text_lower.startswith("/reset") or text_lower in ["重置", "/重置", "新对话"]:
             memory = get_memory(user_id)
             memory.reset()
             if user_id in pending_image:
@@ -539,16 +540,16 @@ URL: {url}
             reply_message(message_id, "✅ 会话和记忆已重置\n\n开始新对话吧！")
             return
 
-        if text_lower in ["/history", "历史", "/记录"]:
+        if text_lower.startswith("/history") or text_lower in ["历史", "/记录"]:
             reply_message(message_id, get_history(user_id))
             return
 
-        if text_lower in ["/memory", "记忆", "/记忆"]:
+        if text_lower.startswith("/memory") or text_lower in ["记忆", "/记忆"]:
             memory = get_memory(user_id)
             reply_message(message_id, f"🧠 记忆状态\n\n{memory.get_stats()}")
             return
 
-        if text_lower in ["/tasks", "任务", "/任务"]:
+        if text_lower.startswith("/tasks") or text_lower in ["任务", "/任务"]:
             reply_message(message_id, TaskLogger.get_recent(5))
             return
 
@@ -563,11 +564,11 @@ URL: {url}
             reply_message(message_id, f"📌 会话 ID: {session_id}")
             return
 
-        if text_lower in ["/status", "状态", "/状态"]:
+        if text_lower.startswith("/status") or text_lower in ["状态", "/状态"]:
             reply_message(message_id, get_quick_status())
             return
 
-        if text_lower in ["/model", "模型", "/模型"]:
+        if text_lower.startswith("/model") or text_lower in ["模型", "/模型"]:
             try:
                 config_path = os.path.expanduser("~/logs/current_model.json")
                 if os.path.exists(config_path):
@@ -598,6 +599,11 @@ URL: {url}
                 reply_message(message_id, msg)
             except Exception as e:
                 reply_message(message_id, f"❌ 切换异常: {e}")
+            return
+
+        # 兜底：拦截所有未识别的 / 命令，防止漏给 OpenClaw
+        if text_stripped.startswith("/"):
+            reply_message(message_id, f"❌ 未知命令: `{text_stripped.split()[0]}`\n\n发送 /help 查看所有可用命令。")
             return
 
         # ===== 4. 网页链接 =====
@@ -742,20 +748,27 @@ def get_quick_status() -> str:
     except:
         pass
 
-    # 知识库状态
+    # 知识库状态 (查询 Core/Important/Reference 进度)
     try:
-        lines.append("\n**知识库:**")
-        cmd = [
-            "python3", "-c",
-            "import sys,os; sys.path.append(os.path.expanduser('~/Documents/Library')); import klib_db; c=klib_db.get_db_connection(); print(c.execute('SELECT count(*) FROM books').fetchone()[0]); c.close()"
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        if res.returncode == 0:
-            lines.append(f"  • 收录书籍: {res.stdout.strip()} 本")
-        else:
-            lines.append("  • 状态未知")
-    except:
-        pass
+        db_path = os.path.expanduser("~/Documents/Library/klib.db")
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            "SELECT priority, COUNT(*) as total, "
+            "SUM(CASE WHEN vectorized = 1 THEN 1 ELSE 0 END) as done "
+            "FROM books GROUP BY priority"
+        ).fetchall()
+        conn.close()
+        
+        lines.append("\n**📊 向量化进度:**")
+        priority_order = ['core', 'important', 'reference']
+        progress = {row[0].lower(): (row[2], row[1]) for row in rows if row[0]}
+        for p in priority_order:
+            done, total = progress.get(p, (0, 0))
+            pct = (done / total * 100) if total > 0 else 0
+            emoji = "🔴" if p == "core" else "🟡" if p == "important" else "⚪"
+            lines.append(f"  {emoji} {p.capitalize()}: {pct:.0f}% ({done}/{total})")
+    except Exception as e:
+        lines.append(f"  • 向量化进度查询失败: {e}")
 
     return "\n".join(lines)
 
