@@ -115,7 +115,7 @@ def load_active_user() -> str:
 def query_knowledge_base(query: str) -> str:
     """调用本地知识库 (klib) 进行检索"""
     try:
-        print(f"📚 RAG 检索: {query}")
+        print(f"📚 RAG 检索：{query}")
         cmd = [
             "python3",
             os.path.expanduser("~/Documents/Library/klib_query.py"),
@@ -131,14 +131,14 @@ def query_knowledge_base(query: str) -> str:
                 return None
             return output
         else:
-            print(f"❌ RAG 检索失败: {result.stderr[:200]}")
+            print(f"❌ RAG 检索失败：{result.stderr[:200]}")
             return None
 
     except subprocess.TimeoutExpired:
         print("❌ RAG 检索超时")
         return None
     except Exception as e:
-        print(f"❌ RAG 调用异常: {e}")
+        print(f"❌ RAG 调用异常：{e}")
         return None
 
 # ========== 应用配置 ==========
@@ -151,7 +151,7 @@ APP_ID = os.environ.get("FEISHU_APP_ID")
 APP_SECRET = os.environ.get("FEISHU_APP_SECRET")
 
 if not APP_ID or not APP_SECRET:
-    print("❌ 错误: 未能在环境变量中找到 FEISHU_APP_ID/SECRET。请检查 .env 文件。")
+    print("❌ 错误：未能在环境变量中找到 FEISHU_APP_ID/SECRET。请检查 .env 文件。")
     sys.exit(1)
 
 client = lark.Client.builder() \
@@ -176,7 +176,7 @@ def get_memory(user_id: str) -> MemoryManager:
 
 
 def cleanup_pending_images():
-    """清理过期的待处理图片（10分钟过期）"""
+    """清理过期的待处理图片（10 分钟过期）"""
     current_time = time.time()
     expired = []
     for user_id, data in pending_image.items():
@@ -220,16 +220,16 @@ def call_openclaw_agent(message: str, session_id: str, agent: str = "main") -> s
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode == 0:
             response = result.stdout.strip()
-            print(f"✅ Agent 响应: {len(response)} 字符")
+            print(f"✅ Agent 响应：{len(response)} 字符")
             return response
         else:
             error = result.stderr or result.stdout
-            print(f"❌ Agent 错误: {error[:200]}")
+            print(f"❌ Agent 错误：{error[:200]}")
             return "❌ AI 暂时无法响应，请稍后重试"
     except subprocess.TimeoutExpired:
         return "⏰ 响应超时，请简化问题后重试"
     except Exception as e:
-        return f"❌ 调用异常: {str(e)}"
+        return f"❌ 调用异常：{str(e)}"
 
 
 # 初始化命令处理模块（需要 call_openclaw_agent 已定义）
@@ -258,7 +258,7 @@ def do_p2_im_message_receive_v1(data) -> None:
     except AttributeError:
         pass
 
-    print(f"📡 [Event] 收到消息: type={msg_type}, id={message_id}")
+    print(f"📡 [Event] 收到消息：type={msg_type}, id={message_id}")
     
     # 更新最后事件时间以监控连接状态
     connection_status["last_event"] = time.time()
@@ -288,7 +288,7 @@ def do_p2_im_message_receive_v1(data) -> None:
             save_active_user(temp_user_id)
 
         if not check_rate_limit(temp_user_id):
-            print(f"⚠️ 限流: {temp_user_id}")
+            print(f"⚠️ 限流：{temp_user_id}")
             return
 
         if len(processed_messages) > 1000:
@@ -302,7 +302,7 @@ def do_p2_im_message_receive_v1(data) -> None:
             user_id = sender.sender_id.user_id or sender.sender_id.open_id or sender.sender_id.union_id or "unknown"
 
         print(f"\n{'=' * 50}")
-        print(f"📨 [{msg_type}] 用户: {str(user_id)[:10]}...")
+        print(f"📨 [{msg_type}] 用户：{str(user_id)[:10]}...")
 
         # T-056: 持久化最近活跃用户
         save_active_user(user_id)
@@ -312,7 +312,7 @@ def do_p2_im_message_receive_v1(data) -> None:
         if msg_type == "text":
             text = content_dict.get("text", "")
             text = re.sub(r'@_user_\d+\s*', '', text).strip()
-            print(f"   文本: {text[:50]}...")
+            print(f"   文本：{text[:50]}...")
             if text:
                 thread = threading.Thread(
                     target=handle_text_async,
@@ -326,7 +326,7 @@ def do_p2_im_message_receive_v1(data) -> None:
 
         elif msg_type == "image":
             image_key = content_dict.get("image_key", "")
-            print(f"   图片: {image_key[:30]}...")
+            print(f"   图片：{image_key[:30]}...")
             reply_message(message_id, "🖼️ 正在分析图片，请稍候...")
             thread = threading.Thread(
                 target=handle_image_async,
@@ -339,12 +339,12 @@ def do_p2_im_message_receive_v1(data) -> None:
                 "📁 暂不支持该文件类型\n\n支持：文字 | 图片 | 网页链接 | 视频链接")
 
         else:
-            print(f"   ⏭️ 不支持: {msg_type}")
+            print(f"   ⏭️ 不支持：{msg_type}")
 
         print(f"{'=' * 50}")
 
     except Exception as e:
-        print(f"❌ 处理错误: {e}")
+        print(f"❌ 处理错误：{e}")
         import traceback
         traceback.print_exc()
 
@@ -360,7 +360,7 @@ def do_p2_card_action_trigger_v1(data) -> None:
         task_id = value.get("task_id")
         plan_name = value.get("plan_name")
         
-        print(f"🔘 卡片交互: {action_type} for {plan_name or task_id} by {user_id}")
+        print(f"🔘 卡片交互：{action_type} for {plan_name or task_id} by {user_id}")
         
         if action_type in ["approve", "reject"]:
             # 发送响应消息到 MessageBus
@@ -381,7 +381,7 @@ def do_p2_card_action_trigger_v1(data) -> None:
             reply_message(data.context.open_message_id, f"✅ 已收到您的「{ '批准' if action_type == 'approve' else '拒绝' }」操作。正在处理中...")
             
     except Exception as e:
-        print(f"❌ 处理卡片回调失败: {e}")
+        print(f"❌ 处理卡片回调失败：{e}")
 
 def main():
     event_handler = lark.EventDispatcherHandler.builder("", "") \
@@ -406,13 +406,13 @@ def main():
         cli._ping_interval = 10  # 从 15 秒缩短到 10 秒，提供更频繁的心跳
         cli._reconnect_interval = 8  # 调整重连间隔以平衡重连速度和服务器压力
         cli._reconnect_nonce = 10  # 增加重试次数，允许更多重连尝试
-        print(f"🔄 WebSocket 配置更新: ping间隔={cli._ping_interval}s, 重连间隔={cli._reconnect_interval}s, 重连次数={cli._reconnect_nonce}")
+        print(f"🔄 WebSocket 配置更新：ping 间隔={cli._ping_interval}s, 重连间隔={cli._reconnect_interval}s, 重连次数={cli._reconnect_nonce}")
     cli._configure = _patched_configure
 
-    print("🤖 知微 v2.1 启动 (RAG增强版)")
-    print("   新增: 知识库检索 (/ask 或 '查一下')")
-    print("   特性: 三层记忆 | 意图路由 | 任务日志")
-    print("   支持: 文字 | 图片 | 网页链接 | 视频链接")
+    print("🤖 知微 v2.1 启动 (RAG 增强版)")
+    print("   新增：知识库检索 (/ask 或 '查一下')")
+    print("   特性：三层记忆 | 意图路由 | 任务日志")
+    print("   支持：文字 | 图片 | 网页链接 | 视频链接")
     print("-" * 50)
 
     # ISSUE-003: 断连监控和告警线程
@@ -423,24 +423,57 @@ def main():
     # 全局变量用于监控连接状态
 
     def connection_monitor():
-        """监控连接状态，检测异常断连"""
+        """监控连接状态，检测异常断连 (ISSUE-027 增强版)"""
         last_status = True
         disconnect_count = 0
+        last_reconnect_time = 0
+        RECONNECT_COOLDOWN = 300  # 重连冷却时间 5 分钟
 
         while True:
+            time.sleep(30)
             current_time = time.time()
-            # 如果超过60秒没有收到任何事件，则认为可能有问题
-            if current_time - connection_status["last_event"] > 60:
+            idle_time = current_time - connection_status["last_event"]
+            
+            # 120 秒无事件 → 尝试强制重连
+            if idle_time > 120:
+                # 检查冷却时间
+                if current_time - last_reconnect_time < RECONNECT_COOLDOWN:
+                    print(f"🟠 连接监控：处于重连冷却期，跳过强制重连")
+                    continue
+                    
+                print(f"🔴 连接监控：120 秒无事件，尝试强制重连")
+                last_reconnect_time = current_time
+                disconnect_count += 1
+                
+                # 记录到日志
+                with open(os.path.expanduser("~/logs/connection_monitor.log"), "a") as f:
+                    f.write(f"{datetime.now().isoformat()}: Force reconnect triggered. Idle time: {idle_time:.0f}s. Disconnect count: {disconnect_count}\n")
+                
+                # 方式 1：触发进程重启
+                try:
+                    print("🔄 执行 launchctl kickstart 重启服务...")
+                    os.system("launchctl kickstart -k gui/$(id -u)/com.zhiwei.bot")
+                    # 重启命令发出后退出当前监控线程
+                    break
+                except Exception as e:
+                    print(f"❌ 重启失败：{e}")
+            
+            # 90 秒无事件 → 第一次告警
+            elif idle_time > 90:
                 if connection_status["connected"]:
-                    print(f"⚠️ 检测到可能的连接问题 - 超过60秒无事件")
-                    # 这里可以增加更多诊断逻辑
+                    print(f"🟡 连接监控：90 秒无事件，可能存在连接问题")
                     connection_status["connected"] = False
                     disconnect_count += 1
-                    # 记录到日志用于分析
+                    
                     with open(os.path.expanduser("~/logs/connection_monitor.log"), "a") as f:
-                        f.write(f"{datetime.now().isoformat()}: Possible disconnection detected. Disconnect count: {disconnect_count}\n")
-
-            time.sleep(30)  # 每30秒检查一次
+                        f.write(f"{datetime.now().isoformat()}: Warning - 90s idle. Disconnect count: {disconnect_count}\n")
+            
+            # 连接正常或恢复
+            elif idle_time <= 60:
+                if not connection_status["connected"]:
+                    # 连接恢复
+                    connection_status["connected"] = True
+                    print(f"✅ 连接监控：连接已恢复 (idle={idle_time:.0f}s)")
 
     # 启动监控线程
     monitor_thread = threading.Thread(target=connection_monitor, daemon=True)
@@ -468,7 +501,7 @@ def main():
             mb.publish(
                 sender="bot/startup",
                 topic="feishu_notification",
-                content=f"🤖知微机器人已重启\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nAppID: {APP_ID[:8]}...",
+                content=f"🤖知微机器人已重启\n时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nAppID: {APP_ID[:8]}...",
                 metadata={"user_id": load_active_user()}
             )
         except: pass
@@ -523,13 +556,13 @@ def main():
                                     mb.mark_failed(msg["id"], "Feishu API delivery failed")
                                     print(f"❌ MessageBus: 消息 {msg['id']} 推送失败")
                             except Exception as em:
-                                print(f"❌ MessageBus: 处理单条消息 {msg['id']} 异常: {em}")
+                                print(f"❌ MessageBus: 处理单条消息 {msg['id']} 异常：{em}")
                                 mb.mark_failed(msg["id"], str(em))
                     except Exception as et:
-                        print(f"❌ MessageBus: [Topic: {topic}] 轮询异常: {et}")
+                        print(f"❌ MessageBus: [Topic: {topic}] 轮询异常：{et}")
                 time.sleep(2)
             except Exception as e:
-                print(f"❌ MessageBus: 主循环异常: {e}")
+                print(f"❌ MessageBus: 主循环异常：{e}")
                 time.sleep(5)
 
     msg_bus_thread = threading.Thread(target=poll_message_bus, daemon=True)
