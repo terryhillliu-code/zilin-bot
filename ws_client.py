@@ -147,16 +147,12 @@ def query_knowledge_base(query: str) -> str:
 
 # ========== 应用配置 ==========
 
-APP_ID = os.environ.get("FEISHU_APP_ID", "cli_a9142bd071bd1bd9")
-APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "mlIZdNRvxpaVQIB6VQxHIee6WgW4UcPf")
-
-# 兜底：如果被错误清空，再次写死兜底
-if not APP_ID or not APP_SECRET:
-    APP_ID = "cli_a9142bd071bd1bd9"
-    APP_SECRET = "mlIZdNRvxpaVQIB6VQxHIee6WgW4UcPf"
+APP_ID = os.environ.get("FEISHU_APP_ID")
+APP_SECRET = os.environ.get("FEISHU_APP_SECRET")
 
 if not APP_ID or not APP_SECRET:
-    print("❌ 错误: 未能在环境变量或 settings.yaml 中找到 FEISHU_APP_ID/SECRET")
+    print("❌ 错误: 未能在环境变量中找到 FEISHU_APP_ID/SECRET。请检查 .env 文件。")
+    sys.exit(1)
 
 client = lark.Client.builder() \
     .app_id(APP_ID) \
@@ -252,27 +248,45 @@ init_command_handler(
 
 def do_p2_im_message_receive_v1(data) -> None:
     global processed_messages, connection_status
+    
+    # 获取消息 ID 和类型
+    message_id = "N/A"
+    msg_type = "unknown"
+    try:
+        message_id = data.event.message.message_id
+        msg_type = data.event.message.message_type
+    except AttributeError:
+        pass
+
+    print(f"📡 [Event] 收到消息: type={msg_type}, id={message_id}")
+    
     # 更新最后事件时间以监控连接状态
     connection_status["last_event"] = time.time()
-    connection_status["connected"] = True  # 确保在收到消息时设置为连接状态
+    connection_status["connected"] = True
 
     try:
         event = data.event
         message = event.message
-        message_id = message.message_id
 
         cleanup_pending_images()
 
         # 去重
         if message_id in processed_messages:
+            print(f"⏭️ 消息 {message_id} 已处理过，跳过")
             return
         processed_messages.add(message_id)
 
-        # 限流
+        # 限流 & 识别用户
         sender = event.sender
         temp_user_id = "unknown"
         if sender and sender.sender_id:
-            temp_user_id = sender.sender_id.user_id or sender.sender_id.open_id or "unknown"
+            # 优先使用 open_id，因为它在 API 调用中更通用且需要权限较少
+            temp_user_id = sender.sender_id.open_id or sender.sender_id.user_id or "unknown"
+        
+        # 保存最近活跃用户
+        if temp_user_id != "unknown":
+            save_active_user(temp_user_id)
+
         if not check_rate_limit(temp_user_id):
             print(f"⚠️ 限流: {temp_user_id}")
             return
@@ -375,11 +389,12 @@ def main():
         .register_p2_card_action_trigger(do_p2_card_action_trigger_v1) \
         .build()
 
+    print(f"🔧 启动 WebSocket 客户端 (AppID: {APP_ID})")
     cli = lark.ws.Client(
         APP_ID,
         APP_SECRET,
         event_handler=event_handler,
-        log_level=lark.LogLevel.INFO
+        log_level=lark.LogLevel.DEBUG
     )
 
     # P5 优化：monkey-patch _configure，防止服务端覆盖 ping 间隔
@@ -406,7 +421,6 @@ def main():
     from datetime import datetime
 
     # 全局变量用于监控连接状态
-    connection_status = {"connected": True, "last_event": time.time()}
 
     def connection_monitor():
         """监控连接状态，检测异常断连"""
@@ -443,59 +457,79 @@ def main():
     # task_notify_thread = threading.Thread(target=poll_task_notifications, daemon=True)
     # task_notify_thread.start()
 
-    # 启动统一的 MessageBus 消费线程 (取代原有的文件轮询)
+    # 启动统一的 MessageBus 消费线程
     def poll_message_bus():
         import feishu_api as _feishu_api_mod
         mb = MessageBus()
         print("💡 MessageBus 消费线程已启动")
+        
+        # 启动时发布一条自检消息
+        try:
+            mb.publish(
+                sender="bot/startup",
+                topic="feishu_notification",
+                content=f"🤖知微机器人已重启\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nAppID: {APP_ID[:8]}...",
+                metadata={"user_id": load_active_user()}
+            )
+        except: pass
+
         while True:
             try:
                 # 消费飞书通知和审批主题
                 topics = ["feishu_notification", "feishu_card_notification"]
                 for topic in topics:
-                    messages = mb.consume_pending(topic=topic, limit=5)
-                    if messages:
-                        print(f"📥 MessageBus: 发现 {len(messages)} 条新消息 ({topic})")
-                    for msg in messages:
-                        print(f"🔄 MessageBus: 正在处理消息 {msg['id']}...")
-                        try:
-                            meta = json.loads(msg["metadata"] or "{}")
-                            target_user = meta.get("user_id") or last_active_user.get("user_id") or load_active_user()
-                            
-                            if not target_user:
-                                print(f"⚠️ MessageBus: 消息 {msg['id']} 找不到目标飞书用户")
-                                continue
+                    try:
+                        messages = mb.consume_pending(topic=topic, limit=5)
+                        if messages:
+                            print(f"📥 MessageBus: 发现 {len(messages)} 条新消息 ({topic})")
+                        for msg in messages:
+                            print(f"🔄 MessageBus: 正在处理消息 {msg['id']}...")
+                            try:
+                                meta = json.loads(msg["metadata"] or "{}")
+                                target_user = meta.get("user_id") or last_active_user.get("user_id") or load_active_user()
+                                
+                                if not target_user:
+                                    print(f"⚠️ MessageBus: 消息 {msg['id']} 找不到目标用户，标记为失败")
+                                    mb.mark_failed(msg["id"], "No target user found")
+                                    continue
 
-                            if topic == "feishu_notification":
-                                # 普通文本消息
-                                success = _feishu_api_mod.send_direct_message(target_user, msg["content"])
-                            else:
-                                # 卡片消息 (metadata 中包含卡片 JSON)
-                                card_content = msg["content"]
-                                try:
-                                    from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+                                if topic == "feishu_notification":
+                                    success = _feishu_api_mod.send_direct_message(target_user, msg["content"])
+                                else:
+                                    # 卡片消息 - 自动识别 ID 类型
+                                    id_type = "user_id"
+                                    if target_user.startswith("ou_"):
+                                        id_type = "open_id"
+                                    elif target_user.startswith("on_"):
+                                        id_type = "union_id"
+                                    elif target_user.startswith("oc_"):
+                                        id_type = "chat_id"
+
                                     request = CreateMessageRequest.builder() \
-                                        .receive_id_type("open_id") \
+                                        .receive_id_type(id_type) \
                                         .request_body(CreateMessageRequestBody.builder()
                                             .receive_id(target_user)
-                                            .content(card_content)
+                                            .content(msg["content"])
                                             .msg_type("interactive")
                                             .build()) \
                                         .build()
                                     response = client.im.v1.message.create(request)
                                     success = response.success()
-                                except: success = False
 
-                            if success:
-                                mb.mark_sent(msg["id"])
-                                print(f"✅ MessageBus: [{topic}] 消息 {msg['id']} 已推送到飞书")
-                            else:
-                                mb.mark_failed(msg["id"], "Feishu API delivery failed")
-                        except Exception as e:
-                            print(f"❌ 处理 MessageBus 消息异常: {e}")
+                                if success:
+                                    mb.mark_sent(msg["id"])
+                                    print(f"✅ MessageBus: 消息 {msg['id']} 已成功推送到飞书")
+                                else:
+                                    mb.mark_failed(msg["id"], "Feishu API delivery failed")
+                                    print(f"❌ MessageBus: 消息 {msg['id']} 推送失败")
+                            except Exception as em:
+                                print(f"❌ MessageBus: 处理单条消息 {msg['id']} 异常: {em}")
+                                mb.mark_failed(msg["id"], str(em))
+                    except Exception as et:
+                        print(f"❌ MessageBus: [Topic: {topic}] 轮询异常: {et}")
                 time.sleep(2)
             except Exception as e:
-                print(f"❌ MessageBus 消费异常: {e}")
+                print(f"❌ MessageBus: 主循环异常: {e}")
                 time.sleep(5)
 
     msg_bus_thread = threading.Thread(target=poll_message_bus, daemon=True)

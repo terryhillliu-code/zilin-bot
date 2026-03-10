@@ -22,7 +22,7 @@ def init_feishu_api(global_client):
     client = global_client
 
 
-def reply_message(message_id: str, text: str) -> bool:
+def reply_message(message_id: str, text: str, **kwargs) -> bool:
     """回复文本消息，失败自动重试（共3次尝试）"""
     max_retries = 3
     retry_delays = [0, 1, 3]  # 首次立即，第二次等1秒，第三次等3秒
@@ -60,7 +60,7 @@ def reply_message(message_id: str, text: str) -> bool:
     return False
 
 
-def send_direct_message(user_id: str, text: str) -> bool:
+def send_direct_message(user_id: str, text: str, **kwargs) -> bool:
     """通过用户ID直接发送消息，用于主动推送"""
     max_retries = 3
     retry_delays = [0, 1, 3]  # 首次立即，第二次等1秒，第三次等3秒
@@ -75,8 +75,20 @@ def send_direct_message(user_id: str, text: str) -> bool:
                 text = text[:3900] + "\n\n...(内容过长已截断)"
             content = json.dumps({"text": text})
 
+            # 自动识别 ID 类型
+            id_type = kwargs.get("receive_id_type")
+            if not id_type:
+                if user_id.startswith("ou_"):
+                    id_type = "open_id"
+                elif user_id.startswith("on_"):
+                    id_type = "union_id"
+                elif user_id.startswith("oc_"):
+                    id_type = "chat_id"
+                else:
+                    id_type = "user_id"
+
             request = CreateMessageRequest.builder() \
-                .receive_id_type("open_id") \
+                .receive_id_type(id_type) \
                 .request_body(CreateMessageRequestBody.builder()
                     .receive_id(user_id)
                     .content(content)
