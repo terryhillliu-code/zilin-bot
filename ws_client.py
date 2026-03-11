@@ -28,6 +28,7 @@ import threading
 import time
 from pathlib import Path
 from collections import defaultdict, deque
+import signal
 
 # 导入新模块
 from memory_manager import MemoryManager
@@ -400,6 +401,17 @@ def main():
         event_handler=event_handler,
         log_level=lark.LogLevel.DEBUG
     )
+
+    # 信号处理，实现优雅退出 (ISSUE-027)
+    def handle_exit(sig, frame):
+        print(f"\n🛑 收到信号 {sig}，正在优雅退出...")
+        try:
+            cli.stop()
+        except: pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, handle_exit)
+    signal.signal(signal.SIGTERM, handle_exit)
 
     # P5 优化：monkey-patch _configure，防止服务端覆盖 ping 间隔
     _original_configure = cli._configure
