@@ -28,6 +28,7 @@ import threading
 import time
 from pathlib import Path
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 import signal
 
 # 导入新模块
@@ -75,6 +76,9 @@ memory_cache = {}
 
 # 消息去重 (deque 自动淘汰旧消息)
 processed_messages = deque(maxlen=500)
+
+# 线程池（最大 10 个并发任务）
+executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="msg_handler")
 
 # 连接状态监控 (ISSUE-003 / ISSUE-027 修复)
 # 简化版：仅监控业务事件，避免误判
@@ -308,11 +312,7 @@ def do_p2_im_message_receive_v1(data) -> None:
             text = re.sub(r'@_user_\d+\s*', '', text).strip()
             print(f"   文本：{text[:50]}...")
             if text:
-                thread = threading.Thread(
-                    target=handle_text_async,
-                    args=(text, user_id, message_id)
-                )
-                thread.start()
+                executor.submit(handle_text_async, text, user_id, message_id)
 
         elif msg_type == "audio":
             reply_message(message_id,
@@ -322,11 +322,7 @@ def do_p2_im_message_receive_v1(data) -> None:
             image_key = content_dict.get("image_key", "")
             print(f"   图片：{image_key[:30]}...")
             reply_message(message_id, "🖼️ 正在分析图片，请稍候...")
-            thread = threading.Thread(
-                target=handle_image_async,
-                args=(message_id, image_key, user_id)
-            )
-            thread.start()
+            executor.submit(handle_image_async, message_id, image_key, user_id)
 
         elif msg_type in ["media", "file"]:
             reply_message(message_id,
@@ -394,6 +390,9 @@ def main():
     # 信号处理，实现优雅退出 (ISSUE-027)
     def handle_exit(sig, frame):
         print(f"\n🛑 收到信号 {sig}，正在优雅退出...")
+        try:
+            executor.shutdown(wait=False)
+        except: pass
         try:
             cli.stop()
         except: pass
