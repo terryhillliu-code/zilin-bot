@@ -73,8 +73,8 @@ MAX_HISTORY = 20
 # 记忆管理器缓存（user_id -> MemoryManager）
 memory_cache = {}
 
-# 消息去重
-processed_messages = set()
+# 消息去重 (deque 自动淘汰旧消息)
+processed_messages = deque(maxlen=500)
 
 # 连接状态监控 (ISSUE-003 / ISSUE-027 修复)
 # 简化版：仅监控业务事件，避免误判
@@ -145,10 +145,6 @@ def query_knowledge_base(query: str) -> str:
     except Exception as e:
         print(f"❌ RAG 调用异常：{e}")
         return None
-
-# ========== 应用配置 ==========
-
-# ========== 应用配置 ==========
 
 # ========== 应用配置 ==========
 
@@ -296,9 +292,6 @@ def do_p2_im_message_receive_v1(data) -> None:
             print(f"⚠️ 限流：{temp_user_id}")
             return
 
-        if len(processed_messages) > 1000:
-            keep = list(processed_messages)[-500:]; processed_messages.clear(); processed_messages.update(keep)
-
         msg_type = message.message_type
         content_str = message.content
 
@@ -433,8 +426,6 @@ def main():
     print("-" * 50)
 
     # ISSUE-003: 断连监控和告警线程
-    import threading
-    import time
     from datetime import datetime
 
     # 全局变量用于监控连接状态
