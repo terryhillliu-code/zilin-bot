@@ -117,29 +117,25 @@ def load_active_user() -> str:
 
 # ========== RAG 知识库功能 (Phase 4 新增) ==========
 
-def query_knowledge_base(query: str) -> str:
-    """调用本地知识库 (klib) 进行检索"""
+def query_knowledge_base(query: str, top_k: int = 3) -> str:
+    """通过 rag-api HTTP 接口检索知识库"""
+    import requests
     try:
         print(f"📚 RAG 检索：{query}")
-        cmd = [
-            "python3",
-            os.path.expanduser("~/Documents/Library/klib_query.py"),
-            "search",
-            query
-        ]
-
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-
-        if result.returncode == 0:
-            output = result.stdout.strip()
-            if "No relevant results found" in output or not output:
+        resp = requests.post(
+            "http://127.0.0.1:8765/search",
+            json={"query": query, "top_k": top_k},
+            timeout=30
+        )
+        if resp.ok:
+            results = resp.json().get("results", [])
+            if not results:
                 return None
-            return output
+            return "\n\n".join([r.get("text", "") for r in results])
         else:
-            print(f"❌ RAG 检索失败：{result.stderr[:200]}")
+            print(f"❌ RAG 检索失败：HTTP {resp.status_code}")
             return None
-
-    except subprocess.TimeoutExpired:
+    except requests.Timeout:
         print("❌ RAG 检索超时")
         return None
     except Exception as e:
@@ -453,17 +449,6 @@ def main():
     # 启动监控线程
     monitor_thread = threading.Thread(target=connection_monitor, daemon=True)
     monitor_thread.start()
-
-    # 原 poll_review_notifications 和 poll_task_notifications 已废弃
-    # 逻辑整合入 poll_message_bus
-
-    # T-056: 审批通知轮询线程
-    # poll_thread = threading.Thread(target=poll_review_notifications, daemon=True)
-    # poll_thread.start()
-
-    # T-055: 启动任务通知轮询线程
-    # task_notify_thread = threading.Thread(target=poll_task_notifications, daemon=True)
-    # task_notify_thread.start()
 
     # 启动统一的 MessageBus 消费线程
     def poll_message_bus():
