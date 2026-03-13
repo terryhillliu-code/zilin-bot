@@ -299,13 +299,54 @@ def handle_video_async(text: str, message_id: str, user_id: str):
 
 
 def process_video(text: str, message_id: str = None) -> str:
-    """处理视频分析"""
+    """处理视频分析 - 调用宿主机 Distiller"""
     try:
         url = extract_video_url(text)
         if not url:
             return "❌ 未找到有效的视频链接"
-        print(f"🎬 视频链接: {url}")
+        logger.info(f"🎬 视频链接: {url}")
 
+        # 调用宿主机 Distiller（新链路）
+        distiller_path = os.path.expanduser("~/zhiwei-bot/scripts/douyin_distiller.py")
+        venv_python = os.path.expanduser("~/zhiwei-bot/venv/bin/python")
+
+        cmd = [
+            venv_python, distiller_path,
+            "--from-text", text,
+            "--output-dir", os.path.expanduser("~/Documents/ZhiweiVault/Inbox")
+        ]
+
+        logger.info(f"🎬 调用 Distiller: {' '.join(cmd[:3])}...")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+        if result.returncode != 0:
+            # 降级：如果 Distiller 失败，尝试容器内的旧版
+            logger.warning(f"Distiller 失败，尝试容器内旧版: {result.stderr[:200]}")
+            return _process_video_legacy(url, message_id)
+
+        # 解析输出
+        output = result.stdout
+        if "✅ Done!" in output:
+            # 提取输出文件路径
+            match = re.search(r'Output: (.+\.md)', output)
+            if match:
+                output_path = match.group(1)
+                return f"✅ 视频知识笔记已生成\n\n📁 文件: {output_path}\n\n请到 Obsidian Inbox 查看完整内容。"
+            return f"✅ 视频处理完成\n\n{output[-500:]}"
+
+        return f"⚠️ 视频处理完成但输出格式异常\n\n{output[-500:]}"
+
+    except subprocess.TimeoutExpired:
+        return "❌ 视频分析超时（10分钟）"
+    except Exception as e:
+        logger.error(f"视频处理异常: {e}")
+        return f"❌ 视频处理异常: {str(e)}"
+
+
+def _process_video_legacy(url: str, message_id: str = None) -> str:
+    """旧版视频处理（容器内 insight.py）- 作为降级方案"""
+    logger.info(f"📦 降级到容器内 insight.py")
+    try:
         cmd = [
             "/usr/local/bin/docker", "exec", "clawdbot",
             "python3", "/root/workspace/skills/douyin-video-insight/insight.py",
