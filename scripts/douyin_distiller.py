@@ -217,53 +217,113 @@ class ShareTextExtractor:
 # ============================================================================
 
 class ProcessedStore:
-    """记录已处理的视频，避免重复蒸馏"""
+    """记录已处理的视频，避免重复蒸馏（SQLite 版本）"""
 
-    DEFAULT_PATH = os.path.expanduser("~/zhiwei-bot/data/processed_videos.json")
+    DEFAULT_DB_PATH = os.path.expanduser("~/zhiwei-bot/data/processed_videos.db")
 
-    def __init__(self, path: str = None):
-        self.path = path or self.DEFAULT_PATH
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        self._load()
+    # 平台视频 ID 提取模式
+    VIDEO_ID_PATTERNS = [
+        (r'douyin\.com/video/(\d+)', 'dy'),
+        (r'bilibili\.com/video/(BV\w+)', 'bili'),
+        (r'tiktok\.com/.*/video/(\d+)', 'tt'),
+        (r'xiaohongshu\.com/.*/(\w+)', 'xhs'),
+        (r'kuaishou\.com/short-video/(\w+)', 'ks'),
+    ]
 
-    def _load(self):
-        """加载已处理记录"""
-        if os.path.exists(self.path):
-            try:
-                with open(self.path, 'r', encoding='utf-8') as f:
-                    self.data = json.load(f)
-            except (json.JSONDecodeError, IOError):
-                logger.warning(f"Failed to load processed store, starting fresh")
-                self.data = {}
-        else:
-            self.data = {}
+    def __init__(self, db_path: str = None):
+        self.db_path = Path(db_path or self.DEFAULT_DB_PATH).expanduser()
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+        self._migrate_json()
 
-    def _save(self):
-        """保存记录到文件"""
-        with open(self.path, 'w', encoding='utf-8') as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
+    @classmethod
+    def extract_video_id(cls, url: str) -> str:
+        """从 URL 提取平台视频 ID"""
+        for pattern, prefix in cls.VIDEO_ID_PATTERNS:
+            m = re.search(pattern, url)
+            if m:
+                return f"{prefix}_{m.group(1)}"
+        return ""
 
-    def is_processed(self, resolved_url: str) -> bool:
-        """检查这个 URL 是否已经处理过"""
-        return resolved_url in self.data
+    def _init_db(self):
+        """初始化 SQLite 数据库"""
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''CREATE TABLE IF NOT EXISTS processed (
+                id INTEGER PRIMARY KEY,
+                video_id TEXT UNIQUE,
+                resolved_url TEXT UNIQUE,
+                title TEXT,
+                output_path TEXT,
+                processed_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_video_id ON processed(video_id)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_resolved_url ON processed(resolved_url)')
+
+    def _migrate_json(self):
+        """迁移历史 JSON 数据到 SQLite"""
+        json_path = self.db_path.parent / "processed_videos.json"
+        if not json_path.exists():
+            return
+
+        import sqlite3
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            with sqlite3.connect(self.db_path) as conn:
+                for resolved_url, record in data.items():
+                    video_id = self.extract_video_id(resolved_url)
+                    conn.execute('''INSERT OR IGNORE INTO processed
+                        (video_id, resolved_url, title, output_path, processed_at)
+                        VALUES (?,?,?,?,?)''',
+                        (video_id or None, resolved_url,
+                         record.get('title', ''), record.get('output_path', ''),
+                         record.get('processed_at', '')))
+
+            # 备份旧 JSON
+            json_path.rename(json_path.with_suffix('.json.bak'))
+            logger.info(f"Migrated {len(data)} records from JSON to SQLite")
+        except Exception as e:
+            logger.warning(f"JSON migration failed: {e}")
+
+    def is_processed(self, resolved_url: str, video_id: str = None) -> bool:
+        """检查是否已处理（video_id 优先）"""
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            if video_id:
+                if conn.execute('SELECT 1 FROM processed WHERE video_id=?', (video_id,)).fetchone():
+                    return True
+            if resolved_url:
+                if conn.execute('SELECT 1 FROM processed WHERE resolved_url=?', (resolved_url,)).fetchone():
+                    return True
+        return False
 
     def get_record(self, resolved_url: str) -> Optional[dict]:
         """获取已处理记录"""
-        return self.data.get(resolved_url)
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute('SELECT * FROM processed WHERE resolved_url=?', (resolved_url,)).fetchone()
+            return dict(row) if row else None
 
-    def mark_processed(self, resolved_url: str, output_path: str, title: str = ""):
-        """标记这个 URL 已处理"""
-        self.data[resolved_url] = {
-            "processed_at": datetime.now().isoformat(),
-            "output_path": str(output_path),
-            "title": title
-        }
-        self._save()
-        logger.info(f"Marked as processed: {resolved_url}")
+    def mark_processed(self, resolved_url: str, output_path: str, title: str = "", video_id: str = None):
+        """标记已处理"""
+        import sqlite3
+        vid = video_id or self.extract_video_id(resolved_url)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''INSERT OR REPLACE INTO processed
+                (video_id, resolved_url, title, output_path)
+                VALUES (?,?,?,?)''',
+                (vid or None, resolved_url, title, str(output_path)))
+        logger.info(f"Marked as processed: {vid or resolved_url}")
 
     def get_stats(self) -> dict:
         """获取统计信息"""
-        return {"total_processed": len(self.data)}
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            count = conn.execute('SELECT COUNT(*) FROM processed').fetchone()[0]
+        return {"total_processed": count}
 
 
 # ============================================================================
@@ -1134,8 +1194,11 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
     logger.info(f"Platform: {video_info.platform}")
     logger.info(f"Resolved URL: {video_info.resolved_url}")
 
-    # 去重检查
-    if store.is_processed(video_info.resolved_url) and not getattr(args, 'force', False):
+    # 去重检查（video_id 优先）
+    video_id = ProcessedStore.extract_video_id(video_info.resolved_url)
+    if video_id:
+        logger.info(f"Video ID: {video_id}")
+    if store.is_processed(video_info.resolved_url, video_id=video_id) and not getattr(args, 'force', False):
         record = store.get_record(video_info.resolved_url)
         logger.info(f"⏭️ 已处理过，跳过（使用 --force 强制重新处理）")
         if record:
@@ -1201,7 +1264,7 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
     output_path = writer.write(video_info, transcript, knowledge, noise_tags)
 
     # 标记已处理
-    store.mark_processed(video_info.resolved_url, output_path, knowledge.title)
+    store.mark_processed(video_info.resolved_url, output_path, knowledge.title, video_id=video_id)
 
     logger.info("=" * 50)
     logger.info(f"✅ Done! Output: {output_path}")
@@ -1247,12 +1310,23 @@ def main():
     parser.add_argument("--cookies-from-browser", type=str, metavar="BROWSER",
                         help="从浏览器加载 cookies（chrome/safari/firefox/edge）")
     parser.add_argument("--debug", action="store_true", help="启用调试模式")
+    parser.add_argument("--openclaw-payload", type=str, help="OpenClaw 消息 payload（JSON 或纯文本）")
+    parser.add_argument("--json", action="store_true", help="JSON 格式输出结果")
 
     args = parser.parse_args()
 
     # 配置日志级别
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # 处理 OpenClaw payload
+    if getattr(args, 'openclaw_payload', None):
+        try:
+            data = json.loads(args.openclaw_payload)
+            raw_text = data.get('content') or data.get('text') or args.openclaw_payload
+        except json.JSONDecodeError:
+            raw_text = args.openclaw_payload
+        args.from_text = raw_text
 
     # 确定输入文本
     raw_text = ""
