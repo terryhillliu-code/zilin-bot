@@ -116,7 +116,7 @@ class AppConfig:
         loaded = False
         for env_path in env_paths:
             if env_path.exists():
-                load_dotenv(env_path, override=False)  # 不覆盖已加载的
+                load_dotenv(env_path, override=True)  # .env 文件覆盖环境变量
                 logger.info(f"Loaded config from {env_path}")
                 loaded = True
 
