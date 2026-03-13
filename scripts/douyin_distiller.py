@@ -105,13 +105,22 @@ class AppConfig:
     """应用配置管理"""
 
     def __init__(self):
-        # 加载 .env 文件
-        env_path = Path(__file__).parent / ".env"
-        if env_path.exists():
-            load_dotenv(env_path)
-            logger.info(f"Loaded config from {env_path}")
-        else:
-            logger.warning(f"No .env file found at {env_path}, using defaults")
+        # 按优先级加载 .env 文件：复用现有配置
+        env_paths = [
+            Path.home() / "zhiwei-bot" / ".env",       # 主配置（已有 DASHSCOPE_API_KEY）
+            Path.home() / ".secrets" / "zhiwei.env",   # 备用配置（OPENAI_API_KEY）
+            Path(__file__).parent / ".env",            # 脚本目录配置
+        ]
+
+        loaded = False
+        for env_path in env_paths:
+            if env_path.exists():
+                load_dotenv(env_path, override=False)  # 不覆盖已加载的
+                logger.info(f"Loaded config from {env_path}")
+                loaded = True
+
+        if not loaded:
+            logger.warning("No .env file found, using environment variables")
 
         # API 配置
         self.dashscope_api_key = os.getenv("DASHSCOPE_API_KEY", "")
