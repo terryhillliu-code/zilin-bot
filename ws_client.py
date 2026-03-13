@@ -206,31 +206,24 @@ def get_history(user_id: str) -> str:
     return "\n".join(lines)
 
 
+# V2-203: 导入 ChatHandler 替代 OpenClaw
+from chat_handler import ChatHandler, chat_handler as _chat_handler_instance
+
+def get_chat_handler():
+    """获取 ChatHandler 实例"""
+    return _chat_handler_instance
+
+
 def call_openclaw_agent(message: str, session_id: str, agent: str = "main") -> str:
-    """调用 OpenClaw Agent"""
-    try:
-        cmd = [
-            "/usr/local/bin/docker", "exec", "clawdbot",
-            "openclaw", "agent",
-            "--agent", agent,
-            "--message", message,
-            "--session-id", session_id,
-            "--timeout", "300"
-        ]
-        print(f"🤖 调用 Agent: {agent}, session: {session_id}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode == 0:
-            response = result.stdout.strip()
-            print(f"✅ Agent 响应：{len(response)} 字符")
-            return response
-        else:
-            error = result.stderr or result.stdout
-            print(f"❌ Agent 错误：{error[:200]}")
-            return "❌ AI 暂时无法响应，请稍后重试"
-    except subprocess.TimeoutExpired:
-        return "⏰ 响应超时，请简化问题后重试"
-    except Exception as e:
-        return f"❌ 调用异常：{str(e)}"
+    """
+    调用 OpenClaw Agent
+
+    @deprecated V2-203: 已废弃，请使用 get_chat_handler().handle_sync()
+    保留此函数是为了向后兼容，实际调用已切换到 chat_handler
+    """
+    # 降级：使用 chat_handler
+    handler = get_chat_handler()
+    return handler.handle_sync(message, session_id, role=agent)
 
 
 # 初始化命令处理模块（需要 call_openclaw_agent 已定义）
@@ -242,7 +235,8 @@ init_command_handler(
     extract_video_url, extract_article_url, TaskLogger, detect_chain_intent, execute_chain,
     IntentRouter, save_active_user, load_active_user,
     chat_history, pending_voice, pending_image, pending_review,
-    MAX_HISTORY, RATE_LIMIT_SECONDS, user_last_request, memory_cache
+    MAX_HISTORY, RATE_LIMIT_SECONDS, user_last_request, memory_cache,
+    get_chat_handler  # V2-203: 新增 chat_handler
 )
 
 # ========== 消息分发 ==========

@@ -36,6 +36,7 @@ def _add_scheduler_path():
 reply_message = None
 reply_card = None
 call_openclaw_agent = None
+get_chat_handler = None  # V2-203: 新增
 query_knowledge_base = None
 get_memory = None
 add_to_history = None
@@ -112,6 +113,7 @@ def init_command_handler(
     global_IntentRouter, global_save_active_user, global_load_active_user,
     global_chat_history, global_pending_voice, global_pending_image, global_pending_review,
     global_MAX_HISTORY, global_RATE_LIMIT_SECONDS, global_user_last_request, global_memory_cache,
+    global_get_chat_handler=None,  # V2-203: 新增 chat_handler
     global_article_writer=None, global_tech_compare=None
 ):
     """初始化命令处理模块的全局依赖"""
@@ -123,6 +125,7 @@ def init_command_handler(
     global chat_history, pending_voice, pending_image, pending_review
     global MAX_HISTORY, RATE_LIMIT_SECONDS, user_last_request, memory_cache
     global pdf_parser, article_writer, tech_compare
+    global get_chat_handler  # V2-203: 新增
 
     reply_message = global_reply_message
     reply_card = global_reply_card
@@ -153,6 +156,7 @@ def init_command_handler(
     memory_cache = global_memory_cache
     article_writer = global_article_writer
     tech_compare = global_tech_compare
+    get_chat_handler = global_get_chat_handler  # V2-203: 新增
 
 
 # ========== 帮助信息 ==========
@@ -659,7 +663,12 @@ URL: {url}
                 reply_message(message_id, summary_prompt)
                 return
             session_id = get_session_id(user_id)
-            response = call_openclaw_agent(summary_prompt, session_id)
+            # V2-203: 使用 chat_handler 替代 call_openclaw_agent
+            if get_chat_handler:
+                handler = get_chat_handler()
+                response = handler.handle_sync(summary_prompt, session_id, role="main")
+            else:
+                response = call_openclaw_agent(summary_prompt, session_id)
             reply_card(message_id, "🌐 网页总结", response)
             TaskLogger.log_task("网页总结", "完成", url)
             return
@@ -721,9 +730,13 @@ URL: {url}
         if rag_context:
             enriched_message += "\n(请结合参考资料回答)"
 
-        # 6e. 调用 Agent
+        # 6e. 调用 Agent (V2-203: 使用 chat_handler)
         session_id = get_session_id(user_id)
-        response = call_openclaw_agent(enriched_message, session_id, agent=target_agent)
+        if get_chat_handler:
+            handler = get_chat_handler()
+            response = handler.handle_sync(enriched_message, session_id, role=target_agent)
+        else:
+            response = call_openclaw_agent(enriched_message, session_id, agent=target_agent)
 
         # 6f. 如果路由到其他Agent，加标注
         if target_agent != "main":
