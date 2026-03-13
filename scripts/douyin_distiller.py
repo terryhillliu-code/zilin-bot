@@ -344,8 +344,9 @@ class URLResolver:
 class MediaExtractor:
     """使用 yt-dlp 提取字幕和音频"""
 
-    def __init__(self):
+    def __init__(self, cookies_browser: Optional[str] = None):
         self.yt_dlp_path = self._find_yt_dlp()
+        self.cookies_browser = cookies_browser
 
     def _find_yt_dlp(self) -> str:
         """查找 yt-dlp 可执行文件"""
@@ -372,6 +373,10 @@ class MediaExtractor:
             "writeautomaticsub": True,
             "subtitleslangs": ["zh-Hans", "zh", "zh-CN", "en"],
         }
+
+        # 添加 cookies 支持
+        if self.cookies_browser:
+            ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -488,6 +493,10 @@ class MediaExtractor:
                 "preferredquality": "128",
             }],
         }
+
+        # 添加 cookies 支持
+        if self.cookies_browser:
+            ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -699,9 +708,10 @@ class LocalMLXWhisperTranscriber(BaseTranscriber):
 class TranscriptProvider:
     """转录服务路由"""
 
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, cookies_browser: Optional[str] = None):
         self.config = config
-        self.media_extractor = MediaExtractor()
+        self.cookies_browser = cookies_browser
+        self.media_extractor = MediaExtractor(cookies_browser)
         self.dashscope_transcriber = DashScopeASRTranscriber(
             config.dashscope_api_key,
             config.asr_model
@@ -1065,7 +1075,10 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
     # 2. 获取转录
     logger.info("=" * 50)
     logger.info("Step 2: Getting transcript")
-    provider = TranscriptProvider(config)
+    cookies_browser = getattr(args, 'cookies_from_browser', None)
+    if cookies_browser:
+        logger.info(f"Using cookies from browser: {cookies_browser}")
+    provider = TranscriptProvider(config, cookies_browser)
     transcript = provider.get_transcript(video_info)
 
     if not transcript.full_text:
@@ -1160,6 +1173,8 @@ def main():
     parser.add_argument("--transcript-only", action="store_true", help="只输出转录文本")
     parser.add_argument("--force", action="store_true", help="即使已处理过也强制重新蒸馏")
     parser.add_argument("--output-dir", type=str, help="自定义输出目录")
+    parser.add_argument("--cookies-from-browser", type=str, metavar="BROWSER",
+                        help="从浏览器加载 cookies（chrome/safari/firefox/edge）")
     parser.add_argument("--debug", action="store_true", help="启用调试模式")
 
     args = parser.parse_args()
