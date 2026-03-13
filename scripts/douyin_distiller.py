@@ -599,7 +599,7 @@ class BaseTranscriber(ABC):
 class DashScopeASRTranscriber(BaseTranscriber):
     """阿里云百炼 ASR 转录器"""
 
-    def __init__(self, api_key: str, model: str = "sensevoice-v1"):
+    def __init__(self, api_key: str, model: str = "paraformer-realtime-v2"):
         self.api_key = api_key
         self.model = model
         self._available = bool(api_key)
