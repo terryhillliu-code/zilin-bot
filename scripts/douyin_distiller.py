@@ -12,6 +12,7 @@ URL → 解析 → 字幕/ASR → LLM 蒸馏 → Markdown 输出
 
 import os
 import re
+import sys
 import json
 import tempfile
 import subprocess
@@ -152,6 +153,117 @@ class AppConfig:
         """确保输出目录存在"""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Output directory: {self.output_dir}")
+
+
+# ============================================================================
+# 分享文本提取器
+# ============================================================================
+
+class ShareTextExtractor:
+    """从各种格式的分享文本中提取视频 URL"""
+
+    # 支持的 URL 模式（按优先级排序）
+    URL_PATTERNS = [
+        r'https?://v\.douyin\.com/[A-Za-z0-9_/]+',           # 抖音短链
+        r'https?://www\.douyin\.com/video/\d+',              # 抖音长链
+        r'https?://www\.tiktok\.com/@[^/]+/video/\d+',       # TikTok
+        r'https?://vm\.tiktok\.com/[A-Za-z0-9]+',            # TikTok 短链
+        r'https?://www\.bilibili\.com/video/[A-Za-z0-9]+',   # B站
+        r'https?://b23\.tv/[A-Za-z0-9]+',                    # B站短链
+        r'https?://xhslink\.com/[A-Za-z0-9/]+',              # 小红书短链
+        r'https?://www\.xiaohongshu\.com/explore/[a-f0-9]+', # 小红书长链
+        r'https?://v\.kuaishou\.com/[A-Za-z0-9]+',           # 快手
+        r'https?://www\.kuaishou\.com/short-video/[A-Za-z0-9]+',
+        r'https?://t\.cn/[A-Za-z0-9]+',                      # 微博短链
+        r'https?://weibo\.com/tv/show/[A-Za-z0-9]+',         # 微博视频
+    ]
+
+    @classmethod
+    def extract(cls, text: str) -> list[str]:
+        """
+        从文本中提取所有视频 URL，去重并保持顺序
+
+        处理逻辑：
+        1. 用正则依次匹配所有模式
+        2. 清理 URL 尾部可能粘连的中文标点
+        3. 清理 URL 尾部的口令垃圾（如 "qeO:/"）
+        4. 去重
+        """
+        urls = []
+        seen = set()
+        for pattern in cls.URL_PATTERNS:
+            for match in re.finditer(pattern, text):
+                url = match.group(0)
+                # 清理尾部中文标点和口令垃圾
+                url = url.rstrip('，。！？、；：""''）】》')
+                # 清理尾部可能的口令格式 (如 "qeO:/", "abc@123")
+                url = re.sub(r'[A-Za-z0-9@._:/]+$', '', url) is False and url or url
+                # 再次清理尾部标点
+                url = url.rstrip('，。！？、；：""''）】》./')
+                if url and url not in seen:
+                    seen.add(url)
+                    urls.append(url)
+        return urls
+
+    @classmethod
+    def extract_first(cls, text: str) -> Optional[str]:
+        """提取第一个 URL，没有则返回 None"""
+        urls = cls.extract(text)
+        return urls[0] if urls else None
+
+
+# ============================================================================
+# 已处理记录存储
+# ============================================================================
+
+class ProcessedStore:
+    """记录已处理的视频，避免重复蒸馏"""
+
+    DEFAULT_PATH = os.path.expanduser("~/zhiwei-bot/data/processed_videos.json")
+
+    def __init__(self, path: str = None):
+        self.path = path or self.DEFAULT_PATH
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self._load()
+
+    def _load(self):
+        """加载已处理记录"""
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, 'r', encoding='utf-8') as f:
+                    self.data = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                logger.warning(f"Failed to load processed store, starting fresh")
+                self.data = {}
+        else:
+            self.data = {}
+
+    def _save(self):
+        """保存记录到文件"""
+        with open(self.path, 'w', encoding='utf-8') as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+
+    def is_processed(self, resolved_url: str) -> bool:
+        """检查这个 URL 是否已经处理过"""
+        return resolved_url in self.data
+
+    def get_record(self, resolved_url: str) -> Optional[dict]:
+        """获取已处理记录"""
+        return self.data.get(resolved_url)
+
+    def mark_processed(self, resolved_url: str, output_path: str, title: str = ""):
+        """标记这个 URL 已处理"""
+        self.data[resolved_url] = {
+            "processed_at": datetime.now().isoformat(),
+            "output_path": str(output_path),
+            "title": title
+        }
+        self._save()
+        logger.info(f"Marked as processed: {resolved_url}")
+
+    def get_stats(self) -> dict:
+        """获取统计信息"""
+        return {"total_processed": len(self.data)}
 
 
 # ============================================================================
@@ -918,16 +1030,135 @@ noise_tags: [{noise_tags}]
 # 主程序入口
 # ============================================================================
 
+def process_single_video(url: str, config: AppConfig, args, store: ProcessedStore) -> int:
+    """
+    处理单个视频的完整蒸馏流程
+
+    Returns:
+        0: 成功
+        1: 失败
+        2: 跳过（已处理过）
+    """
+    resolver = URLResolver()
+
+    # 1. 解析 URL
+    logger.info("=" * 50)
+    logger.info("Step 1: Resolving URL")
+    try:
+        video_info = resolver.resolve(url)
+    except Exception as e:
+        logger.error(f"URL 解析失败: {e}")
+        return 1
+
+    logger.info(f"Platform: {video_info.platform}")
+    logger.info(f"Resolved URL: {video_info.resolved_url}")
+
+    # 去重检查
+    if store.is_processed(video_info.resolved_url) and not getattr(args, 'force', False):
+        record = store.get_record(video_info.resolved_url)
+        logger.info(f"⏭️ 已处理过，跳过（使用 --force 强制重新处理）")
+        if record:
+            logger.info(f"   原输出: {record.get('output_path', 'N/A')}")
+            logger.info(f"   处理时间: {record.get('processed_at', 'N/A')}")
+        return 2
+
+    # 2. 获取转录
+    logger.info("=" * 50)
+    logger.info("Step 2: Getting transcript")
+    provider = TranscriptProvider(config)
+    transcript = provider.get_transcript(video_info)
+
+    if not transcript.full_text:
+        logger.error("Failed to get transcript")
+        return 1
+
+    logger.info(f"Transcript source: {transcript.source}")
+    logger.info(f"Transcript length: {len(transcript.full_text)} chars")
+
+    # 只输出转录
+    if getattr(args, 'transcript_only', False):
+        print("\n" + "=" * 50)
+        print("Transcript:")
+        print("=" * 50)
+        print(transcript.to_text())
+        return 0
+
+    # 3. 后处理
+    logger.info("=" * 50)
+    logger.info("Step 3: Post-processing transcript")
+    processor = TranscriptPostProcessor()
+    transcript = processor.clean(transcript)
+    noise_tags = processor.add_noise_tags(transcript)
+    if noise_tags:
+        logger.info(f"Detected noise tags: {noise_tags}")
+
+    # 4. 知识蒸馏
+    logger.info("=" * 50)
+    logger.info("Step 4: Distilling knowledge")
+    distiller = KnowledgeDistiller(config)
+    knowledge = distiller.distill(video_info, transcript)
+    logger.info(f"Title: {knowledge.title}")
+    logger.info(f"Key points: {len(knowledge.key_points)}")
+    logger.info(f"Tags: {knowledge.tags}")
+
+    # Dry run 模式
+    if getattr(args, 'dry_run', False):
+        logger.info("=" * 50)
+        logger.info("Dry run mode - skipping file generation")
+        print(f"\nTitle: {knowledge.title}")
+        print(f"One-liner: {knowledge.one_liner}")
+        print(f"Summary: {knowledge.summary[:100]}...")
+        return 0
+
+    # 5. 生成 Markdown
+    logger.info("=" * 50)
+    logger.info("Step 5: Writing Markdown")
+    writer = MarkdownWriter(config.output_dir)
+    output_path = writer.write(video_info, transcript, knowledge, noise_tags)
+
+    # 标记已处理
+    store.mark_processed(video_info.resolved_url, output_path, knowledge.title)
+
+    logger.info("=" * 50)
+    logger.info(f"✅ Done! Output: {output_path}")
+    return 0
+
+
 def main():
     """CLI 入口"""
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="抖音知识蒸馏引擎 - 从短视频生成 Markdown 笔记"
+        description="抖音知识蒸馏引擎 - 从短视频生成 Markdown 笔记",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  # 从分享文本提取 URL
+  python douyin_distiller.py --extract-only --from-text '分享文本...'
+
+  # 从剪贴板处理（macOS）
+  pbpaste | python douyin_distiller.py --stdin
+
+  # 完整蒸馏
+  python douyin_distiller.py --from-text '分享文本...'
+
+  # 批量处理
+  python douyin_distiller.py --input-file shares.txt
+        """
     )
-    parser.add_argument("url", help="视频链接（抖音/TikTok/B站等）")
+
+    # 输入源参数（互斥）
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument("url", nargs="?", help="视频链接（抖音/TikTok/B站等）")
+    input_group.add_argument("--from-text", type=str, help="直接处理一段分享文本")
+    input_group.add_argument("--stdin", action="store_true", help="从标准输入读取分享文本")
+    input_group.add_argument("--input-file", type=str, help="从文件读取，每行一条分享文本")
+
+    # 处理参数
+    parser.add_argument("--extract-only", action="store_true", help="仅提取并打印 URL，不执行蒸馏")
     parser.add_argument("--dry-run", action="store_true", help="只解析不生成文件")
     parser.add_argument("--transcript-only", action="store_true", help="只输出转录文本")
+    parser.add_argument("--force", action="store_true", help="即使已处理过也强制重新蒸馏")
     parser.add_argument("--output-dir", type=str, help="自定义输出目录")
     parser.add_argument("--debug", action="store_true", help="启用调试模式")
 
@@ -936,6 +1167,38 @@ def main():
     # 配置日志级别
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # 确定输入文本
+    raw_text = ""
+    if args.stdin:
+        raw_text = sys.stdin.read().strip()
+    elif args.from_text:
+        raw_text = args.from_text
+    elif args.input_file:
+        with open(args.input_file, 'r', encoding='utf-8') as f:
+            raw_text = f.read()
+    elif args.url:
+        raw_text = args.url  # 兼容原有用法
+
+    if not raw_text:
+        print("错误：请提供 URL 或使用 --from-text / --stdin / --input-file")
+        return 1
+
+    # 提取 URL
+    extractor = ShareTextExtractor()
+    urls = extractor.extract(raw_text)
+
+    if not urls:
+        print("未从输入中检测到视频链接")
+        return 1
+
+    print(f"📋 检测到 {len(urls)} 个视频链接")
+
+    # 仅提取模式
+    if args.extract_only:
+        for url in urls:
+            print(f"  → {url}")
+        return 0
 
     # 加载配置
     config = AppConfig()
@@ -951,76 +1214,32 @@ def main():
         logger.error("Configuration validation failed")
         return 1
 
-    try:
-        # 1. 解析 URL
-        logger.info("=" * 50)
-        logger.info("Step 1: Resolving URL")
-        resolver = URLResolver()
-        video_info = resolver.resolve(args.url)
-        logger.info(f"Platform: {video_info.platform}")
-        logger.info(f"Resolved URL: {video_info.resolved_url}")
+    # 初始化去重存储
+    store = ProcessedStore()
 
-        # 2. 获取转录
-        logger.info("=" * 50)
-        logger.info("Step 2: Getting transcript")
-        provider = TranscriptProvider(config)
-        transcript = provider.get_transcript(video_info)
+    # 统计处理结果
+    results = {"success": 0, "failed": 0, "skipped": 0}
 
-        if not transcript.full_text:
-            logger.error("Failed to get transcript")
-            return 1
+    # 逐个处理
+    for i, url in enumerate(urls):
+        print(f"\n{'='*50}")
+        print(f"[{i+1}/{len(urls)}] {url}")
 
-        logger.info(f"Transcript source: {transcript.source}")
-        logger.info(f"Transcript length: {len(transcript.full_text)} chars")
+        result = process_single_video(url, config, args, store)
 
-        # 只输出转录
-        if args.transcript_only:
-            print("\n" + "=" * 50)
-            print("Transcript:")
-            print("=" * 50)
-            print(transcript.to_text())
-            return 0
+        if result == 0:
+            results["success"] += 1
+        elif result == 1:
+            results["failed"] += 1
+        elif result == 2:
+            results["skipped"] += 1
 
-        # 3. 后处理
-        logger.info("=" * 50)
-        logger.info("Step 3: Post-processing transcript")
-        processor = TranscriptPostProcessor()
-        transcript = processor.clean(transcript)
-        noise_tags = processor.add_noise_tags(transcript)
-        if noise_tags:
-            logger.info(f"Detected noise tags: {noise_tags}")
+    # 输出统计
+    if len(urls) > 1:
+        print(f"\n{'='*50}")
+        print(f"处理完成: 成功={results['success']}, 失败={results['failed']}, 跳过={results['skipped']}")
 
-        # 4. 知识蒸馏
-        logger.info("=" * 50)
-        logger.info("Step 4: Distilling knowledge")
-        distiller = KnowledgeDistiller(config)
-        knowledge = distiller.distill(video_info, transcript)
-        logger.info(f"Title: {knowledge.title}")
-        logger.info(f"Key points: {len(knowledge.key_points)}")
-        logger.info(f"Tags: {knowledge.tags}")
-
-        # Dry run 模式
-        if args.dry_run:
-            logger.info("=" * 50)
-            logger.info("Dry run mode - skipping file generation")
-            print(f"\nTitle: {knowledge.title}")
-            print(f"One-liner: {knowledge.one_liner}")
-            print(f"Summary: {knowledge.summary[:100]}...")
-            return 0
-
-        # 5. 生成 Markdown
-        logger.info("=" * 50)
-        logger.info("Step 5: Writing Markdown")
-        writer = MarkdownWriter(config.output_dir)
-        output_path = writer.write(video_info, transcript, knowledge, noise_tags)
-
-        logger.info("=" * 50)
-        logger.info(f"✅ Done! Output: {output_path}")
-        return 0
-
-    except Exception as e:
-        logger.exception(f"Error: {e}")
-        return 1
+    return 0 if results["failed"] == 0 else 1
 
 
 if __name__ == "__main__":
