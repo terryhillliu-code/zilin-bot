@@ -126,7 +126,7 @@ class AppConfig:
         # API 配置
         self.dashscope_api_key = os.getenv("DASHSCOPE_API_KEY", "")
         self.qwen_model = os.getenv("QWEN_MODEL", "qwen-plus")
-        self.asr_model = os.getenv("ASR_MODEL", "sensevoice-v1")
+        self.asr_model = os.getenv("ASR_MODEL", "paraformer-realtime-v2")
         self.asr_policy = os.getenv("ASR_POLICY", "auto")
         self.local_asr_model = os.getenv("LOCAL_ASR_MODEL", "small")
 
@@ -548,7 +548,12 @@ class DashScopeASRTranscriber(BaseTranscriber):
         return self._available
 
     def transcribe(self, audio_path: Path) -> TranscriptResult:
-        """使用 DashScope ASR 转录"""
+        """使用 DashScope ASR 转录
+
+        注意：Transcription.async_call() 需要 OSS URL，不支持 file:// 本地协议。
+        改用 Recognition.call() 处理本地音频文件。
+        Recognition API 要求：采样率 16000Hz，单声道。
+        """
         if not self._available:
             raise RuntimeError("DashScope API key not configured")
 
@@ -556,34 +561,46 @@ class DashScopeASRTranscriber(BaseTranscriber):
 
         try:
             import dashscope
-            from dashscope.audio.asr import Transcription
+            from dashscope.audio.asr import Recognition, RecognitionCallback
 
             dashscope.api_key = self.api_key
 
-            # 根据模型选择参数
-            if self.model.startswith("sensevoice"):
-                # SenseVoice 模型参数
-                task_response = Transcription.async_call(
-                    model=self.model,
-                    file_urls=[f"file://{audio_path.absolute()}"],
-                    language_hints=["zh", "en"],
-                )
+            # 检测并转换音频格式（Recognition API 需要 16kHz 单声道）
+            audio_path = self._ensure_audio_format(audio_path)
+
+            # 检测音频格式
+            suffix = audio_path.suffix.lower().lstrip('.')
+            audio_format = suffix if suffix in ['mp3', 'wav', 'pcm', 'opus', 'm4a', 'aac'] else 'mp3'
+
+            # 定义回调类收集结果
+            class TranscribeCallback(RecognitionCallback):
+                def __init__(self):
+                    self.result = None
+                    self.error = None
+
+                def on_result(self, result):
+                    self.result = result
+
+                def on_error(self, error):
+                    self.error = error
+
+            # 创建 Recognition 实例
+            callback = TranscribeCallback()
+            recognition = Recognition(
+                model=self.model,
+                format=audio_format,
+                sample_rate=16000,
+                callback=callback
+            )
+
+            # 调用同步识别
+            result = recognition.call(file=str(audio_path.absolute()))
+
+            if result.status_code == 200:
+                return self._parse_recognition_result(result)
             else:
-                # Paraformer 模型参数
-                task_response = Transcription.async_call(
-                    model=self.model,
-                    file_urls=[f"file://{audio_path.absolute()}"],
-                    language_hints=["zh", "en"],
-                )
-
-            # 获取结果
-            transcription_response = Transcription.fetch(task=task_response)
-            if transcription_response.status_code == 200:
-                result = transcription_response.output
-                return self._parse_dashscope_result(result)
-
-            logger.error(f"DashScope error: {transcription_response.message}")
-            return TranscriptResult()
+                logger.error(f"DashScope Recognition error: {result.message}")
+                return TranscriptResult()
 
         except ImportError:
             logger.error("dashscope not installed. Run: pip install dashscope")
@@ -592,51 +609,105 @@ class DashScopeASRTranscriber(BaseTranscriber):
             logger.error(f"DashScope transcription error: {e}")
             return TranscriptResult()
 
-    def _parse_dashscope_result(self, result: dict) -> TranscriptResult:
-        """解析 DashScope 返回结果"""
+    def _parse_recognition_result(self, result) -> TranscriptResult:
+        """解析 Recognition API 返回结果"""
         segments = []
         full_text = ""
 
         try:
-            # 解析结果结构
-            if "results" in result:
-                for item in result["results"]:
-                    if "transcription_url" in item:
-                        # 需要下载 JSON 结果
-                        response = requests.get(item["transcription_url"], timeout=30)
-                        data = response.json()
-                    else:
-                        data = item
+            # Recognition 返回结果结构
+            if hasattr(result, 'output') and result.output:
+                output = result.output
 
-                    # 提取转录文本
-                    if "transcripts" in data:
-                        for transcript in data["transcripts"]:
-                            text = transcript.get("text", "")
-                            full_text += text
+                # 提取句子列表
+                if 'sentence' in output:
+                    for sentence in output['sentence']:
+                        text = sentence.get('text', '')
+                        full_text += text
 
-                            # 提取时间戳（如果有）
-                            if "sentences" in transcript:
-                                for sentence in transcript["sentences"]:
-                                    segments.append(TranscriptSegment(
-                                        start=sentence.get("begin_time", 0) / 1000,
-                                        end=sentence.get("end_time", 0) / 1000,
-                                        text=sentence.get("text", "")
-                                    ))
+                        segments.append(TranscriptSegment(
+                            start=sentence.get('begin_time', 0) / 1000,
+                            end=sentence.get('end_time', 0) / 1000,
+                            text=text
+                        ))
+                elif 'text' in output:
+                    # 简单文本结果
+                    full_text = output['text']
 
             return TranscriptResult(
                 segments=segments,
                 full_text=full_text,
-                source="dashscope_asr",
+                source="dashscope_recognition",
                 language="zh",
                 confidence=0.95
             )
 
         except Exception as e:
-            logger.error(f"Error parsing DashScope result: {e}")
-            return TranscriptResult(full_text=full_text, source="dashscope_asr")
+            logger.error(f"Error parsing Recognition result: {e}")
+            return TranscriptResult(full_text=full_text, source="dashscope_recognition")
 
+    def _ensure_audio_format(self, audio_path: Path) -> Path:
+        """确保音频格式符合 Recognition API 要求（16kHz 单声道）
 
-# ============================================================================
+        yt-dlp 下载的音频通常是 48kHz 立体声，需要转换。
+        返回转换后的音频路径（如无需转换则返回原路径）。
+        """
+        try:
+            # 使用 ffprobe 检查音频格式
+            probe_cmd = [
+                "ffprobe", "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "stream=sample_rate,channels",
+                "-of", "csv=p=0", str(audio_path)
+            ]
+            result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+
+            if result.returncode != 0:
+                logger.warning(f"ffprobe failed, using original audio: {result.stderr}")
+                return audio_path
+
+            # 解析输出：格式为 "sample_rate,channels"
+            output = result.stdout.strip()
+            parts = output.split(',')
+
+            if len(parts) >= 2:
+                sample_rate = int(parts[0])
+                channels = int(parts[1])
+
+                logger.debug(f"Audio format: {sample_rate}Hz, {channels} channels")
+
+                # 检查是否需要转换（非16kHz或非单声道）
+                if sample_rate != 16000 or channels != 1:
+                    converted_path = audio_path.with_suffix(".converted.mp3")
+                    logger.info(f"Converting audio: {sample_rate}Hz/{channels}ch -> 16000Hz/1ch")
+
+                    convert_cmd = [
+                        "ffmpeg", "-y", "-i", str(audio_path),
+                        "-ar", "16000", "-ac", "1", "-f", "mp3",
+                        str(converted_path)
+                    ]
+                    conv_result = subprocess.run(convert_cmd, capture_output=True, timeout=120)
+
+                    if conv_result.returncode == 0 and converted_path.exists():
+                        logger.info(f"Audio converted: {converted_path}")
+                        return converted_path
+                    else:
+                        logger.warning(f"ffmpeg conversion failed: {conv_result.stderr.decode()}")
+                        return audio_path
+                else:
+                    logger.debug("Audio format already correct (16kHz mono)")
+                    return audio_path
+            else:
+                logger.warning(f"Unexpected ffprobe output: {output}")
+                return audio_path
+
+        except subprocess.TimeoutExpired:
+            logger.warning("ffprobe/ffmpeg timeout, using original audio")
+            return audio_path
+        except Exception as e:
+            logger.warning(f"Audio format check failed: {e}, using original audio")
+            return audio_path
+
+    # ============================================================================
 # 本地 MLX Whisper 转录器
 # ============================================================================
 
