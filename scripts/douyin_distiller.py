@@ -398,11 +398,92 @@ class URLResolver:
 
 
 # ============================================================================
+# 抖音本地 API 客户端
+# ============================================================================
+
+class DouyinAPIClient:
+    """本地抖音 API 客户端
+
+    使用本地部署的 douyin-api 服务获取视频信息和下载链接
+    解决 yt-dlp 直接下载抖音视频遇到的 CDN 403 问题
+    """
+
+    def __init__(self, base_url: str = "http://localhost:8680"):
+        self.base_url = base_url
+
+    def get_video_data(self, url: str) -> dict:
+        """获取视频信息
+
+        Args:
+            url: 抖音分享链接（支持短链接和长链接）
+
+        Returns:
+            视频信息字典，包含 video、author、desc 等字段
+
+        Raises:
+            ValueError: API 调用失败
+        """
+        api_url = f"{self.base_url}/api/hybrid/video_data"
+        try:
+            resp = requests.get(
+                api_url,
+                params={"url": url, "minimal": "false"},
+                timeout=30
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            if data.get("code") == 200:
+                return data.get("data", {})
+            raise ValueError(f"API error: code={data.get('code')}, msg={data.get('msg')}")
+        except requests.exceptions.RequestException as e:
+            raise ValueError(f"API request failed: {e}")
+
+    def get_video_url(self, video_data: dict) -> str:
+        """提取视频下载链接
+
+        优先使用无水印链接，降级到有水印链接
+
+        Args:
+            video_data: get_video_data() 返回的数据
+
+        Returns:
+            视频下载 URL
+
+        Raises:
+            ValueError: 未找到可用的视频 URL
+        """
+        v = video_data.get("video", {})
+
+        # 优先级：无水印下载链接 > 无水印播放链接 > 有水印下载链接 > 有水印播放链接
+        for key in ["download_addr", "play_addr"]:
+            addr = v.get(key, {})
+            url_list = addr.get("url_list", [])
+            if url_list:
+                return url_list[0]
+
+        raise ValueError("No video URL found in video_data")
+
+    def get_video_info(self, url: str) -> tuple[dict, str]:
+        """获取视频信息和下载链接（便捷方法）
+
+        Args:
+            url: 抖音分享链接
+
+        Returns:
+            (video_data, video_url) 元组
+        """
+        video_data = self.get_video_data(url)
+        video_url = self.get_video_url(video_data)
+        return video_data, video_url
+
+
+# ============================================================================
 # 媒体提取器
 # ============================================================================
 
 class MediaExtractor:
-    """使用 yt-dlp 提取字幕和音频"""
+    """使用 yt-dlp 提取字幕和音频，抖音使用本地 API"""
 
     def __init__(self, cookies_browser: Optional[str] = None):
         self.yt_dlp_path = self._find_yt_dlp()
@@ -537,7 +618,16 @@ class MediaExtractor:
         return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
 
     def extract_audio(self, video_info: VideoInfo, output_path: Path) -> bool:
-        """提取音频文件"""
+        """提取音频文件
+
+        抖音平台：使用本地 douyin-api 服务获取下载链接
+        其他平台：使用 yt-dlp 下载
+        """
+        # 抖音平台：使用本地 API
+        if video_info.platform == "douyin":
+            return self._extract_douyin_audio(video_info, output_path)
+
+        # 其他平台：使用 yt-dlp
         import yt_dlp
 
         logger.info(f"Extracting audio to {output_path}")
@@ -571,6 +661,101 @@ class MediaExtractor:
 
         except Exception as e:
             logger.error(f"Error extracting audio: {e}")
+            return False
+
+    def _extract_douyin_audio(self, video_info: VideoInfo, output_path: Path) -> bool:
+        """通过本地 API 下载抖音视频并提取音频
+
+        使用本地部署的 douyin-api 服务获取视频下载链接，
+        然后用 ffmpeg 下载并提取音频轨道。
+
+        Args:
+            video_info: 视频信息
+            output_path: 音频输出路径
+
+        Returns:
+            是否成功
+        """
+        try:
+            client = DouyinAPIClient()
+
+            # 获取视频信息和下载链接
+            logger.info(f"Fetching douyin video info via local API: {video_info.original_url}")
+            video_data, video_url = client.get_video_info(video_info.original_url)
+
+            # 更新视频信息
+            if not video_info.title:
+                video_info.title = video_data.get("desc", "")[:100]  # 描述可能很长，截取前100字符
+            if not video_info.author:
+                author_info = video_data.get("author", {})
+                video_info.author = author_info.get("nickname", "")
+
+            logger.info(f"Douyin video URL obtained: {video_url[:80]}...")
+
+            # 使用 requests 下载视频（绕过 CDN 防盗链）
+            mp3_path = output_path.with_suffix(".mp3")
+            video_tmp = output_path.with_suffix(".mp4")
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://www.douyin.com/",
+                "Accept": "*/*",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            }
+
+            # 下载视频
+            logger.info("Downloading video with requests...")
+            resp = requests.get(video_url, headers=headers, timeout=60, stream=True)
+            if resp.status_code != 200:
+                logger.error(f"Video download failed: HTTP {resp.status_code}")
+                return False
+
+            with open(video_tmp, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            logger.info(f"Video downloaded: {video_tmp} ({video_tmp.stat().st_size} bytes)")
+
+            # 使用 ffmpeg 从本地文件提取音频
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(video_tmp),
+                "-vn",  # 不包含视频
+                "-acodec", "libmp3lame",
+                "-q:a", "2",  # 高质量音频
+                str(mp3_path)
+            ]
+
+            logger.info(f"Running ffmpeg to extract audio...")
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=120  # 2分钟超时
+            )
+
+            if result.returncode == 0 and mp3_path.exists():
+                logger.info(f"Douyin audio extracted successfully: {mp3_path}")
+                # 清理临时视频文件
+                if video_tmp.exists():
+                    video_tmp.unlink()
+                    logger.debug(f"Cleaned up temp video: {video_tmp}")
+                return True
+            else:
+                stderr = result.stderr.decode('utf-8', errors='replace')
+                logger.error(f"ffmpeg error (returncode={result.returncode}): {stderr[:500]}")
+                # 清理临时文件
+                if video_tmp.exists():
+                    video_tmp.unlink()
+                return False
+
+        except ValueError as e:
+            logger.error(f"Douyin API error: {e}")
+            return False
+        except subprocess.TimeoutExpired:
+            logger.error("ffmpeg timeout (>120s)")
+            return False
+        except Exception as e:
+            logger.error(f"Douyin audio extraction failed: {e}")
             return False
 
 
@@ -995,10 +1180,10 @@ class KnowledgeDistiller:
         from openai import OpenAI
 
         self.client = OpenAI(
-            api_key=config.dashscope_api_key,
+            api_key=self.config.dashscope_api_key,
             base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
         )
-        self.model = config.qwen_model
+        self.model = self.config.qwen_model
 
     def distill(self, video_info: VideoInfo, transcript: TranscriptResult) -> DistilledKnowledge:
         """执行知识蒸馏"""
