@@ -26,6 +26,7 @@ import http.client
 import logging
 from typing import Optional, Tuple
 from dataclasses import dataclass
+from pathlib import Path
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -87,8 +88,30 @@ class LLMClient:
 
     def __init__(self, config: Optional[LLMConfig] = None):
         self.config = config or LLMConfig()
-        # 从环境变量加载 API Key
-        self.config.bailian_api_key = self.config.bailian_api_key or os.getenv("BAILIAN_API_KEY")
+        # 从多个来源加载 API Key
+        self.config.bailian_api_key = (
+            self.config.bailian_api_key or
+            os.getenv("BAILIAN_API_KEY") or
+            self._load_api_key_from_env()
+        )
+
+    def _load_api_key_from_env(self) -> Optional[str]:
+        """从 zhiwei-bot/.env 文件加载 API Key"""
+        env_paths = [
+            Path(__file__).parent / ".env",  # zhiwei-bot/.env
+            Path.home() / "zhiwei-bot" / ".env",
+        ]
+        for env_path in env_paths:
+            if env_path.exists():
+                try:
+                    with open(env_path) as f:
+                        for line in f:
+                            line = line.strip()
+                            if line.startswith("BAILIAN_API_KEY="):
+                                return line.split("=", 1)[1]
+                except Exception as e:
+                    logger.warning(f"读取 .env 失败: {e}")
+        return None
 
     def call(
         self,
