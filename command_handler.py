@@ -108,7 +108,7 @@ def init_command_handler(
     global_reply_message, global_reply_card, global_call_openclaw_agent, global_query_knowledge_base,
     global_get_memory, global_add_to_history, global_get_history,
     global_is_article_url, global_is_video_url, global_summarize_url, global_handle_video_async,
-    global_extract_video_url, global_TaskLogger, global_detect_chain_intent, global_execute_chain,
+    global_extract_video_url, global_extract_article_url, global_TaskLogger, global_detect_chain_intent, global_execute_chain,
     global_IntentRouter, global_save_active_user, global_load_active_user,
     global_chat_history, global_pending_voice, global_pending_image, global_pending_review,
     global_MAX_HISTORY, global_RATE_LIMIT_SECONDS, global_user_last_request, global_memory_cache,
@@ -117,7 +117,7 @@ def init_command_handler(
     """初始化命令处理模块的全局依赖"""
     global reply_message, reply_card, call_openclaw_agent, query_knowledge_base
     global get_memory, add_to_history, get_history
-    global is_article_url, is_video_url, summarize_url, handle_video_async, extract_video_url
+    global is_article_url, is_video_url, summarize_url, handle_video_async, extract_video_url, extract_article_url
     global TaskLogger, detect_chain_intent, execute_chain, IntentRouter
     global save_active_user, load_active_user
     global chat_history, pending_voice, pending_image, pending_review
@@ -136,6 +136,7 @@ def init_command_handler(
     summarize_url = global_summarize_url
     handle_video_async = global_handle_video_async
     extract_video_url = global_extract_video_url
+    extract_article_url = global_extract_article_url
     TaskLogger = global_TaskLogger
     detect_chain_intent = global_detect_chain_intent
     execute_chain = global_execute_chain

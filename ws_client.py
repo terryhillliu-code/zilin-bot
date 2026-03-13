@@ -239,7 +239,7 @@ init_command_handler(
     reply_message, reply_card, call_openclaw_agent, query_knowledge_base,
     get_memory, add_to_history, get_history,
     is_article_url, is_video_url, summarize_url, handle_video_async,
-    extract_video_url, TaskLogger, detect_chain_intent, execute_chain,
+    extract_video_url, extract_article_url, TaskLogger, detect_chain_intent, execute_chain,
     IntentRouter, save_active_user, load_active_user,
     chat_history, pending_voice, pending_image, pending_review,
     MAX_HISTORY, RATE_LIMIT_SECONDS, user_last_request, memory_cache
@@ -275,7 +275,7 @@ def do_p2_im_message_receive_v1(data) -> None:
         if message_id in processed_messages:
             print(f"⏭️ 消息 {message_id} 已处理过，跳过")
             return
-        processed_messages.add(message_id)
+        processed_messages.append(message_id)
 
         # 限流 & 识别用户
         sender = event.sender
