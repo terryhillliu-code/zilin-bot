@@ -491,83 +491,29 @@ def handle_text_async(text: str, user_id: str, message_id: str):
 
             reply_message(message_id, f"📥 正在收录: {url}")
 
-            # 同步调用 knowledge-collect Skill
+            # 调用宿主机 knowledge_collect.py（迁移自 OpenClaw 容器）
             try:
-                cmd = f'docker exec clawdbot python3 /root/workspace/skills/knowledge-collect/collect.py --url "{url}"'
+                script_path = os.path.expanduser("~/zhiwei-bot/scripts/knowledge_collect.py")
+                venv_python = os.path.expanduser("~/zhiwei-bot/venv/bin/python")
+
+                cmd = [venv_python, script_path, "--url", url]
                 if tags:
-                    cmd += f' --tags "{tags}"'
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+                    cmd.extend(["--tags", tags])
+
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
                 if result.returncode == 0:
                     try:
                         data = json.loads(result.stdout.strip())
                         if data.get("status") == "ok":
-                            # 获取收录成功的标题，用于创建 Obsidian 笔记
                             title = data.get('title', '未知名称')
-
-                            # 在后台线程中创建 Obsidian 笔记
-                            def _create_obsidian_note():
-                                try:
-                                    # 将特殊字符替换为适合文件名的形式
-                                    import re
-                                    safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
-                                    safe_title = safe_title[:50]  # 限制长度
-
-                                    # 构建 Obsidian 笔记内容
-                                    note_content = f"""# {title}
-
-URL: {url}
-
-## 摘要
-{data.get('summary', '无摘要')}
-
-## 标签
-{tags if tags else '无'}
-
-## 收录时间
-{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-"""
-
-                                    # 调用 Obsidian CLI 创建笔记
-                                    obs_cmd = f'/opt/homebrew/bin/obsidian-cli create "Inbox/{safe_title}.md" --vault="~/Documents/ZhiweiVault" --content="{note_content.replace(chr(10), "\\n").replace(chr(9), "\\t")}"'
-                                    obs_result = subprocess.run(obs_cmd, shell=True, capture_output=True, text=True, timeout=30)
-
-                                    if obs_result.returncode == 0:
-                                        print(f"✅ Obsidian 笔记创建成功: {safe_title}")
-
-                                        # 调用自动链接功能（异步处理，避免阻塞主线程）
-                                        def _link_related_notes():
-                                            try:
-                                                from obsidian_linker import link_new_note
-                                                import time
-                                                # 等待文件创建完成
-                                                time.sleep(2)
-                                                note_path = Path.home() / "Documents" / "ZhiweiVault" / f"Inbox/{safe_title}.md"
-                                                link_new_note(note_path, note_content)
-                                            except ImportError:
-                                                print("⚠️ 未能导入 obsidian_linker，跳过自动链接")
-                                            except Exception as e:
-                                                print(f"❌ 自动链接过程中出错: {e}")
-
-                                        # 在后台线程中处理链接
-                                        link_thread = threading.Thread(target=_link_related_notes, daemon=True)
-                                        link_thread.start()
-                                    else:
-                                        print(f"❌ Obsidian 笔记创建失败: {obs_result.stderr}")
-
-                                except Exception as e:
-                                    print(f"❌ 创建 Obsidian 笔记时出错: {e}")
-
-                            # 启动后台线程创建 Obsidian 笔记
-                            obs_thread = threading.Thread(target=_create_obsidian_note, daemon=True)
-                            obs_thread.start()
+                            filepath = data.get('file', '')
 
                             reply_message(message_id,
                                 f"✅ 已收录到知识库\n"
-                                f"📄 标题: {data.get('title', '未知')}\n"
+                                f"📄 标题: {title}\n"
                                 f"📏 字数: {data.get('word_count', 0)}\n"
-                                f"📁 位置: knowledge-inbox/unsorted/\n"
-                                f"📘 同步创建 Obsidian 笔记中...")
+                                f"📁 位置: Inbox/{os.path.basename(filepath)}")
                         else:
                             reply_message(message_id, f"❌ 收录失败: {data.get('message', '未知错误')}")
                     except json.JSONDecodeError:
