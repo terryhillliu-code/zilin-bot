@@ -106,53 +106,11 @@ def extract_pdf_text(pdf_path: str) -> Tuple[Optional[str], Optional[str]]:
                     return None, "PDF 中未提取到有效文字"
 
             except ImportError:
-                # 两个库都不可用，尝试调用 Docker 中的工具
-                print("📄 正在检查 Docker 环境...")
-                return extract_pdf_text_docker(pdf_path)
+                return None, "PDF 解析库不可用，请安装 PyMuPDF 或 pdfplumber"
 
     except Exception as e:
         print(f"❌ PDF 提取异常: {e}")
         return None, f"提取失败: {str(e)}"
-
-
-def extract_pdf_text_docker(pdf_path: str) -> Tuple[Optional[str], Optional[str]]:
-    """使用 Docker 环境中的 PDF 工具提取文字"""
-    try:
-        # 复制文件到 Docker 容器
-        container_path = f"/tmp/pdf_{os.path.basename(pdf_path)}"
-        result = subprocess.run(
-            ["/usr/local/bin/docker", "cp", pdf_path, f"clawdbot:{container_path}"],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-
-        if result.returncode != 0:
-            return None, "复制文件到 Docker 失败"
-
-        # 在 Docker 中使用 pdfplumber 提取
-        cmd = [
-            "/usr/local/bin/docker", "exec", "clawdbot",
-            "python3", "-c",
-            f"import pdfplumber; doc=pdfplumber.open('{container_path}'); print('\\\\n\\\\n'.join([p.extract_text() or '' for p in doc.pages]))"
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-
-        if result.returncode == 0:
-            text = result.stdout.strip()
-            if text and len(text) > 10:
-                print(f"✅ Docker PDF 提取完成: {len(text)} 字符")
-                os.remove(pdf_path)  # 清理临时文件
-                return text, None
-            else:
-                return None, "PDF 中未提取到有效文字"
-        else:
-            return None, f"Docker 提取失败: {result.stderr[:200]}"
-
-    except subprocess.TimeoutExpired:
-        return None, "PDF 提取超时"
-    except Exception as e:
-        return None, f"Docker 提取异常: {str(e)}"
 
 
 def extract_pdf_summary(pdf_path: str, max_pages: int = 10) -> str:

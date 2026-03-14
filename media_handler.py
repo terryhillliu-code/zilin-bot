@@ -215,10 +215,9 @@ def is_video_url(text: str) -> bool:
 
 def fetch_url_content(url: str, timeout: int = 30) -> tuple[bool, str]:
     """
-    抓取 URL 内容，优先使用 defuddle，失败后降级到 web-summary
+    抓取 URL 内容，使用宿主机 defuddle
     返回: (success, content)
     """
-    # 1. 先尝试 defuddle
     try:
         result = subprocess.run(
             ["defuddle", "parse", url, "--md"],
@@ -229,36 +228,17 @@ def fetch_url_content(url: str, timeout: int = 30) -> tuple[bool, str]:
         if result.returncode == 0 and result.stdout.strip():
             logger.info(f"✅ defuddle 抓取成功: {url[:50]}")
             return True, result.stdout.strip()
+        else:
+            logger.error(f"❌ defuddle 抓取失败: {result.stderr[:200] if result.stderr else '无输出'}")
+            return False, f"❌ 网页抓取失败"
     except subprocess.TimeoutExpired:
-        logger.warning(f"⚠️ defuddle 超时: {url[:50]}")
-    except Exception as e:
-        logger.warning(f"⚠️ defuddle 失败: {e}")
-
-    # 2. 降级到原 web-summary
-    logger.info(f"↩️ 降级到 web-summary: {url[:50]}")
-    try:
-        cmd = [
-            "/usr/local/bin/docker", "exec", "clawdbot",
-            "python3", "/root/workspace/skills/web-summary/websummary.py", "fetch", "--url", url
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-
-        if result.returncode != 0:
-            logger.error(f"❌ web-summary 抓取失败: {result.stderr[:200]}")
-            return False, f"❌ 网页抓取失败: {result.stderr[:200]}"
-
-        content = result.stdout.strip()
-        if len(content) < 100:
-            logger.warning(f"⚠️ 网页内容太少: {url[:50]}")
-            return False, f"❌ 网页内容太少，无法总结"
-
-        return True, content
-
-    except subprocess.TimeoutExpired:
-        logger.error(f"❌ web-summary 抓取超时: {url[:50]}")
+        logger.error(f"❌ defuddle 超时: {url[:50]}")
         return False, "❌ 网页抓取超时"
+    except FileNotFoundError:
+        logger.error("❌ defuddle 未安装，请运行: npm install -g defuddle")
+        return False, "❌ defuddle 未安装"
     except Exception as e:
-        logger.error(f"❌ web-summary 抓取异常: {e}")
+        logger.error(f"❌ defuddle 抓取异常: {e}")
         return False, f"❌ 网页处理异常: {str(e)}"
 
 
