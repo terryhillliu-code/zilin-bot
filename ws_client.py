@@ -224,6 +224,16 @@ def call_openclaw_agent(message: str, session_id: str, agent: str = "main") -> s
     return handler.handle_sync(message, session_id, role=agent)
 
 
+# 占位函数（遗留接口兼容）
+def detect_chain_intent(text: str):
+    """检测链式意图 - 占位函数"""
+    return None
+
+def execute_chain(intent: str, context: dict):
+    """执行链式操作 - 占位函数"""
+    return None
+
+
 # 初始化命令处理模块（需要 call_openclaw_agent 已定义）
 from command_handler import init_command_handler
 init_command_handler(
