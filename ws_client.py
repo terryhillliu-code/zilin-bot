@@ -1,6 +1,5 @@
-from openclaw_api import OpenClawClient
 """
-知微 v2.1 - OpenClaw Agent 飞书机器人 (RAG 增强版)
+知微 v2.2 - 飞书机器人 (RAG 增强版)
 新增特性：
 - 📚 知识库检索 (RAG)：支持 /ask 命令和智能触发
 - 🧠 集成 klib 向量数据库
@@ -34,7 +33,6 @@ import signal
 # 导入新模块
 from memory_manager import MemoryManager
 from task_logger import TaskLogger
-from agent_chain import detect_chain_intent, execute_chain
 from intent_router import IntentRouter
 
 # 导入飞书 API 模块
