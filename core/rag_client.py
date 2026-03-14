@@ -105,19 +105,18 @@ class RAGClient:
         cmd = [
             str(self.venv_python),
             str(self.bridge_script),
-            "--query", query,
-            "--top_k", str(top_k),
+            "retrieve", query,
+            "--top-k", str(top_k),
         ]
 
-        if source_filter:
-            cmd.extend(["--source_filter", source_filter])
+        # Note: source_filter 暂不支持，bridge.py retrieve 命令无此参数
 
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=120,  # 增加超时，bridge 首次加载模型较慢
                 cwd=str(self.rag_dir)
             )
 
