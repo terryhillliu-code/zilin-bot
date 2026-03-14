@@ -10,6 +10,7 @@ import base64
 import threading
 import subprocess
 import logging
+from pathlib import Path
 from typing import Optional
 
 # 设置日志
@@ -402,36 +403,139 @@ def download_audio(message_id: str, file_key: str) -> str:
 
 
 def transcribe_audio(audio_path: str) -> str:
-    """转录语音文件为文字"""
-    container_audio = None
+    """转录语音文件为文字（使用宿主机 DashScope ASR）
+
+    复用 douyin_distiller.py 的 DashScopeASRTranscriber 逻辑。
+    音频格式自动转换为 16kHz 单声道（Recognition API 要求）。
+    """
+    converted_path = None
     try:
-        container_audio = f"/tmp/feishu_audio_{os.path.basename(audio_path)}"
-        subprocess.run([
-            "/usr/local/bin/docker", "cp",
-            audio_path, f"clawdbot:{container_audio}"
-        ], check=True, timeout=10)
+        import dashscope
+        from dashscope.audio.asr import Recognition
 
-        result = subprocess.run([
-            "/usr/local/bin/docker", "exec", "clawdbot",
-            "python3", "/root/workspace/scripts/transcribe_aliyun.py", container_audio
-        ], capture_output=True, text=True, timeout=120)
+        # 获取 API key
+        api_key = os.getenv("DASHSCOPE_API_KEY")
+        if not api_key:
+            # 尝试从 .env 文件加载
+            env_path = os.path.expanduser("~/zhiwei-bot/.env")
+            if os.path.exists(env_path):
+                from dotenv import load_dotenv
+                load_dotenv(env_path)
+                api_key = os.getenv("DASHSCOPE_API_KEY")
 
-        if result.returncode == 0:
-            text = result.stdout.strip()
-            print(f"✅ 转录完成: {len(text)} 字符")
-            return text
-        else:
-            print(f"❌ 转录失败: {result.stderr[:300]}")
+        if not api_key:
+            logger.error("DASHSCOPE_API_KEY 未配置")
             return None
-    except subprocess.TimeoutExpired:
+
+        dashscope.api_key = api_key
+
+        # 音频格式转换（Recognition API 需要 16kHz 单声道）
+        audio_path_obj = Path(audio_path)
+        converted_path = _ensure_audio_format(audio_path_obj)
+
+        # 检测音频格式
+        suffix = converted_path.suffix.lower().lstrip('.')
+        audio_format = suffix if suffix in ['mp3', 'wav', 'pcm', 'opus', 'm4a', 'aac'] else 'opus'
+
+        logger.info(f"🎵 ASR 转录: {converted_path.name} ({audio_format})")
+
+        # 创建 Recognition 实例
+        recognition = Recognition(
+            model="paraformer-realtime-v2",
+            format=audio_format,
+            sample_rate=16000
+        )
+
+        # 调用同步识别
+        result = recognition.call(file=str(converted_path.absolute()))
+
+        if result.status_code == 200:
+            # 解析结果
+            full_text = ""
+            if hasattr(result, 'output') and result.output:
+                output = result.output
+                if 'sentence' in output:
+                    for sentence in output['sentence']:
+                        full_text += sentence.get('text', '')
+                elif 'text' in output:
+                    full_text = output['text']
+
+            if full_text:
+                logger.info(f"✅ 转录完成: {len(full_text)} 字符")
+                return full_text
+            else:
+                logger.error("ASR 返回空结果")
+                return None
+        else:
+            logger.error(f"ASR 转录失败: {result.message}")
+            return None
+
+    except ImportError:
+        logger.error("dashscope 未安装，请运行: pip install dashscope")
         return None
     except Exception as e:
-        print(f"❌ 转录异常: {e}")
+        logger.error(f"ASR 转录异常: {e}")
         return None
     finally:
+        # 清理文件
         if audio_path and os.path.exists(audio_path):
             os.remove(audio_path)
-        if container_audio:
-            subprocess.run([
-                "/usr/local/bin/docker", "exec", "clawdbot", "rm", "-f", container_audio
-            ], capture_output=True)
+        if converted_path and converted_path != Path(audio_path) and converted_path.exists():
+            converted_path.unlink()
+
+
+def _ensure_audio_format(audio_path: Path) -> Path:
+    """确保音频格式符合 Recognition API 要求（16kHz 单声道）
+
+    复用 douyin_distiller.py 的 DashScopeASRTranscriber._ensure_audio_format 逻辑。
+    返回转换后的音频路径（如无需转换则返回原路径）。
+    """
+    try:
+        # 使用 ffprobe 检查音频格式
+        probe_cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=sample_rate,channels",
+            "-of", "csv=p=0", str(audio_path)
+        ]
+        result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+
+        if result.returncode != 0:
+            logger.warning(f"ffprobe failed, using original audio")
+            return audio_path
+
+        # 解析输出：格式为 "sample_rate,channels"
+        output = result.stdout.strip()
+        parts = output.split(',')
+
+        if len(parts) >= 2:
+            sample_rate = int(parts[0])
+            channels = int(parts[1])
+
+            # 检查是否需要转换（非16kHz或非单声道）
+            if sample_rate != 16000 or channels != 1:
+                converted_path = audio_path.with_suffix(".converted.mp3")
+                logger.info(f"🎵 音频转换: {sample_rate}Hz/{channels}ch → 16000Hz/1ch")
+
+                convert_cmd = [
+                    "ffmpeg", "-y", "-i", str(audio_path),
+                    "-ar", "16000", "-ac", "1", "-f", "mp3",
+                    str(converted_path)
+                ]
+                conv_result = subprocess.run(convert_cmd, capture_output=True, timeout=120)
+
+                if conv_result.returncode == 0 and converted_path.exists():
+                    return converted_path
+                else:
+                    logger.warning(f"ffmpeg conversion failed")
+                    return audio_path
+            else:
+                return audio_path
+        else:
+            return audio_path
+
+    except subprocess.TimeoutExpired:
+        logger.warning("ffprobe/ffmpeg timeout")
+        return audio_path
+    except Exception as e:
+        logger.warning(f"Audio format check failed: {e}")
+        return audio_path
