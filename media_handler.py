@@ -287,7 +287,7 @@ def process_video(text: str, message_id: str = None) -> str:
             return "❌ 未找到有效的视频链接"
         logger.info(f"🎬 视频链接: {url}")
 
-        # 调用宿主机 Distiller（新链路）
+        # 调用宿主机 Distiller
         distiller_path = os.path.expanduser("~/zhiwei-bot/scripts/douyin_distiller.py")
         venv_python = os.path.expanduser("~/zhiwei-bot/venv/bin/python")
 
@@ -301,9 +301,9 @@ def process_video(text: str, message_id: str = None) -> str:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
         if result.returncode != 0:
-            # 降级：如果 Distiller 失败，尝试容器内的旧版
-            logger.warning(f"Distiller 失败，尝试容器内旧版: {result.stderr[:200]}")
-            return _process_video_legacy(url, message_id)
+            error_msg = result.stderr[:500] if result.stderr else result.stdout[:500]
+            logger.error(f"Distiller 失败: {error_msg}")
+            return f"❌ 视频处理失败\n\n{error_msg}"
 
         # 解析输出
         output = result.stdout
@@ -321,54 +321,6 @@ def process_video(text: str, message_id: str = None) -> str:
         return "❌ 视频分析超时（10分钟）"
     except Exception as e:
         logger.error(f"视频处理异常: {e}")
-        return f"❌ 视频处理异常: {str(e)}"
-
-
-def _process_video_legacy(url: str, message_id: str = None) -> str:
-    """旧版视频处理（容器内 insight.py）- 作为降级方案"""
-    logger.info(f"📦 降级到容器内 insight.py")
-    try:
-        cmd = [
-            "/usr/local/bin/docker", "exec", "clawdbot",
-            "python3", "/root/workspace/skills/douyin-video-insight/insight.py",
-            "--url", url, "--whisper-model", "small"
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
-        if result.returncode != 0:
-            return f"❌ 视频分析失败\n\n{(result.stderr or result.stdout)[:500]}"
-
-        output = result.stdout
-        timestamp_match = re.search(r'(\d{8}_\d{6})', output)
-        if timestamp_match:
-            timestamp = timestamp_match.group(1)
-        else:
-            find_result = subprocess.run(
-                ["/usr/local/bin/docker", "exec", "clawdbot", "ls", "-t",
-                 "/root/workspace/data/douyin_cache"],
-                capture_output=True, text=True
-            )
-            dirs = find_result.stdout.strip().split('\n')
-            timestamp = dirs[0] if dirs else None
-
-        if not timestamp:
-            return "❌ 未找到分析报告"
-
-        cat_result = subprocess.run(
-            ["/usr/local/bin/docker", "exec", "clawdbot", "cat",
-             f"/root/workspace/data/douyin_cache/{timestamp}/report.md"],
-            capture_output=True, text=True
-        )
-        if cat_result.returncode != 0:
-            return "❌ 无法读取报告"
-
-        report = cat_result.stdout
-        if len(report) > 3800:
-            report = report[:3700] + "\n\n...(内容过长已截断)"
-        return f"🎬 视频分析报告\n\n{report}"
-
-    except subprocess.TimeoutExpired:
-        return "❌ 视频分析超时（10分钟）"
-    except Exception as e:
         return f"❌ 视频处理异常: {str(e)}"
 
 
