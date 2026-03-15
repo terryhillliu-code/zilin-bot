@@ -64,6 +64,7 @@ class LLMClient:
         "chat": "qwen3.5-plus",      # 知微 - 对话
         "research": "kimi-k2.5",     # 探微 - 研究
         "format": "qwen3.5-plus",    # 通微 - 格式化
+        "distill": "kimi-k2.5",      # 蒸微 - 视频知识蒸馏（快速、精炼）
         "main": "qwen3.5-plus",      # 兼容 OpenClaw main agent
         "researcher": "kimi-k2.5",   # 兼容 OpenClaw researcher agent
         "operator": "qwen3.5-plus",  # 兼容 OpenClaw operator agent
@@ -72,7 +73,8 @@ class LLMClient:
     # 模型降级链
     FALLBACK_CHAIN = {
         "qwen3.5-plus": ["glm-5", "MiniMax-M2.5"],
-        "kimi-k2.5": ["qwen3.5-plus", "glm-5"],
+        "kimi-k2.5": ["qwen3-max-2026-01-23", "qwen3.5-plus", "glm-5"],
+        "qwen3-max-2026-01-23": ["qwen3.5-plus", "glm-5"],
         "glm-5": ["MiniMax-M2.5"],
     }
 
@@ -81,6 +83,7 @@ class LLMClient:
         "chat": "你是知微，一个友好、专业的AI助手。",
         "research": "你是探微，一个擅长深度分析和信息收集的AI助手。",
         "format": "你是通微，一个擅长内容整理和格式化的AI助手。",
+        "distill": "你是蒸微，一个擅长从视频转录中提取知识精华的AI助手。",
         "main": "你是知微，一个友好、专业的AI助手。",
         "researcher": "你是探微，一个擅长深度分析和信息收集的AI助手。",
         "operator": "你是通微，一个擅长内容整理和格式化的AI助手。",

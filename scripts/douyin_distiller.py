@@ -1133,7 +1133,12 @@ class TranscriptPostProcessor:
 # ============================================================================
 
 class KnowledgeDistiller:
-    """LLM 知识蒸馏"""
+    """
+    知识蒸馏引擎
+
+    使用统一 LLM 客户端 (llm_client.py) 进行知识提取
+    默认使用 kimi-k2.5 模型，自动降级到 qwen3-max-2026-01-23 → qwen3.5-plus → glm-5
+    """
 
     SYSTEM_PROMPT = """你是一个专业的知识提取助手。你的任务是从视频转录文本中提取核心知识点。
 
@@ -1176,18 +1181,17 @@ class KnowledgeDistiller:
         self._init_client()
 
     def _init_client(self):
-        """初始化 OpenAI 客户端（兼容 DashScope）"""
-        from openai import OpenAI
+        """初始化统一 LLM 客户端"""
+        # 导入统一客户端
+        sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
+        from llm_client import llm_client
 
-        self.client = OpenAI(
-            api_key=self.config.dashscope_api_key,
-            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
-        )
-        self.model = self.config.qwen_model
+        self.llm_client = llm_client
+        logger.info("Using unified LLM client with distill role (kimi-k2.5)")
 
     def distill(self, video_info: VideoInfo, transcript: TranscriptResult) -> DistilledKnowledge:
-        """执行知识蒸馏"""
-        logger.info(f"Distilling knowledge with {self.model}")
+        """执行知识蒸馏（使用统一客户端自动降级）"""
+        logger.info("Distilling knowledge with distill role (kimi-k2.5 + auto-fallback)")
 
         # 构建提示
         user_prompt = self.USER_PROMPT_TEMPLATE.format(
@@ -1198,18 +1202,19 @@ class KnowledgeDistiller:
         )
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.3,
-                max_tokens=2000,
+            # 使用统一客户端调用（自动降级）
+            success, content = self.llm_client.call(
+                role="distill",
+                message=user_prompt,
+                system_prompt=self.SYSTEM_PROMPT,
+                timeout=120
             )
 
-            content = response.choices[0].message.content
-            return self._parse_response(content)
+            if success:
+                return self._parse_response(content)
+            else:
+                logger.error(f"LLM distillation failed: {content}")
+                return self._fallback_distill(video_info, transcript)
 
         except Exception as e:
             logger.error(f"LLM distillation error: {e}")
