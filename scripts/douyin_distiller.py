@@ -630,6 +630,111 @@ class MediaExtractor:
         """将 SRT 时间转换为秒"""
         return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
 
+    def download_video(self, video_info: VideoInfo, output_path: Path) -> bool:
+        """下载视频文件（用于图片视频检测等场景）
+
+        Args:
+            video_info: 视频信息
+            output_path: 视频输出路径
+
+        Returns:
+            是否成功
+        """
+        # 抖音平台：使用本地 API
+        if video_info.platform == "douyin":
+            return self._download_douyin_video(video_info, output_path)
+
+        # 其他平台：使用 yt-dlp
+        import yt_dlp
+
+        logger.info(f"Downloading video to {output_path}")
+
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "format": "best[ext=mp4]/best",
+            "outtmpl": str(output_path.with_suffix("")),
+        }
+
+        # 添加 cookies 支持
+        if self.cookies_browser:
+            ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([video_info.resolved_url])
+
+            # 检查输出文件
+            if output_path.exists():
+                logger.info(f"Video downloaded: {output_path}")
+                return True
+            # 尝试其他扩展名
+            for ext in [".mp4", ".mkv", ".webm"]:
+                alt_path = output_path.with_suffix(ext)
+                if alt_path.exists():
+                    # 重命名为期望的路径
+                    alt_path.rename(output_path)
+                    logger.info(f"Video downloaded: {output_path}")
+                    return True
+
+            logger.error(f"Video file not found after download")
+            return False
+
+        except Exception as e:
+            logger.error(f"Error downloading video: {e}")
+            return False
+
+    def _download_douyin_video(self, video_info: VideoInfo, output_path: Path) -> bool:
+        """下载抖音视频（不提取音频）
+
+        Args:
+            video_info: 视频信息
+            output_path: 视频输出路径
+
+        Returns:
+            是否成功
+        """
+        try:
+            client = DouyinAPIClient()
+
+            # 获取视频信息和下载链接
+            logger.info(f"Fetching douyin video info for download: {video_info.original_url}")
+            video_data, video_url = client.get_video_info(video_info.original_url)
+
+            # 更新视频信息
+            if not video_info.title:
+                video_info.title = video_data.get("desc", "")[:100]
+            if not video_info.author:
+                author_info = video_data.get("author", {})
+                video_info.author = author_info.get("nickname", "")
+
+            logger.info(f"Douyin video URL obtained: {video_url[:80]}...")
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://www.douyin.com/",
+                "Accept": "*/*",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            }
+
+            # 下载视频
+            logger.info("Downloading douyin video...")
+            resp = requests.get(video_url, headers=headers, timeout=120, stream=True)
+            if resp.status_code != 200:
+                logger.error(f"Video download failed: HTTP {resp.status_code}")
+                return False
+
+            with open(output_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            logger.info(f"Video downloaded: {output_path} ({output_path.stat().st_size} bytes)")
+            return True
+
+        except Exception as e:
+            logger.error(f"Douyin video download error: {e}")
+            return False
+
     def extract_audio(self, video_info: VideoInfo, output_path: Path) -> bool:
         """提取音频文件
 
@@ -1031,6 +1136,394 @@ class LocalMLXWhisperTranscriber(BaseTranscriber):
 
 
 # ============================================================================
+# 图片视频处理器
+# ============================================================================
+
+class ImageVideoProcessor:
+    """
+    处理图片/幻灯片类型的视频
+
+    这类视频由连续图片组成，没有实际的动态画面，
+    需要通过帧提取 + VLM 识别来获取内容。
+    """
+
+    # 图片视频判定阈值
+    SCENE_CHANGE_THRESHOLD = 0.15  # 场景变化阈值（低于此值判定为图片视频）
+    MIN_FRAME_INTERVAL = 2.0       # 最小帧间隔（秒）
+    MAX_FRAMES = 15                # 最大提取帧数
+
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self._vlm_engine = None
+
+    def _get_vlm_engine(self):
+        """延迟初始化 VLM 引擎"""
+        if self._vlm_engine is None:
+            try:
+                # 尝试导入 VLM 引擎
+                vlm_path = Path.home() / "zhiwei-rag" / "multimodal"
+                if vlm_path not in [Path(p) for p in sys.path]:
+                    sys.path.insert(0, str(vlm_path.parent))
+                from multimodal.vlm_engine import VLMEngine
+
+                self._vlm_engine = VLMEngine(
+                    model_name="qwen-vl-plus",
+                    prefer_local=False,  # 优先云端，更稳定
+                    api_key=self.config.dashscope_api_key
+                )
+                logger.info("VLM Engine initialized for image video processing")
+            except ImportError as e:
+                logger.warning(f"VLM Engine not available: {e}")
+                self._vlm_engine = None
+
+        return self._vlm_engine
+
+    def is_image_video(self, video_path: Path) -> bool:
+        """
+        判断是否为图片视频
+
+        通过分析场景变化率和帧相似度来判断：
+        - 图片视频：场景变化极少，大部分帧相似
+        - 正常视频：场景变化频繁
+
+        Args:
+            video_path: 视频文件路径
+
+        Returns:
+            True 如果是图片视频
+        """
+        try:
+            # 方法1：使用 ffmpeg 检测场景变化
+            cmd = [
+                "ffmpeg", "-i", str(video_path),
+                "-vf", f"select='gt(scene,{self.SCENE_CHANGE_THRESHOLD})',showinfo",
+                "-f", "null", "-"
+            ]
+
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60
+            )
+
+            # 统计场景变化次数
+            scene_changes = result.stderr.count("showinfo")
+
+            # 获取视频时长
+            duration_cmd = [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "csv=p=0", str(video_path)
+            ]
+            duration_result = subprocess.run(
+                duration_cmd, capture_output=True, text=True, timeout=10
+            )
+
+            if duration_result.returncode == 0:
+                duration = float(duration_result.stdout.strip())
+                # 每分钟场景变化次数
+                changes_per_minute = (scene_changes / duration) * 60 if duration > 0 else 0
+
+                # 图片视频通常每分钟场景变化 < 5 次
+                is_image = changes_per_minute < 5
+
+                logger.info(
+                    f"Video analysis: {scene_changes} scene changes, "
+                    f"{changes_per_minute:.1f}/min, is_image_video={is_image}"
+                )
+
+                if is_image:
+                    return True
+
+            # 方法2：提取几帧检查相似度
+            return self._check_frame_similarity(video_path)
+
+        except subprocess.TimeoutExpired:
+            logger.warning("Video analysis timeout, assuming regular video")
+        except Exception as e:
+            logger.warning(f"Video analysis failed: {e}")
+
+        return False
+
+    def _check_frame_similarity(self, video_path: Path) -> bool:
+        """检查帧相似度，判断是否为图片视频"""
+        try:
+            with tempfile.TemporaryDirectory(prefix="framesim_") as tmpdir:
+                tmpdir_path = Path(tmpdir)
+
+                # 提取3帧进行对比
+                for i, ts in enumerate([0, 2, 5]):
+                    frame_path = tmpdir_path / f"frame_{i}.jpg"
+                    cmd = [
+                        "ffmpeg", "-y", "-ss", str(ts),
+                        "-i", str(video_path),
+                        "-vframes", "1", "-q:v", "2",
+                        str(frame_path)
+                    ]
+                    subprocess.run(cmd, capture_output=True, timeout=30)
+
+                # 检查提取的帧
+                frames = list(tmpdir_path.glob("frame_*.jpg"))
+                if len(frames) < 2:
+                    return False
+
+                # 使用 ImageHash 计算帧相似度
+                try:
+                    import imagehash
+                    from PIL import Image
+
+                    hashes = []
+                    for frame in frames:
+                        img = Image.open(frame)
+                        h = imagehash.average_hash(img)
+                        hashes.append(h)
+
+                    # 计算平均汉明距离
+                    if len(hashes) >= 2:
+                        total_diff = sum(h1 - h2 for i, h1 in enumerate(hashes) for h2 in hashes[i+1:])
+                        avg_diff = total_diff / (len(hashes) * (len(hashes) - 1) / 2)
+
+                        # 平均汉明距离 < 5 表示非常相似（图片视频）
+                        is_similar = avg_diff < 5
+                        logger.info(f"Frame similarity: avg_diff={avg_diff:.1f}, is_similar={is_similar}")
+                        return is_similar
+
+                except ImportError:
+                    # imagehash 不可用，使用像素对比
+                    from PIL import Image
+                    import numpy as np
+
+                    arrays = []
+                    for frame in frames:
+                        img = Image.open(frame).convert('L').resize((64, 64))
+                        arrays.append(np.array(img))
+
+                    if len(arrays) >= 2:
+                        # 计算像素差异
+                        diffs = [np.mean(np.abs(arrays[i] - arrays[j]))
+                                 for i in range(len(arrays)) for j in range(i+1, len(arrays))]
+                        avg_diff = sum(diffs) / len(diffs)
+
+                        # 平均像素差异 < 10 表示非常相似
+                        is_similar = avg_diff < 10
+                        logger.info(f"Frame pixel similarity: avg_diff={avg_diff:.1f}, is_similar={is_similar}")
+                        return is_similar
+
+        except Exception as e:
+            logger.warning(f"Frame similarity check failed: {e}")
+
+        return False
+
+    def extract_key_frames(
+        self,
+        video_path: Path,
+        output_dir: Path
+    ) -> list[ImageFrame]:
+        """
+        提取关键帧
+
+        Args:
+            video_path: 视频文件路径
+            output_dir: 输出目录
+
+        Returns:
+            ImageFrame 列表
+        """
+        frames = []
+
+        try:
+            # 确保输出目录存在
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # 获取视频时长
+            duration_cmd = [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "csv=p=0", str(video_path)
+            ]
+            result = subprocess.run(
+                duration_cmd, capture_output=True, text=True, timeout=10
+            )
+
+            if result.returncode != 0:
+                logger.error("Failed to get video duration")
+                return frames
+
+            duration = float(result.stdout.strip())
+
+            # 计算帧间隔
+            frame_count = min(
+                int(duration / self.MIN_FRAME_INTERVAL) + 1,
+                self.MAX_FRAMES
+            )
+            interval = duration / frame_count if frame_count > 0 else self.MIN_FRAME_INTERVAL
+
+            logger.info(f"Extracting {frame_count} frames from {duration:.1f}s video")
+
+            # 提取帧
+            for i in range(frame_count):
+                timestamp = i * interval
+                frame_path = output_dir / f"frame_{i:03d}.jpg"
+
+                cmd = [
+                    "ffmpeg", "-y", "-ss", str(timestamp),
+                    "-i", str(video_path),
+                    "-vframes", "1",
+                    "-q:v", "2",
+                    str(frame_path)
+                ]
+
+                result = subprocess.run(
+                    cmd, capture_output=True, timeout=30
+                )
+
+                if result.returncode == 0 and frame_path.exists():
+                    frames.append(ImageFrame(
+                        index=i,
+                        timestamp=timestamp,
+                        path=str(frame_path)
+                    ))
+                else:
+                    logger.warning(f"Failed to extract frame at {timestamp:.1f}s")
+
+            logger.info(f"Successfully extracted {len(frames)} frames")
+
+        except Exception as e:
+            logger.error(f"Frame extraction failed: {e}")
+
+        return frames
+
+    def describe_frames(
+        self,
+        frames: list[ImageFrame],
+        prompt: Optional[str] = None
+    ) -> list[ImageFrame]:
+        """
+        使用 VLM 描述每帧内容
+
+        Args:
+            frames: 帧列表
+            prompt: 自定义提示词
+
+        Returns:
+            更新了 description 的帧列表
+        """
+        vlm = self._get_vlm_engine()
+
+        if vlm is None:
+            logger.error("VLM Engine not available")
+            # 回退：直接标记无法处理
+            for frame in frames:
+                frame.description = "[VLM 不可用，无法识别图片内容]"
+            return frames
+
+        default_prompt = """请详细描述这张图片的内容，包括：
+1. 主要文字信息（标题、要点等）
+2. 图表或数据可视化内容
+3. 关键视觉元素
+4. 如果是幻灯片，请提取主要知识点
+
+请用简洁的语言概括核心内容。"""
+
+        actual_prompt = prompt or default_prompt
+
+        for frame in frames:
+            try:
+                logger.info(f"Describing frame {frame.index} at {frame.timestamp:.1f}s")
+                result = vlm.describe_image(
+                    frame.path,
+                    prompt=actual_prompt,
+                    max_tokens=500
+                )
+                frame.description = result.description
+                logger.info(f"Frame {frame.index}: {result.description[:100]}...")
+
+            except Exception as e:
+                logger.error(f"Failed to describe frame {frame.index}: {e}")
+                frame.description = f"[图片识别失败: {e}]"
+
+        return frames
+
+    def synthesize_transcript(
+        self,
+        frames: list[ImageFrame]
+    ) -> TranscriptResult:
+        """
+        将帧描述合成为转录结果
+
+        Args:
+            frames: 包含描述的帧列表
+
+        Returns:
+            TranscriptResult
+        """
+        segments = []
+        full_text_parts = []
+
+        for frame in frames:
+            if frame.description and not frame.description.startswith("["):
+                # 创建转录片段
+                segment = TranscriptSegment(
+                    start=frame.timestamp,
+                    end=frame.timestamp + self.MIN_FRAME_INTERVAL,
+                    text=frame.description
+                )
+                segments.append(segment)
+                full_text_parts.append(f"[{self._format_time(frame.timestamp)}] {frame.description}")
+
+        full_text = "\n\n".join(full_text_parts)
+
+        return TranscriptResult(
+            segments=segments,
+            full_text=full_text,
+            source="vlm_image_frames",
+            language="zh",
+            confidence=0.85
+        )
+
+    def _format_time(self, seconds: float) -> str:
+        """格式化时间戳"""
+        mins = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{mins:02d}:{secs:02d}"
+
+    def process_image_video(
+        self,
+        video_info: VideoInfo,
+        video_path: Path
+    ) -> TranscriptResult:
+        """
+        处理图片视频的完整流程
+
+        Args:
+            video_info: 视频信息
+            video_path: 视频文件路径
+
+        Returns:
+            TranscriptResult
+        """
+        logger.info(f"Processing image video: {video_info.title}")
+
+        with tempfile.TemporaryDirectory(prefix="imgvid_") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+
+            # 提取关键帧
+            frames = self.extract_key_frames(video_path, tmpdir_path)
+
+            if not frames:
+                logger.error("No frames extracted")
+                return TranscriptResult()
+
+            # 使用 VLM 描述帧
+            frames = self.describe_frames(frames)
+
+            # 合成为转录结果
+            transcript = self.synthesize_transcript(frames)
+
+            logger.info(f"Image video processing complete: {len(transcript.full_text)} chars")
+
+            return transcript
+
+
+# ============================================================================
 # 转录提供者（路由编排）
 # ============================================================================
 
@@ -1046,6 +1539,7 @@ class TranscriptProvider:
             config.asr_model
         )
         self.local_transcriber = LocalMLXWhisperTranscriber(config.local_asr_model)
+        self.image_video_processor = ImageVideoProcessor(config)
 
     def get_transcript(self, video_info: VideoInfo) -> TranscriptResult:
         """获取转录文本，按策略选择方法"""
@@ -1059,10 +1553,34 @@ class TranscriptProvider:
                 logger.info("Successfully extracted platform subtitles")
                 return subtitle_result
 
-            logger.info("No subtitles found, falling back to ASR")
+            logger.info("No subtitles found, checking video type...")
 
-        # ASR 转录
+        # 检测并处理图片视频
+        image_result = self._try_image_video(video_info)
+        if image_result and image_result.full_text:
+            logger.info("Successfully processed as image video")
+            return image_result
+
+        # 普通 ASR 转录
         return self._transcribe_with_asr(video_info)
+
+    def _try_image_video(self, video_info: VideoInfo) -> Optional[TranscriptResult]:
+        """尝试作为图片视频处理"""
+        with tempfile.TemporaryDirectory(prefix="vidcheck_") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            video_path = tmpdir_path / "video.mp4"
+
+            # 下载视频
+            if not self.media_extractor.download_video(video_info, video_path):
+                logger.warning("Failed to download video for type check")
+                return None
+
+            # 检测是否为图片视频
+            if self.image_video_processor.is_image_video(video_path):
+                logger.info("Detected image/slide video, using VLM processing")
+                return self.image_video_processor.process_image_video(video_info, video_path)
+
+            return None
 
     def _transcribe_with_asr(self, video_info: VideoInfo) -> TranscriptResult:
         """使用 ASR 转录"""
