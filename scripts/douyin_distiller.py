@@ -102,6 +102,15 @@ class DistilledKnowledge:
     related_concepts: list[str] = field(default_factory=list)  # 可关联的知识概念
 
 
+@dataclass
+class ImageFrame:
+    """图片帧信息"""
+    index: int           # 帧序号
+    timestamp: float     # 时间戳（秒）
+    path: str           # 临时文件路径
+    description: str = ""  # VLM 生成的描述
+
+
 # ============================================================================
 # 配置管理
 # ============================================================================
