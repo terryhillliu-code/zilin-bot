@@ -1453,6 +1453,7 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
 
     logger.info("=" * 50)
     logger.info(f"✅ Done! Output: {output_path}")
+    print(f"✅ Done! Output: {output_path}")  # 同时输出到 stdout，供调用方检测
     return 0
 
 
