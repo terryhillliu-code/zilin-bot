@@ -192,12 +192,12 @@ def handle_image_async(message_id: str, image_key: str, user_id: str):
 def extract_video_url(text: str) -> str:
     """提取视频 URL"""
     patterns = [
-        r'(https?://v\.douyin\.com/[A-Za-z0-9]+/?)',
+        r'(https?://v\.douyin\.com/[A-Za-z0-9_-]+/?)',
         r'(https?://www\.douyin\.com/video/\d+)',
         r'(https?://(?:www\.)?youtube\.com/watch\?v=[A-Za-z0-9_-]+)',
         r'(https?://youtu\.be/[A-Za-z0-9_-]+)',
-        r'(https?://(?:www\.)?bilibili\.com/video/[A-Za-z0-9]+)',
-        r'(https?://b23\.tv/[A-Za-z0-9]+)'
+        r'(https?://(?:www\.)?bilibili\.com/video/[A-Za-z0-9_-]+)',
+        r'(https?://b23\.tv/[A-Za-z0-9_-]+)'
     ]
     for pattern in patterns:
         match = re.search(pattern, text)
