@@ -285,13 +285,72 @@ def handle_text_async(text: str, user_id: str, message_id: str):
 
         # ===== 1. 语音确认流程 =====
         if user_id in pending_voice:
-            pending_text = pending_voice.pop(user_id)
+            voice_data = pending_voice.pop(user_id)
+            # 支持两种格式：旧格式（直接字符串）和新格式（字典）
+            if isinstance(voice_data, dict):
+                original_text = voice_data.get("text", "")
+            else:
+                original_text = voice_data
+
             if text_lower in ["取消", "cancel", "算了"]:
                 reply_message(message_id, "✅ 已取消")
                 return
+
             if text_lower in ["ok", "确认", "好的", "执行", "是", "yes"]:
-                text_stripped = pending_text
-            # 否则使用用户修改后的内容
+                # 用户确认，提取任务
+                reply_message(message_id, "📋 正在提取待办任务...")
+
+                try:
+                    # 动态导入任务提取模块
+                    bot_dir = Path(__file__).parent
+                    if str(bot_dir) not in sys.path:
+                        sys.path.insert(0, str(bot_dir))
+
+                    from voice_task_extractor import extract_tasks
+                    from voice_task_store import VoiceTaskStore
+
+                    # 提取任务
+                    tasks = extract_tasks(original_text)
+
+                    if not tasks:
+                        reply_message(message_id, "📋 未识别到待办任务\n\n原始内容已保存，你可以手动记录")
+                        return
+
+                    # 存储任务
+                    store = VoiceTaskStore()
+                    added_ids = []
+                    for task in tasks:
+                        task_id = store.add(
+                            content=task["content"],
+                            priority=task.get("priority", "normal"),
+                            source_text=original_text
+                        )
+                        added_ids.append(task_id)
+
+                    # 构建回复
+                    priority_icons = {"high": "🔴", "normal": "🟡", "low": "⚪"}
+                    task_lines = []
+                    for task in tasks:
+                        icon = priority_icons.get(task.get("priority", "normal"), "🟡")
+                        task_lines.append(f"{icon} {task['content']}")
+
+                    reply_message(message_id,
+                        f"✅ 已添加 {len(tasks)} 个待办任务\n\n" +
+                        "\n".join(task_lines) +
+                        "\n\n💡 发送 /任务 查看所有待办"
+                    )
+
+                    # 记录日志
+                    TaskLogger.log_task("语音任务提取", "完成", f"{len(tasks)}个任务")
+                    return
+
+                except Exception as e:
+                    traceback.print_exc()
+                    reply_message(message_id, f"❌ 任务提取失败: {str(e)}")
+                    return
+            else:
+                # 用户修改了内容，使用修改后的文本继续处理
+                text_stripped = text_stripped if text_stripped else original_text
 
         # ===== 2. 图片追问 =====
         if user_id in pending_image:
@@ -708,7 +767,32 @@ def handle_text_async(text: str, user_id: str, message_id: str):
             return
 
         if text_lower.startswith("/tasks") or text_lower in ["任务", "/任务"]:
-            reply_message(message_id, TaskLogger.get_recent(5))
+            # 显示语音任务列表
+            try:
+                bot_dir = Path(__file__).parent
+                if str(bot_dir) not in sys.path:
+                    sys.path.insert(0, str(bot_dir))
+                from voice_task_store import VoiceTaskStore
+
+                store = VoiceTaskStore()
+                stats = store.stats()
+                pending = store.list_pending(10)
+
+                lines = [f"📋 待办任务 ({stats['pending']} 项)"]
+                if pending:
+                    priority_icons = {"high": "🔴", "normal": "🟡", "low": "⚪"}
+                    for task in pending:
+                        icon = priority_icons.get(task.get('priority', 'normal'), '🟡')
+                        lines.append(f"{icon} #{task['id']} {task['content']}")
+                else:
+                    lines.append("暂无待办任务")
+
+                lines.append(f"\n✅ 今日完成: {stats['done_today']} 项")
+                lines.append("💡 回复「完成 #ID」标记完成")
+
+                reply_message(message_id, "\n".join(lines))
+            except Exception as e:
+                reply_message(message_id, f"❌ 获取任务列表失败: {e}")
             return
 
         if text_lower.startswith("/route "):

@@ -21,16 +21,18 @@ client = None
 reply_message = None
 TaskLogger = None
 pending_image = None
+pending_voice = None
 time = None
 
 
-def init_media_handler(global_client, global_reply_message, global_task_logger, global_pending_image, global_time):
+def init_media_handler(global_client, global_reply_message, global_task_logger, global_pending_image, global_pending_voice, global_time):
     """初始化媒体处理模块的全局依赖"""
-    global client, reply_message, TaskLogger, pending_image, time
+    global client, reply_message, TaskLogger, pending_image, pending_voice, time
     client = global_client
     reply_message = global_reply_message
     TaskLogger = global_task_logger
     pending_image = global_pending_image
+    pending_voice = global_pending_voice
     time = global_time
 
 
@@ -537,3 +539,45 @@ def _ensure_audio_format(audio_path: Path) -> Path:
     except Exception as e:
         logger.warning(f"Audio format check failed: {e}")
         return audio_path
+
+
+# ========== 语音任务收集 ==========
+
+def handle_voice_task_async(message_id: str, file_key: str, user_id: str):
+    """异步处理语音 -> 转文字 -> 等待确认 -> 提取任务
+
+    流程：
+    1. 下载语音文件
+    2. 转录为文字
+    3. 存入待确认队列，等待用户回复「确认」
+    """
+    try:
+        # 1. 下载语音
+        audio_path = download_audio(message_id, file_key)
+        if not audio_path:
+            reply_message(message_id, "❌ 语音下载失败，请重试")
+            return
+
+        # 2. 转录
+        text = transcribe_audio(audio_path)
+        if not text:
+            reply_message(message_id, "❌ 语音识别失败，请重试")
+            return
+
+        # 3. 存入待确认，等待用户回复
+        pending_voice[user_id] = {
+            "text": text,
+            "time": time.time()
+        }
+
+        # 4. 回复，等待确认
+        reply_message(message_id,
+            f"🎤 语音识别结果：\n\n{text}\n\n"
+            f"回复「确认」提取任务，或「取消」放弃"
+        )
+
+        logger.info(f"🎤 语音待确认: {user_id} - {text[:50]}...")
+
+    except Exception as e:
+        logger.error(f"语音处理异常: {e}")
+        reply_message(message_id, f"❌ 语音处理异常: {str(e)}")

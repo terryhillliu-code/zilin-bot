@@ -43,7 +43,7 @@ from media_handler import (
     download_image, compress_image_base64, handle_image_async,
     extract_video_url, extract_article_url, is_article_url, is_video_url, summarize_url,
     handle_video_async, process_video,
-    download_audio, transcribe_audio
+    download_audio, transcribe_audio, handle_voice_task_async
 )
 
 from command_handler import handle_text_async, show_help, get_session_id, get_quick_status, check_rate_limit
@@ -167,7 +167,7 @@ init_feishu_api(client)
 
 # 初始化媒体处理模块
 from media_handler import init_media_handler
-init_media_handler(client, reply_message, TaskLogger, pending_image, time)
+init_media_handler(client, reply_message, TaskLogger, pending_image, pending_voice, time)
 
 
 def get_memory(user_id: str) -> MemoryManager:
@@ -321,8 +321,10 @@ def do_p2_im_message_receive_v1(data) -> None:
                 executor.submit(handle_text_async, text, user_id, message_id)
 
         elif msg_type == "audio":
-            reply_message(message_id,
-                "🎤 语音识别功能暂时关闭\n\n请直接发送文字消息")
+            file_key = content_dict.get("file_key", "")
+            print(f"   语音：{file_key[:30]}...")
+            reply_message(message_id, "🎤 正在识别语音...")
+            executor.submit(handle_voice_task_async, message_id, file_key, user_id)
 
         elif msg_type == "image":
             image_key = content_dict.get("image_key", "")
