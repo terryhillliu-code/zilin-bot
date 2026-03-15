@@ -904,6 +904,44 @@ def handle_text_async(text: str, user_id: str, message_id: str):
             handle_video_async(text_stripped, message_id, user_id)
             return
 
+        # ===== 5.5 待办任务自动提取 (关键词触发) =====
+        TODO_KEYWORDS = ["要做的", "要完成", "需要", "得去", "记得", "别忘了", "待办", "记得做", "还要", "要去"]
+        if any(kw in text_stripped for kw in TODO_KEYWORDS):
+            try:
+                bot_dir = Path(__file__).parent
+                if str(bot_dir) not in sys.path:
+                    sys.path.insert(0, str(bot_dir))
+                from voice_task_extractor import extract_tasks
+                from voice_task_store import VoiceTaskStore
+
+                tasks = extract_tasks(text_stripped)
+
+                if tasks:
+                    store = VoiceTaskStore()
+                    for task in tasks:
+                        store.add(
+                            content=task["content"],
+                            priority=task.get("priority", "normal"),
+                            source_text=text_stripped
+                        )
+
+                    priority_icons = {"high": "🔴", "normal": "🟡", "low": "⚪"}
+                    task_lines = []
+                    for task in tasks:
+                        icon = priority_icons.get(task.get("priority", "normal"), "🟡")
+                        task_lines.append(f"{icon} {task['content']}")
+
+                    reply_message(message_id,
+                        f"📋 已提取 {len(tasks)} 个待办任务\n\n" +
+                        "\n".join(task_lines) +
+                        "\n\n💡 发送 /任务 查看所有待办"
+                    )
+                    TaskLogger.log_task("待办任务提取", "完成", f"{len(tasks)}个任务")
+                    return
+            except Exception as e:
+                print(f"⚠️ 待办任务提取异常: {e}")
+                # 继续正常对话流程
+
         # ===== 6. 核心：带记忆的 Agent 对话 =====
 
         # 6a. 记录到轻量历史
