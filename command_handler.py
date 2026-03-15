@@ -24,6 +24,12 @@ except ImportError:
     def get_rag_context(query, top_k=5): return ""
     def rag_is_available(): return False
 
+# 导入视频历史（用于重复检测）
+try:
+    from video_history import get_video_history
+except ImportError:
+    def get_video_history(): return None
+
 # 添加 scheduler 目录到路径
 sys_path_added = False
 def _add_scheduler_path():
@@ -56,6 +62,7 @@ chat_history = None
 pending_voice = None
 pending_image = None
 pending_review = None
+pending_video_confirm = None  # 等待视频重复确认
 MAX_HISTORY = 20
 RATE_LIMIT_SECONDS = 2
 user_last_request = None
@@ -114,7 +121,8 @@ def init_command_handler(
     global_chat_history, global_pending_voice, global_pending_image, global_pending_review,
     global_MAX_HISTORY, global_RATE_LIMIT_SECONDS, global_user_last_request, global_memory_cache,
     global_get_chat_handler=None,  # V2-203: 新增 chat_handler
-    global_article_writer=None, global_tech_compare=None
+    global_article_writer=None, global_tech_compare=None,
+    global_pending_video_confirm=None  # 视频重复确认
 ):
     """初始化命令处理模块的全局依赖"""
     global reply_message, reply_card, call_openclaw_agent, query_knowledge_base
@@ -122,7 +130,7 @@ def init_command_handler(
     global is_article_url, is_video_url, summarize_url, handle_video_async, extract_video_url, extract_article_url
     global TaskLogger, detect_chain_intent, execute_chain, IntentRouter
     global save_active_user, load_active_user
-    global chat_history, pending_voice, pending_image, pending_review
+    global chat_history, pending_voice, pending_image, pending_review, pending_video_confirm
     global MAX_HISTORY, RATE_LIMIT_SECONDS, user_last_request, memory_cache
     global pdf_parser, article_writer, tech_compare
     global get_chat_handler  # V2-203: 新增
@@ -157,6 +165,7 @@ def init_command_handler(
     article_writer = global_article_writer
     tech_compare = global_tech_compare
     get_chat_handler = global_get_chat_handler  # V2-203: 新增
+    pending_video_confirm = global_pending_video_confirm  # 视频重复确认
 
 
 # ========== 帮助信息 ==========
@@ -257,6 +266,22 @@ def handle_text_async(text: str, user_id: str, message_id: str):
                     return
 
             # 不是审批回复，保留状态，继续正常处理
+
+        # ===== 0.5 视频重复确认流程 =====
+        if pending_video_confirm is not None and user_id in pending_video_confirm:
+            confirm_data = pending_video_confirm[user_id]
+
+            if text_lower in ["继续", "执行", "ok", "yes", "确认", "重新处理", "是"]:
+                url = confirm_data["url"]
+                reply_message(message_id, "🎬 开始重新处理视频...\n\n⏳ 预计需要3-5分钟")
+                handle_video_async(confirm_data["text"], confirm_data["message_id"], user_id)
+                del pending_video_confirm[user_id]
+                return
+
+            elif text_lower in ["取消", "no", "不要", "算了", "不"]:
+                reply_message(message_id, "✅ 已取消视频处理")
+                del pending_video_confirm[user_id]
+                return
 
         # ===== 1. 语音确认流程 =====
         if user_id in pending_voice:
@@ -760,6 +785,37 @@ def handle_text_async(text: str, user_id: str, message_id: str):
 
         # ===== 5. 视频链接 =====
         if is_video_url(text_stripped):
+            # 检查重复视频
+            video_history = get_video_history()
+            url = extract_video_url(text_stripped)
+
+            if video_history and url:
+                dup = video_history.check_duplicate(url)
+                if dup:
+                    # 记录到 pending_video_confirm 等待确认
+                    if pending_video_confirm is not None:
+                        pending_video_confirm[user_id] = {
+                            "url": url,
+                            "history": dup,
+                            "text": text_stripped,
+                            "message_id": message_id
+                        }
+                    # 构建提示信息
+                    title = dup.get('title', '未知')[:50] if dup.get('title') else '未知'
+                    processed_at = dup.get('processed_at', '未知')[:10] if dup.get('processed_at') else '未知'
+                    output_path = dup.get('output_path', '')
+                    output_name = output_path[-50:] if output_path else '无'
+
+                    reply_message(message_id,
+                        f"⚠️ 检测到重复视频\n\n"
+                        f"📺 标题: {title}\n"
+                        f"📅 处理时间: {processed_at}\n"
+                        f"📁 输出文件: ...{output_name}\n\n"
+                        f"👉 回复「继续」重新处理，或「取消」放弃"
+                    )
+                    return
+
+            # 无重复，正常处理
             reply_message(message_id, "🎬 开始分析视频...\n\n⏳ 预计需要3-5分钟，完成后自动回复")
             handle_video_async(text_stripped, message_id, user_id)
             return

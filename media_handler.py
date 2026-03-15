@@ -283,11 +283,22 @@ def handle_video_async(text: str, message_id: str, user_id: str):
 
 def process_video(text: str, message_id: str = None) -> str:
     """处理视频分析 - 调用宿主机 Distiller"""
+    video_history = None
+    url = None
     try:
         url = extract_video_url(text)
         if not url:
             return "❌ 未找到有效的视频链接"
         logger.info(f"🎬 视频链接: {url}")
+
+        # 记录开始处理
+        try:
+            from video_history import get_video_history
+            video_history = get_video_history()
+            video_history.record_start(url)
+        except Exception as e:
+            logger.warning(f"VideoHistory 记录开始失败: {e}")
+            video_history = None
 
         # 调用宿主机 Distiller
         distiller_path = os.path.expanduser("~/zhiwei-bot/scripts/douyin_distiller.py")
@@ -303,6 +314,9 @@ def process_video(text: str, message_id: str = None) -> str:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
         if result.returncode != 0:
+            # 记录失败
+            if video_history:
+                video_history.record_failed(url)
             error_msg = result.stderr[:500] if result.stderr else result.stdout[:500]
             logger.error(f"Distiller 失败: {error_msg}")
             return f"❌ 视频处理失败\n\n{error_msg}"
@@ -314,14 +328,25 @@ def process_video(text: str, message_id: str = None) -> str:
             match = re.search(r'Output: (.+\.md)', output)
             if match:
                 output_path = match.group(1)
+                # 提取标题（从文件名）
+                title = Path(output_path).stem
+                # 记录成功
+                if video_history:
+                    video_history.record_done(url, title, output_path)
                 return f"✅ 视频知识笔记已生成\n\n📁 文件: {output_path}\n\n请到 Obsidian Inbox 查看完整内容。"
             return f"✅ 视频处理完成\n\n{output[-500:]}"
 
         return f"⚠️ 视频处理完成但输出格式异常\n\n{output[-500:]}"
 
     except subprocess.TimeoutExpired:
+        # 记录失败
+        if video_history and url:
+            video_history.record_failed(url)
         return "❌ 视频分析超时（10分钟）"
     except Exception as e:
+        # 记录失败
+        if video_history and url:
+            video_history.record_failed(url)
         logger.error(f"视频处理异常: {e}")
         return f"❌ 视频处理异常: {str(e)}"
 

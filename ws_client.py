@@ -88,6 +88,9 @@ connection_status = {
 # 审批待确认 (T-056)
 pending_review = {}  # user_id -> task_id
 
+# 视频重复确认
+pending_video_confirm = {}  # user_id -> {url, history, text, message_id}
+
 # 最近活跃用户 (T-056) — 持久化到文件
 FEISHU_USER_FILE = os.path.expanduser("~/tasks/.feishu_user_id")
 last_active_user = {"user_id": None}
@@ -244,7 +247,8 @@ init_command_handler(
     IntentRouter, save_active_user, load_active_user,
     chat_history, pending_voice, pending_image, pending_review,
     MAX_HISTORY, RATE_LIMIT_SECONDS, user_last_request, memory_cache,
-    get_chat_handler  # V2-203: 新增 chat_handler
+    get_chat_handler,  # V2-203: 新增 chat_handler
+    global_pending_video_confirm=pending_video_confirm  # 视频重复确认
 )
 
 # ========== 消息分发 ==========
