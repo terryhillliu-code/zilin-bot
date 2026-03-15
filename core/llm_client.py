@@ -65,6 +65,7 @@ class LLMClient:
         "research": "kimi-k2.5",     # 探微 - 研究
         "format": "qwen3.5-plus",    # 通微 - 格式化
         "distill": "kimi-k2.5",      # 蒸微 - 视频知识蒸馏（快速、精炼）
+        "dev": "qwen3-coder-plus",   # 执微 - 代码开发（编程专用）
         "main": "qwen3.5-plus",      # 兼容 OpenClaw main agent
         "researcher": "kimi-k2.5",   # 兼容 OpenClaw researcher agent
         "operator": "qwen3.5-plus",  # 兼容 OpenClaw operator agent
@@ -76,6 +77,7 @@ class LLMClient:
         "kimi-k2.5": ["qwen3-max-2026-01-23", "qwen3.5-plus", "glm-5"],
         "qwen3-max-2026-01-23": ["qwen3.5-plus", "glm-5"],
         "glm-5": ["MiniMax-M2.5"],
+        "qwen3-coder-plus": ["qwen3.5-plus", "glm-5"],  # 执微降级链
     }
 
     # 角色系统提示词
@@ -84,6 +86,7 @@ class LLMClient:
         "research": "你是探微，一个擅长深度分析和信息收集的AI助手。",
         "format": "你是通微，一个擅长内容整理和格式化的AI助手。",
         "distill": "你是蒸微，一个擅长从视频转录中提取知识精华的AI助手。",
+        "dev": "你是执微，一个擅长代码开发和系统修改的AI助手。",
         "main": "你是知微，一个友好、专业的AI助手。",
         "researcher": "你是探微，一个擅长深度分析和信息收集的AI助手。",
         "operator": "你是通微，一个擅长内容整理和格式化的AI助手。",
