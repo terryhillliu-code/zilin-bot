@@ -260,6 +260,11 @@ def fetch_url_content(url: str, timeout: int = 30) -> tuple[bool, str]:
 def summarize_url(url: str) -> str:
     """总结网页 URL，使用 AI 硬件架构师专属 prompt"""
     try:
+        # 确保从 zhiwei-bot 目录导入
+        import sys
+        bot_dir = Path(__file__).parent
+        if str(bot_dir) not in sys.path:
+            sys.path.insert(0, str(bot_dir))
         from scripts.obsidian_summary_filler import SUMMARY_PROMPT, generate_ai_summary
 
         print(f"🌐 抓取网页: {url}")
