@@ -130,9 +130,10 @@ def save_to_inbox(
     content: str,
     meta: Dict[str, str],
     tags: str = "",
-    inbox_dir: Path = None
+    inbox_dir: Path = None,
+    generate_ai_summary: bool = True
 ) -> str:
-    """保存到 Obsidian Inbox"""
+    """保存到 Obsidian Inbox，可选生成 AI 硬件架构师专属摘要"""
     inbox = inbox_dir or DEFAULT_INBOX
     inbox.mkdir(parents=True, exist_ok=True)
 
@@ -141,7 +142,7 @@ def save_to_inbox(
     filename = f"{safe_title}_{timestamp}.md"
     filepath = inbox / filename
 
-    # 获取摘要
+    # 获取 meta description
     description = meta.get("description", meta.get("og:description", ""))
 
     # 构建 Obsidian 笔记
@@ -159,8 +160,19 @@ status: unprocessed
 > 收录时间: {datetime.now().strftime("%Y-%m-%d %H:%M")}
 """
 
+    # Meta 摘要
     if description:
         md_content += f"\n## 摘要\n\n{description}\n"
+
+    # 生成 AI 硬件架构师专属摘要
+    if generate_ai_summary and content:
+        try:
+            from obsidian_summary_filler import generate_ai_summary_for_obsidian
+            ai_summary = generate_ai_summary_for_obsidian(content, title, doc_type="网页")
+            if ai_summary:
+                md_content += ai_summary
+        except Exception as e:
+            print(f"⚠️ AI 摘要生成失败: {e}")
 
     md_content += f"\n## 正文\n\n{content}\n"
 

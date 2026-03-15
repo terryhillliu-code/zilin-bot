@@ -201,38 +201,60 @@ def handle_text_async(text: str, user_id: str, message_id: str):
         text_stripped = text.strip()
         text_lower = text_stripped.lower()
 
-        # ===== 0. 审批确认流程 (T-056) =====
+        # ===== 0. 审批确认流程 (T-056) + v34.0: awaiting_review 支持 =====
         if user_id in pending_review:
             task_id = pending_review[user_id]
 
-            if text_lower in ["好", "可以", "执行", "ok", "yes", "同意", "批准", "行", "执行吧", "没问题", "approve"]:
-                # 添加项目路径
-                if os.path.expanduser("~/zhiwei-dev") not in sys.path:
-                    sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
-                from task_store import TaskStore
-                store = TaskStore()
-                
-                if store.approve(task_id):
-                    del pending_review[user_id]
-                    reply_message(message_id, f"✅ 任务 #{task_id} 已批准，开始执行...\n\n完成后会推送结果。")
-                else:
-                    del pending_review[user_id]
-                    reply_message(message_id, f"⚠️ 任务 #{task_id} 审批失败 (可能已被取消或已执行)")
-                return
+            # 添加项目路径
+            if os.path.expanduser("~/zhiwei-dev") not in sys.path:
+                sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
+            from task_store import TaskStore
+            store = TaskStore()
+            task = store.get(task_id)
 
-            elif text_lower in ["不要", "取消", "不", "no", "拒绝", "算了", "不行", "reject"]:
-                if os.path.expanduser("~/zhiwei-dev") not in sys.path:
-                    sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
-                from task_store import TaskStore
-                store = TaskStore()
-                
-                if store.reject(task_id):
-                    reply_message(message_id, f"❌ 任务 #{task_id} 已取消")
-                else:
-                    reply_message(message_id, f"⚠️ 任务 #{task_id} 取消失败 (可能状态已变)")
-                    
-                del pending_review[user_id]
-                return
+            # v34.0: 处理 awaiting_review 状态（新确认流程）
+            if task and task.get("status") == "awaiting_review":
+                if text_lower in ["好", "可以", "执行", "ok", "yes", "同意", "批准", "行", "执行吧", "没问题", "approve", "确认"]:
+                    # 执行合并
+                    branch = task.get("branch")
+                    repo_path = task.get("repo_path") or os.path.expanduser("~/zhiwei-scheduler")
+                    merge_result = subprocess.run(["git", "merge", branch, "--no-edit"],
+                        cwd=repo_path, capture_output=True, text=True)
+
+                    if merge_result.returncode == 0:
+                        store.accept(task_id)
+                        del pending_review[user_id]
+                        reply_message(message_id, f"✅ 任务 #{task_id} 已确认完成并合并")
+                    else:
+                        reply_message(message_id, f"❌ 合并失败:\n{merge_result.stderr[:500]}")
+                    return
+
+                elif text_lower in ["不要", "取消", "不", "no", "拒绝", "算了", "不行", "reject", "重做"]:
+                    reason = text_stripped.split(maxsplit=1)[1] if " " in text_stripped else "用户拒绝"
+                    store.reject_with_retry(task_id, reason)
+                    del pending_review[user_id]
+                    reply_message(message_id, f"🔄 任务 #{task_id} 已拒绝，将重新执行\n\n原因: {reason}")
+                    return
+
+            # 原有 review 状态处理
+            if task and task.get("status") == "review":
+                if text_lower in ["好", "可以", "执行", "ok", "yes", "同意", "批准", "行", "执行吧", "没问题", "approve"]:
+                    if store.approve(task_id):
+                        del pending_review[user_id]
+                        reply_message(message_id, f"✅ 任务 #{task_id} 已批准，开始执行...\n\n完成后会推送结果。")
+                    else:
+                        del pending_review[user_id]
+                        reply_message(message_id, f"⚠️ 任务 #{task_id} 审批失败 (可能已被取消或已执行)")
+                    return
+
+                elif text_lower in ["不要", "取消", "不", "no", "拒绝", "算了", "不行", "reject"]:
+                    if store.reject(task_id):
+                        reply_message(message_id, f"❌ 任务 #{task_id} 已取消")
+                    else:
+                        reply_message(message_id, f"⚠️ 任务 #{task_id} 取消失败 (可能状态已变)")
+
+                    del pending_review[user_id]
+                    return
 
             # 不是审批回复，保留状态，继续正常处理
 
@@ -332,6 +354,123 @@ def handle_text_async(text: str, user_id: str, message_id: str):
             except Exception as e:
                 traceback.print_exc()
                 reply_message(message_id, f"❌ 投递任务失败: {e}")
+            return
+
+        # ========== v34.0: 人工确认命令 ==========
+        # /accept 命令: 确认任务完成并合并
+        if text_lower.startswith("/accept ") or text_lower == "确认" or text_lower == "/accept":
+            try:
+                # 解析 task_id
+                parts = text_stripped.split()
+                task_id = None
+                if len(parts) > 1 and parts[1].isdigit():
+                    task_id = int(parts[1])
+                elif user_id in pending_review:
+                    task_id = pending_review[user_id]
+                else:
+                    # 查找用户最近的 awaiting_review 任务
+                    sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
+                    from task_store import TaskStore
+                    store = TaskStore()
+                    tasks = store.list_recent(20)
+                    for t in tasks:
+                        if t.get("status") == "awaiting_review":
+                            # 检查是否属于当前用户
+                            user_file = os.path.expanduser(f"~/zhiwei-dev/user_mappings/task_{t['id']}_user.json")
+                            if os.path.exists(user_file):
+                                with open(user_file) as f:
+                                    mapping = json.load(f)
+                                    if mapping.get("user_id") == user_id:
+                                        task_id = t["id"]
+                                        break
+
+                if not task_id:
+                    reply_message(message_id, "❌ 请提供任务 ID\n\n用法: /accept <task_id> 或先有等待确认的任务")
+                    return
+
+                sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
+                from task_store import TaskStore
+                store = TaskStore()
+                task = store.get(task_id)
+
+                if not task or task.get("status") != "awaiting_review":
+                    reply_message(message_id, f"❌ 任务 #{task_id} 不在等待审核状态（当前状态: {task.get('status') if task else '不存在'}）")
+                    return
+
+                # 执行合并
+                branch = task.get("branch")
+                repo_path = task.get("repo_path") or os.path.expanduser("~/zhiwei-scheduler")
+                merge_result = subprocess.run(["git", "merge", branch, "--no-edit"],
+                    cwd=repo_path, capture_output=True, text=True)
+
+                if merge_result.returncode == 0:
+                    store.accept(task_id)
+                    if user_id in pending_review:
+                        del pending_review[user_id]
+                    reply_message(message_id, f"✅ 任务 #{task_id} 已确认完成并合并到 main")
+                else:
+                    reply_message(message_id, f"❌ 合并失败:\n{merge_result.stderr[:500]}")
+            except Exception as e:
+                traceback.print_exc()
+                reply_message(message_id, f"❌ 确认失败: {e}")
+            return
+
+        # /reject 命令: 拒绝任务并要求重新执行
+        if text_lower.startswith("/reject ") or text_lower.startswith("重做") or text_lower == "/reject":
+            try:
+                parts = text_stripped.split(maxsplit=2)
+                task_id = None
+                reason = "未提供原因"
+
+                # 解析 task_id 和原因
+                if parts[0].lower() in ["重做", "/reject"]:
+                    if len(parts) > 1 and parts[1].isdigit():
+                        task_id = int(parts[1])
+                        reason = parts[2] if len(parts) > 2 else "未提供原因"
+                    elif user_id in pending_review:
+                        task_id = pending_review[user_id]
+                        reason = parts[1] if len(parts) > 1 else "未提供原因"
+                    else:
+                        # 查找用户最近的 awaiting_review 任务
+                        sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
+                        from task_store import TaskStore
+                        store = TaskStore()
+                        tasks = store.list_recent(20)
+                        for t in tasks:
+                            if t.get("status") == "awaiting_review":
+                                user_file = os.path.expanduser(f"~/zhiwei-dev/user_mappings/task_{t['id']}_user.json")
+                                if os.path.exists(user_file):
+                                    with open(user_file) as f:
+                                        mapping = json.load(f)
+                                        if mapping.get("user_id") == user_id:
+                                            task_id = t["id"]
+                                            break
+                        if len(parts) > 1:
+                            reason = parts[1]
+                else:
+                    task_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else pending_review.get(user_id)
+                    reason = parts[2] if len(parts) > 2 else "未提供原因"
+
+                if not task_id:
+                    reply_message(message_id, "❌ 请提供任务 ID\n\n用法: /reject <task_id> [原因] 或 重做 <task_id> [原因]")
+                    return
+
+                sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
+                from task_store import TaskStore
+                store = TaskStore()
+                task = store.get(task_id)
+
+                if not task or task.get("status") != "awaiting_review":
+                    reply_message(message_id, f"❌ 任务 #{task_id} 不在等待审核状态（当前状态: {task.get('status') if task else '不存在'}）")
+                    return
+
+                store.reject_with_retry(task_id, reason)
+                if user_id in pending_review:
+                    del pending_review[user_id]
+                reply_message(message_id, f"🔄 任务 #{task_id} 已拒绝，将重新执行\n\n原因: {reason}")
+            except Exception as e:
+                traceback.print_exc()
+                reply_message(message_id, f"❌ 拒绝失败: {e}")
             return
 
         # Phase 4 新增: RAG 强制查询

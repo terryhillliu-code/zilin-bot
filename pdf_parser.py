@@ -407,7 +407,7 @@ def analyze_pdf_content(text: str, pages: int, question: str = None) -> str:
     Args:
         text: PDF 提取的文本
         pages: 页数
-        question: 用户的特定问题，None 表示 generically 分析
+        question: 用户的特定问题，None 表示生成 AI 硬件架构师专属摘要
 
     Returns:
         str: AI 分析结果
@@ -415,45 +415,32 @@ def analyze_pdf_content(text: str, pages: int, question: str = None) -> str:
     try:
         import httpx
 
-        env_path = os.path.expanduser("~/tanwei-bot/.env")
-        api_key = None
-        if os.path.exists(env_path):
-            with open(env_path) as f:
-                for line in f:
-                    if line.startswith("CODING_PLAN_API_KEY="):
-                        api_key = line.split("=", 1)[1].strip().strip('"\'')
-                        break
+        # 导入专属摘要模块
+        from scripts.obsidian_summary_filler import SUMMARY_PROMPT, get_text_for_summary, _get_api_key
 
+        api_key = _get_api_key()
         if not api_key:
             return "❌ 系统配置异常，请联系管理员"
 
-        # 限制文本长度
-        prompt_text = text[:8000] if len(text) > 8000 else text
+        # 使用智能截断策略
+        prompt_text = get_text_for_summary(text)
 
         if question:
+            # 有特定问题时，使用问答模式
             prompt = f"""请分析以下 PDF 文档内容，回答用户的问题：
 
 文档信息: {pages} 页
 
 文档内容:
-{prompt_text}
+{prompt_text[:8000]}
 
 用户问题:
 {question}
 
 请结合文档内容，准确回答用户的问题。"""
         else:
-            prompt = f"""请分析以下 PDF 文档内容，提取关键信息并生成摘要：
-
-文档信息: {pages} 页 | {len(prompt_text)} 字符
-
-文档内容:
-{prompt_text}
-
-请按以下格式返回:
-1. 文档主题
-2. 关键要点（3-5 条）
-3. 重要数据或结论"""
+            # 无特定问题时，使用 AI 硬件架构师专属摘要 prompt
+            prompt = SUMMARY_PROMPT + f"\n\n## 文档信息\n页数: {pages} 页\n字符数: {len(prompt_text)}\n\n## 文档内容\n{prompt_text}"
 
         print(f"PDF 分析: 调用 qwen3.5-plus...")
         response = httpx.post(

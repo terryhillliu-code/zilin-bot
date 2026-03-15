@@ -244,21 +244,23 @@ def fetch_url_content(url: str, timeout: int = 30) -> tuple[bool, str]:
 
 
 def summarize_url(url: str) -> str:
-    """总结网页 URL"""
+    """总结网页 URL，使用 AI 硬件架构师专属 prompt"""
     try:
+        from scripts.obsidian_summary_filler import SUMMARY_PROMPT, generate_ai_summary
+
         print(f"🌐 抓取网页: {url}")
 
         success, content = fetch_url_content(url, timeout=60)
         if not success:
             return content  # 返回错误信息
 
-        # 处理成功获取的内容
-        if len(content) > 8000:
-            content = content[:8000] + "..."
+        print(f"📄 内容长度: {len(content)} 字符，调用 AI 生成专属摘要...")
+        summary = generate_ai_summary(content, doc_type="网页")
 
-        print(f"📄 内容长度: {len(content)} 字符，调用 AI 总结...")
-        summary_prompt = f"请总结以下网页内容，提取关键信息：\n\n{content}"
-        return summary_prompt
+        if summary.startswith("❌"):
+            return summary
+        else:
+            return f"📄 **网页摘要**\n\n{summary}"
 
     except Exception as e:
         return f"❌ 网页处理异常: {str(e)}"
