@@ -89,13 +89,14 @@ class TranscriptResult:
 @dataclass
 class DistilledKnowledge:
     """蒸馏后的知识结构"""
-    title: str
-    one_liner: str  # 一句话核心
-    key_points: list[dict]  # [{timestamp, point}]
+    title: str  # 主张式标题
+    core_insight: str  # 核心观点（一句话论点）
+    key_points: list[dict]  # [{timestamp, insight}]
     summary: str
     tags: list[str]
     action_items: list[str] = field(default_factory=list)
     references: list[str] = field(default_factory=list)
+    related_concepts: list[str] = field(default_factory=list)  # 可关联的知识概念
 
 
 # ============================================================================
@@ -1140,31 +1141,43 @@ class KnowledgeDistiller:
     默认使用 kimi-k2.5 模型，自动降级到 qwen3-max-2026-01-23 → qwen3.5-plus → glm-5
     """
 
-    SYSTEM_PROMPT = """你是一个专业的知识提取助手。你的任务是从视频转录文本中提取核心知识点。
+    SYSTEM_PROMPT = """你是一个专业的知识提取助手，擅长将视频内容转化为结构化的知识笔记。
 
 你必须严格按照以下 JSON 格式输出，不要添加任何其他内容：
 
 ```json
 {
-  "title": "视频标题（简洁概括）",
-  "one_liner": "一句话核心要点（不超过50字）",
+  "title": "主张式标题（不是描述视频内容，而是提炼核心观点/价值，如"一行代码让网站支持AI操控"而非"阿里开源网页自动化项目介绍"）",
+  "core_insight": "核心观点（一句话陈述视频的核心论点或洞见，不是描述视频讲什么，而是视频主张什么）",
   "key_points": [
-    {"timestamp": "MM:SS", "point": "知识点描述"},
-    {"timestamp": "MM:SS", "point": "知识点描述"}
+    {"timestamp": "MM:SS", "insight": "洞察点（不只是内容，而是为什么重要/如何应用）"},
+    {"timestamp": "MM:SS", "insight": "洞察点"}
   ],
-  "summary": "内容摘要（100-200字）",
+  "summary": "内容摘要（100-150字，突出核心价值和适用场景）",
   "tags": ["标签1", "标签2", "标签3"],
-  "action_items": ["可执行的建议1", "可执行的建议2"],
-  "references": ["提到的资源或链接"]
+  "action_items": ["具体可执行的第一步", "进阶探索方向"],
+  "references": ["提到的工具/项目名称", "相关资源"],
+  "related_concepts": ["可关联的知识概念（用于双向链接）"]
 }
 ```
 
-注意：
-1. 时间戳必须是 MM:SS 格式
-2. 标签不超过5个，要具体有意义
-3. key_points 数量控制在3-8个
-4. 如果没有明确的可执行建议，action_items 为空数组
-5. 如果没有提到具体资源，references 为空数组"""
+重要原则：
+1. **主张式标题**：标题应该是一个观点或价值主张，而非简单的描述
+   - ❌ "AI工具介绍"、"XX项目分享"
+   - ✅ "一行代码让网站支持AI操控"、"输入提示词即可生成完整App界面"
+
+2. **核心观点 vs 内容描述**：
+   - ❌ "这个视频介绍了一个开源项目"
+   - ✅ "网页自动化无需浏览器插件，纯前端即可实现"
+
+3. **洞察式知识点**：不只是记录内容，要说明为什么重要、如何应用
+   - ❌ "项目有5.3K star"
+   - ✅ "项目快速获得社区认可，说明前端AI化是刚需"
+
+4. 时间戳必须是 MM:SS 格式，从转录文本中推断
+5. 标签3-5个，要具体有意义
+6. key_points 数量控制在3-6个
+7. related_concepts 用于知识关联，如"前端自动化"、"AI Agent"、"低代码"等"""
 
     USER_PROMPT_TEMPLATE = """视频信息：
 - 平台：{platform}
@@ -1234,27 +1247,29 @@ class KnowledgeDistiller:
             data = json.loads(json_str)
             return DistilledKnowledge(
                 title=data.get("title", "未命名"),
-                one_liner=data.get("one_liner", ""),
+                core_insight=data.get("core_insight", data.get("one_liner", "")),
                 key_points=data.get("key_points", []),
                 summary=data.get("summary", ""),
                 tags=data.get("tags", []),
                 action_items=data.get("action_items", []),
-                references=data.get("references", [])
+                references=data.get("references", []),
+                related_concepts=data.get("related_concepts", [])
             )
         except json.JSONDecodeError as e:
             logger.error(f"JSON parse error: {e}")
-            return DistilledKnowledge(title="解析失败", one_liner="", key_points=[])
+            return DistilledKnowledge(title="解析失败", core_insight="", key_points=[], summary="", tags=[], action_items=[], references=[], related_concepts=[])
 
     def _fallback_distill(self, video_info: VideoInfo, transcript: TranscriptResult) -> DistilledKnowledge:
         """降级处理：简单的文本截取"""
         return DistilledKnowledge(
             title=video_info.title or "未知标题",
-            one_liner="知识蒸馏失败，请查看原文",
-            key_points=[{"timestamp": "00:00", "point": transcript.full_text[:200]}],
+            core_insight="知识蒸馏失败，请查看原文",
+            key_points=[{"timestamp": "00:00", "insight": transcript.full_text[:200]}],
             summary=transcript.full_text[:500],
             tags=["需人工处理"],
             action_items=[],
-            references=[]
+            references=[],
+            related_concepts=[]
         )
 
 
@@ -1272,20 +1287,24 @@ date: {date}
 tags: [{tags}]
 type: video_distill
 asr_source: "{asr_source}"
-noise_tags: [{noise_tags}]
+related: [{related_concepts}]
 ---
 
 # {title}
 
-## 💡 一句话核心
-{one_liner}
+## 💡 核心观点
+{core_insight}
 
-## 🧠 知识点拆解
+## 🧠 关键洞察
 {key_points}
 
 ## 📝 内容摘要
 {summary}
 
+## 🔗 知识关联
+{related_section}
+
+## ✅ 行动建议
 {action_items_section}
 
 {references_section}
@@ -1296,7 +1315,7 @@ noise_tags: [{noise_tags}]
 - 原始链接：[点击查看]({source_url})
 
 ---
-> 由知微系统自动生成，建议人工审核后归档
+> 由知微系统生成，建议关联已有知识并添加个人洞察
 '''
 
     def __init__(self, output_dir: Path):
@@ -1308,25 +1327,30 @@ noise_tags: [{noise_tags}]
         # 准备内容
         date_str = datetime.now().strftime("%Y-%m-%d")
         tags_str = ", ".join(f'"{tag}"' for tag in knowledge.tags)
-        noise_tags_str = ", ".join(f'"{tag}"' for tag in noise_tags)
 
-        # 格式化知识点
+        # 格式化知识点（洞察式）
         key_points_str = "\n".join(
-            f"- **[{kp['timestamp']}]** {kp['point']}"
+            f"- **[{kp['timestamp']}]** {kp['insight']}"
             for kp in knowledge.key_points
         )
 
-        # 行动建议部分
-        action_items_section = ""
+        # 知识关联部分
+        related_section = "暂无关联"
+        if knowledge.related_concepts:
+            related_str = ", ".join(f"[[{c}]]" for c in knowledge.related_concepts)
+            related_section = related_str
+
+        # 行动建议部分（必显示）
         if knowledge.action_items:
-            items_str = "\n".join(f"- {item}" for item in knowledge.action_items)
-            action_items_section = f"## ✅ 行动建议\n{items_str}"
+            items_str = "\n".join(f"- [ ] {item}" for item in knowledge.action_items)
+        else:
+            items_str = "- [ ] 思考如何将此知识应用到实际场景"
 
         # 参考资源部分
         references_section = ""
         if knowledge.references:
             refs_str = "\n".join(f"- {ref}" for ref in knowledge.references)
-            references_section = f"## 🔗 参考资料\n{refs_str}"
+            references_section = f"## 📚 参考资料\n{refs_str}"
 
         # 生成 Markdown
         content = self.TEMPLATE.format(
@@ -1335,11 +1359,12 @@ noise_tags: [{noise_tags}]
             date=date_str,
             tags=tags_str,
             asr_source=transcript.source,
-            noise_tags=noise_tags_str,
-            one_liner=knowledge.one_liner,
+            related_concepts=", ".join(f'"{c}"' for c in knowledge.related_concepts) if knowledge.related_concepts else "",
+            core_insight=knowledge.core_insight,
             key_points=key_points_str,
             summary=knowledge.summary,
-            action_items_section=action_items_section,
+            related_section=related_section,
+            action_items_section=items_str,
             references_section=references_section,
             platform=video_info.platform,
             author=video_info.author or "未知"
