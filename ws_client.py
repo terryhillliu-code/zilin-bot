@@ -430,26 +430,106 @@ def main():
     from datetime import datetime
 
     # 全局变量用于监控连接状态
+    # 告警状态文件路径
+    ALERT_STATE_FILE = os.path.expanduser("~/logs/ws_alert_state.json")
+
+    def load_alert_state() -> dict:
+        """加载告警状态"""
+        try:
+            if os.path.exists(ALERT_STATE_FILE):
+                with open(ALERT_STATE_FILE) as f:
+                    return json.load(f)
+        except:
+            pass
+        return {"last_alert_time": 0, "alert_type": None}
+
+    def save_alert_state(state: dict):
+        """保存告警状态"""
+        try:
+            with open(ALERT_STATE_FILE, "w") as f:
+                json.dump(state, f)
+        except:
+            pass
+
+    def send_ws_alert(msg: str, alert_type: str = "disconnect") -> bool:
+        """发送 WebSocket 告警（通过钉钉，避免消耗飞书额度）"""
+        state = load_alert_state()
+        now = time.time()
+
+        # 告警频率控制：同一类型告警每小时最多发一次
+        if state.get("alert_type") == alert_type:
+            if now - state.get("last_alert_time", 0) < 3600:
+                print(f"⏭️ 告警频率限制，跳过推送：{alert_type}")
+                return False
+
+        # 尝试通过钉钉发送
+        try:
+            sys.path.insert(0, os.path.expanduser("~/zhiwei-scheduler"))
+            from pusher import DingTalkPusher
+            import yaml
+
+            config_path = os.path.expanduser("~/zhiwei-scheduler/config/settings.yaml")
+            with open(config_path) as f:
+                dt_conf = yaml.safe_load(f).get("push", {}).get("dingtalk", {})
+
+            if dt_conf.get("enabled"):
+                pusher = DingTalkPusher(dt_conf["webhook"], dt_conf["secret"])
+                pusher.send_text(msg)
+                print(f"📱 WebSocket 告警已发送: {msg[:50]}...")
+
+                # 更新告警状态
+                save_alert_state({
+                    "last_alert_time": now,
+                    "alert_type": alert_type
+                })
+                return True
+            else:
+                print("⚠️ 钉钉未启用，无法发送告警")
+        except Exception as e:
+            print(f"❌ 发送 WebSocket 告警失败: {e}")
+
+        return False
 
     def connection_monitor():
-        """连接监控线程 - 简化版 (ISSUE-027)"""
+        """连接监控线程 - 增强版 (ISSUE-003 + P2 健康告警)"""
         while True:
             time.sleep(60)  # 每分钟检查一次
             now = time.time()
             event_idle = now - connection_status.get("last_event", now)
-            
+
             if event_idle > 600:  # 10 分钟无业务消息
                 if connection_status["connected"]:
-                    print(f"🟡 业务消息空闲 {int(event_idle)}s，连接可能异常（仅告警）")
+                    idle_minutes = int(event_idle / 60)
+                    print(f"🟡 业务消息空闲 {idle_minutes} 分钟，连接可能异常")
+
                     connection_status["connected"] = False
-                    
+
                     # 记录到日志
                     with open(os.path.expanduser("~/logs/connection_monitor.log"), "a") as f:
-                        f.write(f"{datetime.now().isoformat()}: Business idle {int(event_idle)}s - Possible disconnect\n")
+                        f.write(f"{datetime.now().isoformat()}: Business idle {idle_minutes}min - Possible disconnect\n")
+
+                    # 发送钉钉告警
+                    send_ws_alert(
+                        f"🚨 WebSocket 连接告警\n\n"
+                        f"状态: 业务消息空闲 {idle_minutes} 分钟\n"
+                        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"AppID: {APP_ID[:8]}...\n\n"
+                        f"请检查飞书机器人服务状态",
+                        alert_type="disconnect"
+                    )
             else:
                 if not connection_status["connected"]:
-                    connection_status["connected"] = True
+                    # 连接恢复，发送恢复通知
                     print(f"✅ 业务消息已恢复，连接正常")
+
+                    # 发送恢复通知
+                    send_ws_alert(
+                        f"✅ WebSocket 连接已恢复\n\n"
+                        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"AppID: {APP_ID[:8]}...",
+                        alert_type="recover"
+                    )
+                    connection_status["connected"] = True
 
     # 启动监控线程
     monitor_thread = threading.Thread(target=connection_monitor, daemon=True)
