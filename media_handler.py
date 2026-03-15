@@ -100,14 +100,28 @@ def analyze_image_base64(image_base64: str, question: str = None) -> str:
     try:
         import httpx
 
-        env_path = os.path.expanduser("~/tanwei-bot/.env")
+        # 获取 API Key - 支持多路径和多变量名查找
         api_key = None
-        if os.path.exists(env_path):
-            with open(env_path) as f:
-                for line in f:
-                    if line.startswith("CODING_PLAN_API_KEY="):
-                        api_key = line.split("=", 1)[1].strip().strip('"\'')
+        env_paths = [
+            os.path.expanduser("~/clawdbot-docker/workspace/secrets/.env"),
+            os.path.expanduser("~/zhiwei-bot/.env"),
+            os.path.expanduser("~/tanwei-bot/.env"),
+        ]
+        key_names = ["CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY", "BAILIAN_API_KEY"]
+
+        for env_path in env_paths:
+            if os.path.exists(env_path):
+                with open(env_path) as f:
+                    lines = f.readlines()
+                for key_name in key_names:
+                    for line in lines:
+                        if line.startswith(f"{key_name}="):
+                            api_key = line.split("=", 1)[1].strip().strip('"\'')
+                            break
+                    if api_key:
                         break
+            if api_key:
+                break
 
         if not api_key:
             return "❌ 系统配置异常，请联系管理员"

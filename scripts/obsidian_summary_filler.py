@@ -80,13 +80,27 @@ def get_text_for_summary(full_text: str) -> str:
 # ============ API 配置 ============
 
 def _get_api_key() -> Optional[str]:
-    """获取百炼 API Key"""
-    env_path = os.path.expanduser("~/tanwei-bot/.env")
-    if os.path.exists(env_path):
-        with open(env_path) as f:
-            for line in f:
-                if line.startswith("CODING_PLAN_API_KEY="):
-                    return line.split("=", 1)[1].strip().strip('"\'')
+    """获取百炼 API Key，支持多路径和多变量名查找"""
+    # 配置文件路径列表（按优先级）
+    env_paths = [
+        os.path.expanduser("~/clawdbot-docker/workspace/secrets/.env"),
+        os.path.expanduser("~/zhiwei-bot/.env"),
+        os.path.expanduser("~/tanwei-bot/.env"),
+    ]
+
+    # 环境变量名列表（按优先级）- Coding Plan API Key 优先
+    key_names = ["CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY", "BAILIAN_API_KEY"]
+
+    for env_path in env_paths:
+        if os.path.exists(env_path):
+            # 先读取整个文件内容
+            with open(env_path) as f:
+                lines = f.readlines()
+            # 按 key 优先级查找
+            for key_name in key_names:
+                for line in lines:
+                    if line.startswith(f"{key_name}="):
+                        return line.split("=", 1)[1].strip().strip('"\'')
     return None
 
 

@@ -153,12 +153,22 @@ class MemoryManager:
                 self.summary = ""
 
     def _get_api_key(self) -> str:
-        env_path = os.path.expanduser("~/zhiwei-bot/.env")
-        if os.path.exists(env_path):
-            with open(env_path) as f:
-                for line in f:
-                    if line.startswith("CODING_PLAN_API_KEY="):
-                        return line.split("=", 1)[1].strip().strip('"\'')
+        """获取 API Key - 支持多路径和多变量名查找"""
+        env_paths = [
+            os.path.expanduser("~/clawdbot-docker/workspace/secrets/.env"),
+            os.path.expanduser("~/zhiwei-bot/.env"),
+            os.path.expanduser("~/tanwei-bot/.env"),
+        ]
+        key_names = ["CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY", "BAILIAN_API_KEY"]
+
+        for env_path in env_paths:
+            if os.path.exists(env_path):
+                with open(env_path) as f:
+                    lines = f.readlines()
+                for key_name in key_names:
+                    for line in lines:
+                        if line.startswith(f"{key_name}="):
+                            return line.split("=", 1)[1].strip().strip('"\'')
         return None
 
     def get_stats(self) -> str:
