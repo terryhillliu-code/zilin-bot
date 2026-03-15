@@ -1387,8 +1387,10 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
         record = store.get_record(video_info.resolved_url)
         logger.info(f"⏭️ 已处理过，跳过（使用 --force 强制重新处理）")
         if record:
-            logger.info(f"   原输出: {record.get('output_path', 'N/A')}")
+            output_path = record.get('output_path', 'N/A')
+            logger.info(f"   原输出: {output_path}")
             logger.info(f"   处理时间: {record.get('processed_at', 'N/A')}")
+            print(f"✅ Done! Output: {output_path}")  # 跳过也输出成功标志
         return 2
 
     # 2. 获取转录
