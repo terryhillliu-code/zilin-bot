@@ -91,9 +91,12 @@ class DistilledKnowledge:
     """蒸馏后的知识结构"""
     title: str  # 主张式标题
     core_insight: str  # 核心观点（一句话论点）
-    key_points: list[dict]  # [{timestamp, insight}]
-    summary: str
-    tags: list[str]
+    content_tier: str = "B"  # 内容质量等级 A/B/C/D
+    key_points: list[dict] = field(default_factory=list)  # [{timestamp, insight}]
+    summary: str = ""
+    target_audience: str = ""  # 目标受众
+    use_cases: str = ""  # 适用场景
+    tags: list[str] = field(default_factory=list)
     action_items: list[str] = field(default_factory=list)
     references: list[str] = field(default_factory=list)
     related_concepts: list[str] = field(default_factory=list)  # 可关联的知识概念
@@ -1143,41 +1146,64 @@ class KnowledgeDistiller:
 
     SYSTEM_PROMPT = """你是一个专业的知识提取助手，擅长将视频内容转化为结构化的知识笔记。
 
-你必须严格按照以下 JSON 格式输出，不要添加任何其他内容：
+**第一步：评估内容质量等级**
+
+根据视频信息密度，判断内容等级：
+- **A级（深度干货）**：技术教程、深度分析、方法论，信息密度高
+- **B级（有价值介绍）**：产品介绍、工具分享、观点输出，信息密度中
+- **C级（浅层内容）**：日常分享、简单演示，信息密度低
+- **D级（信息稀薄）**：广告、重复内容、无实质信息
+
+**第二步：根据等级输出 JSON**
 
 ```json
 {
-  "title": "主张式标题（不是描述视频内容，而是提炼核心观点/价值，如"一行代码让网站支持AI操控"而非"阿里开源网页自动化项目介绍"）",
-  "core_insight": "核心观点（一句话陈述视频的核心论点或洞见，不是描述视频讲什么，而是视频主张什么）",
+  "title": "主张式标题（提炼核心观点/价值，而非描述内容）",
+  "core_insight": "核心观点（一句话陈述视频的核心论点或洞见）",
+  "content_tier": "A/B/C/D",
   "key_points": [
-    {"timestamp": "MM:SS", "insight": "洞察点（不只是内容，而是为什么重要/如何应用）"},
-    {"timestamp": "MM:SS", "insight": "洞察点"}
+    {"timestamp": "MM:SS", "insight": "洞察点（为什么重要/如何应用）"}
   ],
-  "summary": "内容摘要（100-150字，突出核心价值和适用场景）",
+  "summary": "见下方摘要模板",
+  "target_audience": "适合谁（如：前端开发者、产品经理、AI爱好者）",
+  "use_cases": "适用场景（如：快速原型开发、自动化测试）",
   "tags": ["标签1", "标签2", "标签3"],
-  "action_items": ["具体可执行的第一步", "进阶探索方向"],
-  "references": ["提到的工具/项目名称", "相关资源"],
-  "related_concepts": ["可关联的知识概念（用于双向链接）"]
+  "action_items": ["具体可执行的建议"],
+  "references": ["提到的工具/项目名称"],
+  "related_concepts": ["可关联的知识概念"]
 }
 ```
 
-重要原则：
-1. **主张式标题**：标题应该是一个观点或价值主张，而非简单的描述
-   - ❌ "AI工具介绍"、"XX项目分享"
-   - ✅ "一行代码让网站支持AI操控"、"输入提示词即可生成完整App界面"
+**摘要模板（根据 content_tier 选择）：**
 
-2. **核心观点 vs 内容描述**：
-   - ❌ "这个视频介绍了一个开源项目"
-   - ✅ "网页自动化无需浏览器插件，纯前端即可实现"
+**A级（深度干货）- 150-200字**：
+结构：[核心技术原理/方法论一句话] + [具体应用场景，2-3个] + [适用人群+前提条件] + [与其他方案的对比优势]
+示例："该项目采用纯前端DOM操作实现AI自动化，无需浏览器插件或后端服务。适用于需要降低用户使用门槛的B端产品、希望提升可访问性的政务系统、以及追求轻量部署的SaaS服务。开发者只需一行代码即可集成，相比Puppeteer等传统方案部署成本降低90%。"
 
-3. **洞察式知识点**：不只是记录内容，要说明为什么重要、如何应用
-   - ❌ "项目有5.3K star"
-   - ✅ "项目快速获得社区认可，说明前端AI化是刚需"
+**B级（有价值介绍）- 100-150字**：
+结构：[产品/工具核心价值] + [适用场景] + [与替代品差异]
+示例："AI界面生成工具，输入自然语言即可一秒生成完整App界面。适用于产品经理快速验证想法、设计师制作原型、创业者展示概念。相比Figma手绘，速度提升10倍；相比传统开发，门槛降至零代码。"
 
-4. 时间戳必须是 MM:SS 格式，从转录文本中推断
-5. 标签3-5个，要具体有意义
-6. key_points 数量控制在3-6个
-7. related_concepts 用于知识关联，如"前端自动化"、"AI Agent"、"低代码"等"""
+**C级（浅层内容）- 50-80字**：
+结构：[核心价值点] + [适合谁]
+示例："介绍了某AI工具的基本功能，适合对该领域完全不了解的新手快速建立认知。内容较浅，建议结合官方文档深入学习。"
+
+**D级（信息稀薄）- 30字以内**：
+结构：[一句话概括] + 建议
+示例："产品广告视频，无实质内容，建议跳过。"
+
+**重要原则：**
+1. **主张式标题**：标题是观点/价值主张，非描述
+   - ❌ "AI工具介绍" → ✅ "一行代码让网站支持AI操控"
+
+2. **洞察式知识点**：说明为什么重要、如何应用
+   - ❌ "项目有5.3K star" → ✅ "快速获认可说明前端AI化是刚需"
+
+3. **价值导向摘要**：不是"讲了什么"，而是"能得到什么"
+
+4. 时间戳从转录文本推断，格式 MM:SS
+5. 标签3-5个，具体有意义
+6. key_points 数量：A级5-6个，B级3-5个，C级2-3个，D级1个"""
 
     USER_PROMPT_TEMPLATE = """视频信息：
 - 平台：{platform}
@@ -1248,8 +1274,11 @@ class KnowledgeDistiller:
             return DistilledKnowledge(
                 title=data.get("title", "未命名"),
                 core_insight=data.get("core_insight", data.get("one_liner", "")),
+                content_tier=data.get("content_tier", "B"),
                 key_points=data.get("key_points", []),
                 summary=data.get("summary", ""),
+                target_audience=data.get("target_audience", ""),
+                use_cases=data.get("use_cases", ""),
                 tags=data.get("tags", []),
                 action_items=data.get("action_items", []),
                 references=data.get("references", []),
@@ -1257,15 +1286,30 @@ class KnowledgeDistiller:
             )
         except json.JSONDecodeError as e:
             logger.error(f"JSON parse error: {e}")
-            return DistilledKnowledge(title="解析失败", core_insight="", key_points=[], summary="", tags=[], action_items=[], references=[], related_concepts=[])
+            return DistilledKnowledge(
+                title="解析失败",
+                core_insight="",
+                content_tier="D",
+                key_points=[],
+                summary="",
+                target_audience="",
+                use_cases="",
+                tags=["需人工处理"],
+                action_items=[],
+                references=[],
+                related_concepts=[]
+            )
 
     def _fallback_distill(self, video_info: VideoInfo, transcript: TranscriptResult) -> DistilledKnowledge:
         """降级处理：简单的文本截取"""
         return DistilledKnowledge(
             title=video_info.title or "未知标题",
             core_insight="知识蒸馏失败，请查看原文",
+            content_tier="D",
             key_points=[{"timestamp": "00:00", "insight": transcript.full_text[:200]}],
             summary=transcript.full_text[:500],
+            target_audience="",
+            use_cases="",
             tags=["需人工处理"],
             action_items=[],
             references=[],
@@ -1286,11 +1330,14 @@ source_url: "{source_url}"
 date: {date}
 tags: [{tags}]
 type: video_distill
+tier: {content_tier}
 asr_source: "{asr_source}"
 related: [{related_concepts}]
 ---
 
 # {title}
+
+> **内容等级：{tier_display}** | 适合：{target_audience}
 
 ## 💡 核心观点
 {core_insight}
@@ -1300,6 +1347,8 @@ related: [{related_concepts}]
 
 ## 📝 内容摘要
 {summary}
+
+{use_cases_section}
 
 ## 🔗 知识关联
 {related_section}
@@ -1328,11 +1377,25 @@ related: [{related_concepts}]
         date_str = datetime.now().strftime("%Y-%m-%d")
         tags_str = ", ".join(f'"{tag}"' for tag in knowledge.tags)
 
+        # 内容等级显示
+        tier_labels = {
+            "A": "⭐⭐⭐ 深度干货",
+            "B": "⭐⭐ 有价值",
+            "C": "⭐ 浅层内容",
+            "D": "⚠️ 信息稀薄"
+        }
+        tier_display = tier_labels.get(knowledge.content_tier, "未评估")
+
         # 格式化知识点（洞察式）
         key_points_str = "\n".join(
             f"- **[{kp['timestamp']}]** {kp['insight']}"
             for kp in knowledge.key_points
         )
+
+        # 适用场景部分
+        use_cases_section = ""
+        if knowledge.use_cases:
+            use_cases_section = f"## 🎯 适用场景\n{knowledge.use_cases}"
 
         # 知识关联部分
         related_section = "暂无关联"
@@ -1352,17 +1415,24 @@ related: [{related_concepts}]
             refs_str = "\n".join(f"- {ref}" for ref in knowledge.references)
             references_section = f"## 📚 参考资料\n{refs_str}"
 
+        # 目标受众
+        target_audience = knowledge.target_audience or "通用"
+
         # 生成 Markdown
         content = self.TEMPLATE.format(
             title=knowledge.title,
             source_url=video_info.original_url,
             date=date_str,
             tags=tags_str,
+            content_tier=knowledge.content_tier,
+            tier_display=tier_display,
+            target_audience=target_audience,
             asr_source=transcript.source,
             related_concepts=", ".join(f'"{c}"' for c in knowledge.related_concepts) if knowledge.related_concepts else "",
             core_insight=knowledge.core_insight,
             key_points=key_points_str,
             summary=knowledge.summary,
+            use_cases_section=use_cases_section,
             related_section=related_section,
             action_items_section=items_str,
             references_section=references_section,
