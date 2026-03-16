@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-PDF-VLM 处理管线 v1.0
+PDF-VLM 处理管线 v2.0 ⭐
 
 智能提取 PDF 文本和图表内容，使用 VLM 描述图片/表格。
 
+v2.0 更新 (2026-03-16):
+- 放弃 Camelot 表格提取（准确率 0%），改用纯 VLM 方案
+- 结构化 JSON 输出：表格数据直接提取为 Markdown 表格
+- 智能类型识别：table/chart/figure/text
+
 特性:
-- 智能筛选：仅处理含图/表页面，节省 70% VLM 成本
-- 双重表格保障：Markdown 保留数据 + VLM 描述语义
+- 智能筛选：仅处理含图页面，节省 70% VLM 成本
+- 结构化输出：JSON → Markdown 表格转换
 - 自适应速率控制：自动处理 API 限流
 
 用法:
@@ -37,8 +42,30 @@ DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY")
 # VLM 配置
 VLM_MODEL = "qwen-vl-max"
 VLM_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-VLM_MAX_TOKENS = 500
+VLM_MAX_TOKENS = 2000  # 增加以支持表格数据提取 ⭐ v2.0
 VLM_TEMPERATURE = 0.3
+
+# 结构化数据提取 Prompt ⭐ v2.0
+VLM_PROMPT = """分析此页面内容，按以下 JSON 格式输出：
+
+```json
+{
+  "type": "table|chart|figure|text",
+  "title": "图表标题（如果有）",
+  "data": {
+    "headers": ["列1", "列2", ...],
+    "rows": [["值1", "值2", ...], ...]
+  },
+  "key_insights": ["关键发现1", "关键发现2", ...],
+  "description": "图表/图片的文字描述"
+}
+```
+
+规则：
+- 如果是表格：完整提取所有行列数据到 data.rows
+- 如果是图表：提取关键数据点，在 description 中描述趋势
+- 如果是流程图/示意图：用 key_insights 描述流程步骤
+- 如果只是文字：type 设为 "text"，在 description 中总结内容"""
 
 
 def find_pdf_files():
@@ -140,93 +167,6 @@ def extract_text_and_images(pdf_path: Path) -> tuple:
 
     except Exception as e:
         return None, None, str(e)
-
-
-# ============ Camelot 表格提取 ============
-
-def extract_tables(pdf_path: Path) -> tuple:
-    """
-    从 PDF 提取表格
-
-    Returns:
-        (tables: list, error: str)
-        tables: [{'page': int, 'markdown': str, 'image_path': str}, ...]
-    """
-    try:
-        import camelot
-
-        tables_data = []
-
-        # 使用 lattice 模式检测有线条的表格
-        try:
-            tables = camelot.read_pdf(str(pdf_path), pages='all', flavor='lattice')
-            for table in tables:
-                page_num = table.page
-                markdown = table.df.to_markdown(index=False)
-
-                # 生成表格图片
-                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                    table_img_path = tmp.name
-
-                # 使用 matplotlib 生成表格图片
-                import matplotlib.pyplot as plt
-                fig, ax = plt.subplots(figsize=(12, len(table.df) * 0.5 + 1))
-                ax.axis('off')
-                ax.table(cellText=table.df.values,
-                        colLabels=table.df.columns,
-                        loc='center',
-                        cellLoc='center')
-                plt.savefig(table_img_path, bbox_inches='tight', dpi=150)
-                plt.close()
-
-                tables_data.append({
-                    'page': page_num,
-                    'markdown': markdown,
-                    'image_path': table_img_path
-                })
-        except Exception as e:
-            print(f"    ⚠️ Lattice 模式失败: {e}")
-
-        # 使用 stream 模式检测无线条表格
-        try:
-            tables_stream = camelot.read_pdf(str(pdf_path), pages='all', flavor='stream')
-            for table in tables_stream:
-                page_num = table.page
-
-                # 检查是否已存在该页的表格
-                existing_pages = [t['page'] for t in tables_data]
-                if page_num in existing_pages:
-                    continue
-
-                markdown = table.df.to_markdown(index=False)
-
-                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                    table_img_path = tmp.name
-
-                import matplotlib.pyplot as plt
-                fig, ax = plt.subplots(figsize=(12, len(table.df) * 0.5 + 1))
-                ax.axis('off')
-                ax.table(cellText=table.df.values,
-                        colLabels=table.df.columns,
-                        loc='center',
-                        cellLoc='center')
-                plt.savefig(table_img_path, bbox_inches='tight', dpi=150)
-                plt.close()
-
-                tables_data.append({
-                    'page': page_num,
-                    'markdown': markdown,
-                    'image_path': table_img_path
-                })
-        except Exception as e:
-            print(f"    ⚠️ Stream 模式失败: {e}")
-
-        return tables_data, None
-
-    except ImportError:
-        return None, "Camelot 未安装"
-    except Exception as e:
-        return None, str(e)
 
 
 # ============ 页面截图 ============
@@ -338,18 +278,92 @@ def call_vlm(image_data: bytes, prompt: str = "请详细描述这张图片中的
     return None, "VLM 调用失败，超过最大重试次数"
 
 
+# ============ 结构化输出解析 ⭐ v2.0 ============
+
+def parse_vlm_response(response: str) -> dict:
+    """
+    解析 VLM 响应为结构化数据
+
+    Returns:
+        dict 或 None
+    """
+    import re
+    try:
+        # 尝试提取 JSON 块
+        json_match = re.search(r'```json\s*(\{[\s\S]*?\})\s*```', response)
+        if json_match:
+            return json.loads(json_match.group(1))
+        # 尝试直接解析
+        return json.loads(response)
+    except:
+        return None
+
+
+def format_vlm_output(vlm_data: dict, page_num: int) -> str:
+    """
+    格式化 VLM 输出为 Markdown
+
+    Returns:
+        Markdown 格式的字符串
+    """
+    content_type = vlm_data.get('type', 'unknown')
+    title = vlm_data.get('title', '')
+    data = vlm_data.get('data', {})
+    insights = vlm_data.get('key_insights', [])
+    description = vlm_data.get('description', '')
+
+    output = f"### 第 {page_num} 页\n\n"
+
+    # 类型标签
+    type_labels = {
+        'table': '📊 表格',
+        'chart': '📈 图表',
+        'figure': '🖼️ 图片',
+        'text': '📝 内容'
+    }
+    output += f"**类型**: {type_labels.get(content_type, content_type)}\n\n"
+
+    if title:
+        output += f"**标题**: {title}\n\n"
+
+    # 表格数据
+    if content_type == 'table' and data.get('headers') and data.get('rows'):
+        headers = data['headers']
+        rows = data['rows']
+        # 生成 Markdown 表格
+        output += "| " + " | ".join(str(h) for h in headers) + " |\n"
+        output += "|" + "|".join(["---"] * len(headers)) + "|\n"
+        for row in rows[:10]:  # 最多显示 10 行
+            output += "| " + " | ".join(str(cell) for cell in row) + " |\n"
+        if len(rows) > 10:
+            output += f"*... 共 {len(rows)} 行*\n"
+        output += "\n"
+
+    # 关键洞察
+    if insights:
+        output += "**关键信息**:\n"
+        for insight in insights[:5]:
+            output += f"- {insight}\n"
+        output += "\n"
+
+    # 描述
+    if description:
+        output += f"**描述**: {description}\n\n"
+
+    return output
+
+
 # ============ 智能筛选 ============
 
 def analyze_pages(pdf_path: Path) -> dict:
     """
-    分析 PDF 页面，识别含图/表的页面
+    分析 PDF 页面，识别含图的页面
 
     Returns:
         {
             'total_pages': int,
             'text_only_pages': [int],
             'image_pages': [int],
-            'table_pages': [int],
             'needs_vlm': [int]  # 需要 VLM 处理的页面
         }
     """
@@ -359,7 +373,6 @@ def analyze_pages(pdf_path: Path) -> dict:
         'total_pages': 0,
         'text_only_pages': [],
         'image_pages': [],
-        'table_pages': [],
         'needs_vlm': []
     }
 
@@ -375,11 +388,12 @@ def analyze_pages(pdf_path: Path) -> dict:
                 image_list = page.get_images(full=True)
                 for img in image_list:
                     try:
-                        img_rect = page.get_image_bbox(img)
-                        page_rect = page.rect
-                        img_area = img_rect.width * img_rect.height
-                        page_area = page_rect.width * page_rect.height
-                        if img_area / page_area >= 0.01:  # 面积 >= 页面 1%
+                        xref = img[0]
+                        base_image = doc.extract_image(xref)
+                        img_area = base_image["width"] * base_image["height"]
+                        page_area = page.rect.width * page.rect.height
+                        # 图片面积 >= 页面 1% 且大小 > 1KB
+                        if img_area / page_area >= 0.01 and len(base_image["image"]) > 1000:
                             has_image = True
                             break
                     except:
@@ -390,18 +404,6 @@ def analyze_pages(pdf_path: Path) -> dict:
                     result['needs_vlm'].append(page_num)
                 else:
                     result['text_only_pages'].append(page_num)
-
-        # 检查表格（需要 Camelot）
-        try:
-            import camelot
-            tables = camelot.read_pdf(str(pdf_path), pages='all', flavor='lattice')
-            for table in tables:
-                if table.page not in result['table_pages']:
-                    result['table_pages'].append(table.page)
-                if table.page not in result['needs_vlm']:
-                    result['needs_vlm'].append(table.page)
-        except:
-            pass
 
     except Exception as e:
         print(f"    ⚠️ 页面分析失败: {e}")
@@ -422,7 +424,6 @@ def process_pdf(pdf_path: Path, dry_run: bool = False) -> dict:
             'output': str,
             'pages': int,
             'images': int,
-            'tables': int,
             'vlm_calls': int,
             'error': str
         }
@@ -433,12 +434,9 @@ def process_pdf(pdf_path: Path, dry_run: bool = False) -> dict:
         'output': None,
         'pages': 0,
         'images': 0,
-        'tables': 0,
         'vlm_calls': 0,
         'error': None
     }
-
-    temp_files = []  # 临时文件清理列表
 
     try:
         # 检查文件大小
@@ -453,12 +451,9 @@ def process_pdf(pdf_path: Path, dry_run: bool = False) -> dict:
         page_info = analyze_pages(pdf_path)
         result['pages'] = page_info['total_pages']
         result['images'] = len(page_info['image_pages'])
-        result['tables'] = len(page_info['table_pages'])
 
         print(f"     总页数: {page_info['total_pages']}")
         print(f"     含图页: {len(page_info['image_pages'])}")
-        print(f"     含表页: {len(page_info['table_pages'])}")
-        print(f"     需 VLM: {len(page_info['needs_vlm'])}")
 
         # 提取文本
         print(f"  📝 提取文本...")
@@ -467,20 +462,12 @@ def process_pdf(pdf_path: Path, dry_run: bool = False) -> dict:
             result['error'] = text_error
             return result
 
-        # 提取表格
-        print(f"  📊 检测表格...")
-        tables, tables_error = extract_tables(pdf_path)
-        if tables_error:
-            print(f"     ⚠️ {tables_error}")
-            tables = []
+        # VLM 处理 ⭐ v2.0 纯 VLM 方案
+        vlm_outputs = []
 
-        # VLM 处理
-        vlm_descriptions = []
+        if not dry_run and page_info['image_pages']:
+            print(f"  🤖 VLM 描述 ({len(page_info['image_pages'])} 页)...")
 
-        if not dry_run and page_info['needs_vlm']:
-            print(f"  🤖 VLM 描述...")
-
-            # 处理图片页面
             for page_num in page_info['image_pages']:
                 print(f"     处理第 {page_num} 页...")
                 img_data, img_error = render_page_to_image(pdf_path, page_num)
@@ -488,42 +475,33 @@ def process_pdf(pdf_path: Path, dry_run: bool = False) -> dict:
                     print(f"     ⚠️ 渲染失败: {img_error}")
                     continue
 
-                desc, desc_error = call_vlm(img_data, f"请详细描述这张图片中的内容。这是 PDF 第 {page_num} 页。")
+                # 使用结构化 Prompt
+                desc, desc_error = call_vlm(img_data, VLM_PROMPT)
                 if desc_error:
                     print(f"     ⚠️ VLM 失败: {desc_error}")
                     continue
 
-                vlm_descriptions.append({
-                    'type': 'image',
-                    'page': page_num,
-                    'description': desc
-                })
+                # 解析结构化输出
+                vlm_data = parse_vlm_response(desc)
+                if vlm_data:
+                    formatted = format_vlm_output(vlm_data, page_num)
+                    vlm_outputs.append({
+                        'page': page_num,
+                        'formatted': formatted,
+                        'type': vlm_data.get('type', 'unknown')
+                    })
+                    print(f"     ✅ 完成 ({vlm_data.get('type', 'unknown')})")
+                else:
+                    # 解析失败，使用原始输出
+                    vlm_outputs.append({
+                        'page': page_num,
+                        'formatted': f"### 第 {page_num} 页\n\n{desc}\n\n",
+                        'type': 'raw'
+                    })
+                    print(f"     ✅ 完成 (原始输出)")
+
                 result['vlm_calls'] += 1
                 time.sleep(0.5)  # 避免请求过快
-
-            # 处理表格
-            for table in tables:
-                print(f"     处理表格 (第 {table['page']} 页)...")
-                try:
-                    with open(table['image_path'], 'rb') as f:
-                        table_img_data = f.read()
-                    temp_files.append(table['image_path'])
-
-                    desc, desc_error = call_vlm(table_img_data, "请描述这个表格的内容和关键数据。")
-                    if desc_error:
-                        print(f"     ⚠️ VLM 失败: {desc_error}")
-                        continue
-
-                    vlm_descriptions.append({
-                        'type': 'table',
-                        'page': table['page'],
-                        'markdown': table['markdown'],
-                        'description': desc
-                    })
-                    result['vlm_calls'] += 1
-                    time.sleep(0.5)
-                except Exception as e:
-                    print(f"     ⚠️ 表格处理失败: {e}")
 
         # 构建输出
         output_path = get_output_path(pdf_path)
@@ -542,7 +520,6 @@ source: {pdf_path}
 extracted_at: {datetime.now().isoformat()}
 pages: {result['pages']}
 images: {result['images']}
-tables: {result['tables']}
 vlm_calls: {result['vlm_calls']}
 ---
 
@@ -553,16 +530,14 @@ vlm_calls: {result['vlm_calls']}
 """
 
         # 添加图表描述
-        if vlm_descriptions:
+        if vlm_outputs:
             md_content += "## 图表描述\n\n"
-            for item in vlm_descriptions:
-                if item['type'] == 'image':
-                    md_content += f"### 图 (第 {item['page']} 页)\n\n"
-                    md_content += f"{item['description']}\n\n"
-                elif item['type'] == 'table':
-                    md_content += f"### 表 (第 {item['page']} 页)\n\n"
-                    md_content += f"**Markdown 表格**:\n\n{item['markdown']}\n\n"
-                    md_content += f"**视觉描述**: {item['description']}\n\n"
+            for item in vlm_outputs:
+                md_content += item['formatted']
+        elif page_info['image_pages']:
+            md_content += "## 图表描述\n\n本文档含图页面 VLM 处理失败。\n"
+        else:
+            md_content += "## 图表描述\n\n本文档无显著图片内容。\n"
 
         # 写入文件
         output_path.write_text(md_content, encoding='utf-8')
@@ -576,14 +551,6 @@ vlm_calls: {result['vlm_calls']}
         result['error'] = str(e)
         return result
 
-    finally:
-        # 清理临时文件
-        for temp_file in temp_files:
-            try:
-                Path(temp_file).unlink(missing_ok=True)
-            except:
-                pass
-
 
 def main():
     parser = argparse.ArgumentParser(description="PDF-VLM 处理管线")
@@ -595,7 +562,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print("PDF-VLM 处理管线 v1.0")
+    print("PDF-VLM 处理管线 v2.0")
     print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"模式: {'预览' if args.dry_run else '写入'}")
     print(f"并发: {args.workers}")
@@ -616,10 +583,6 @@ def main():
     except ImportError:
         print("❌ PyMuPDF 未安装，请运行: pip install pymupdf")
         return
-
-    try:
-        import camelot
-        print(f"✅ Camelot 已安装")
     except ImportError:
         print("⚠️ Camelot 未安装，表格检测将不可用")
 
@@ -662,7 +625,6 @@ def main():
     fail_count = 0
     total_vlm_calls = 0
     total_images = 0
-    total_tables = 0
 
     # 处理 PDF（串行，因为 VLM 调用有速率限制）
     for i, pdf_path in enumerate(pdf_files, 1):
@@ -675,8 +637,7 @@ def main():
             success_count += 1
             total_vlm_calls += result['vlm_calls']
             total_images += result['images']
-            total_tables += result['tables']
-            print(f"  ✅ 完成: {result['pages']} 页, {result['images']} 图, {result['tables']} 表, {result['vlm_calls']} VLM 调用")
+            print(f"  ✅ 完成: {result['pages']} 页, {result['images']} 图, {result['vlm_calls']} VLM 调用")
         else:
             fail_count += 1
             print(f"  ❌ 失败: {result['error']}")
@@ -688,7 +649,6 @@ def main():
     print(f"  成功: {success_count}")
     print(f"  失败: {fail_count}")
     print(f"  总图片: {total_images}")
-    print(f"  总表格: {total_tables}")
     print(f"  VLM 调用: {total_vlm_calls}")
     print(f"  耗时: {elapsed:.1f} 秒")
     if total_vlm_calls > 0:
