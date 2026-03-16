@@ -44,12 +44,21 @@ class LLMConfig:
     bailian_api_key: Optional[str] = None
     bailian_base_url: str = "coding.dashscope.aliyuncs.com"
 
+    # OpenRouter API 配置
+    openrouter_api_key: Optional[str] = None
+    openrouter_base_url: str = "openrouter.ai"
+    openrouter_site_url: str = "https://github.com/zhiwei-bot"  # 用于 OpenRouter 排名
+    openrouter_app_name: str = "Zhiwei-Bot"  # HTTP 头不支持中文
+
     # 超时设置
     default_timeout: int = 120
     max_timeout: int = 600
 
     # 是否优先使用直连 API（跳过代理）
     prefer_direct: bool = True  # 默认直连百炼，避免代理依赖
+
+    # 是否启用 OpenRouter（作为主调用或降级选项）
+    openrouter_enabled: bool = False  # 默认关闭，需要时开启
 
 
 class LLMClient:
@@ -69,6 +78,19 @@ class LLMClient:
         "main": "qwen3.5-plus",      # 兼容 OpenClaw main agent
         "researcher": "kimi-k2.5",   # 兼容 OpenClaw researcher agent
         "operator": "qwen3.5-plus",  # 兼容 OpenClaw operator agent
+    }
+
+    # OpenRouter 模型映射（可选使用 OpenRouter 上的模型）
+    # 注意：部分模型有地区限制，使用 DeepSeek 作为默认（全球可用）
+    OPENROUTER_MODELS = {
+        "chat": "deepseek/deepseek-chat",
+        "research": "deepseek/deepseek-chat",
+        "format": "deepseek/deepseek-chat",
+        "distill": "deepseek/deepseek-chat",
+        "dev": "deepseek/deepseek-chat",
+        "main": "deepseek/deepseek-chat",
+        "researcher": "deepseek/deepseek-chat",
+        "operator": "deepseek/deepseek-chat",
     }
 
     # 模型降级链
@@ -98,13 +120,18 @@ class LLMClient:
         self.config.bailian_api_key = (
             self.config.bailian_api_key or
             os.getenv("BAILIAN_API_KEY") or
-            self._load_api_key_from_env()
+            self._load_api_key_from_env("BAILIAN_API_KEY")
+        )
+        self.config.openrouter_api_key = (
+            self.config.openrouter_api_key or
+            os.getenv("OPENROUTER_API_KEY") or
+            self._load_api_key_from_env("OPENROUTER_API_KEY")
         )
 
-    def _load_api_key_from_env(self) -> Optional[str]:
+    def _load_api_key_from_env(self, key_name: str = "BAILIAN_API_KEY") -> Optional[str]:
         """从 zhiwei-bot/.env 文件加载 API Key"""
         env_paths = [
-            Path(__file__).parent / ".env",  # zhiwei-bot/.env
+            Path(__file__).parent.parent / ".env",  # zhiwei-bot/.env
             Path.home() / "zhiwei-bot" / ".env",
         ]
         for env_path in env_paths:
@@ -113,7 +140,7 @@ class LLMClient:
                     with open(env_path) as f:
                         for line in f:
                             line = line.strip()
-                            if line.startswith("BAILIAN_API_KEY="):
+                            if line.startswith(f"{key_name}="):
                                 return line.split("=", 1)[1]
                 except Exception as e:
                     logger.warning(f"读取 .env 失败: {e}")
@@ -124,7 +151,8 @@ class LLMClient:
         role: str,
         message: str,
         system_prompt: Optional[str] = None,
-        timeout: Optional[int] = None
+        timeout: Optional[int] = None,
+        use_openrouter: Optional[bool] = None
     ) -> Tuple[bool, str]:
         """
         统一调用接口
@@ -134,15 +162,35 @@ class LLMClient:
             message: 用户消息
             system_prompt: 可选系统提示词
             timeout: 超时时间（秒）
+            use_openrouter: 是否使用 OpenRouter（None 表示自动选择）
 
         Returns:
             (success, content) 元组
         """
         model = self.ROLE_MODELS.get(role, "qwen3.5-plus")
+        openrouter_model = self.OPENROUTER_MODELS.get(role, "google/gemini-2.0-flash-001")
         system = system_prompt or self.ROLE_PROMPTS.get(role, "")
         timeout = timeout or self.config.default_timeout
 
-        # 尝试调用，失败时降级
+        # 决定是否使用 OpenRouter
+        use_or = use_openrouter if use_openrouter is not None else self.config.openrouter_enabled
+
+        # 优先使用 OpenRouter
+        if use_or and self.config.openrouter_api_key:
+            try:
+                success, content = self._call_via_openrouter(
+                    model=openrouter_model,
+                    system_prompt=system,
+                    message=message,
+                    timeout=timeout
+                )
+                if success:
+                    return True, content
+                logger.warning(f"OpenRouter {openrouter_model} 失败，尝试降级...")
+            except Exception as e:
+                logger.warning(f"OpenRouter {openrouter_model} 异常: {e}")
+
+        # 尝试百炼 API
         fallback_models = [model] + self.FALLBACK_CHAIN.get(model, [])
 
         for current_model in fallback_models:
@@ -335,6 +383,69 @@ class LLMClient:
         except Exception as e:
             logger.error(f"百炼直连异常: {e}")
             return False, f"Bailian Exception: {e}"
+
+    def _call_via_openrouter(
+        self,
+        model: str,
+        system_prompt: str,
+        message: str,
+        timeout: int
+    ) -> Tuple[bool, str]:
+        """
+        通过 OpenRouter API 调用 LLM
+
+        Args:
+            model: OpenRouter 模型名称（如 anthropic/claude-3.5-sonnet）
+            system_prompt: 系统提示词
+            message: 用户消息
+            timeout: 超时时间
+
+        Returns:
+            (success, content) 元组
+        """
+        if not self.config.openrouter_api_key:
+            return False, "未配置 OpenRouter API Key"
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": message})
+
+        payload = json.dumps({
+            "model": model,
+            "messages": messages,
+            "temperature": 0.7
+        })
+
+        try:
+            import ssl
+            import urllib.request
+
+            context = ssl.create_default_context()
+            url = f"https://{self.config.openrouter_base_url}/api/v1/chat/completions"
+
+            req = urllib.request.Request(
+                url,
+                data=payload.encode('utf-8'),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.config.openrouter_api_key}",
+                    "HTTP-Referer": self.config.openrouter_site_url,
+                    "X-Title": self.config.openrouter_app_name
+                },
+                method='POST'
+            )
+
+            with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
+                data = json.loads(resp.read().decode())
+
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            logger.info(f"OpenRouter {model} 成功，{len(content)} 字符")
+            return True, content
+
+        except Exception as e:
+            logger.error(f"OpenRouter 调用异常: {e}")
+            return False, f"OpenRouter Exception: {e}"
 
 
 # 全局单例
