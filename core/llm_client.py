@@ -81,16 +81,16 @@ class LLMClient:
     }
 
     # OpenRouter 模型映射（可选使用 OpenRouter 上的模型）
-    # 注意：部分模型有地区限制，使用 DeepSeek 作为默认（全球可用）
+    # Claude 4.6 为最新版本
     OPENROUTER_MODELS = {
-        "chat": "deepseek/deepseek-chat",
-        "research": "deepseek/deepseek-chat",
-        "format": "deepseek/deepseek-chat",
-        "distill": "deepseek/deepseek-chat",
-        "dev": "deepseek/deepseek-chat",
-        "main": "deepseek/deepseek-chat",
-        "researcher": "deepseek/deepseek-chat",
-        "operator": "deepseek/deepseek-chat",
+        "chat": "anthropic/claude-sonnet-4.6",
+        "research": "anthropic/claude-sonnet-4.6",
+        "format": "anthropic/claude-sonnet-4.6",
+        "distill": "anthropic/claude-sonnet-4.6",
+        "dev": "anthropic/claude-sonnet-4.6",
+        "main": "anthropic/claude-sonnet-4.6",
+        "researcher": "anthropic/claude-sonnet-4.6",
+        "operator": "anthropic/claude-sonnet-4.6",
     }
 
     # 模型降级链
