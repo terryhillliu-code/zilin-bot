@@ -493,45 +493,30 @@ def main():
         return False
 
     def connection_monitor():
-        """连接监控线程 - 增强版 (ISSUE-003 + P2 健康告警)"""
+        """连接监控线程 - 优化版 (v44.3)
+
+        修正：业务消息空闲 ≠ 连接异常
+        - 业务消息空闲是正常现象（夜间、午休等），不发送钉钉告警
+        - 仅记录日志用于排查
+        - 真正的连接问题由 SDK 的 ping/重连机制处理
+        """
         while True:
             time.sleep(60)  # 每分钟检查一次
             now = time.time()
             event_idle = now - connection_status.get("last_event", now)
 
-            if event_idle > 600:  # 10 分钟无业务消息
-                if connection_status["connected"]:
-                    idle_minutes = int(event_idle / 60)
-                    print(f"🟡 业务消息空闲 {idle_minutes} 分钟，连接可能异常")
+            # 业务消息空闲超过 30 分钟才记录日志（不再发送钉钉告警）
+            if event_idle > 1800:  # 30 分钟
+                idle_minutes = int(event_idle / 60)
 
-                    connection_status["connected"] = False
+                # 仅记录到日志，不发送钉钉告警
+                with open(os.path.expanduser("~/logs/connection_monitor.log"), "a") as f:
+                    f.write(f"{datetime.now().isoformat()}: Business idle {idle_minutes}min (normal)\n")
 
-                    # 记录到日志
-                    with open(os.path.expanduser("~/logs/connection_monitor.log"), "a") as f:
-                        f.write(f"{datetime.now().isoformat()}: Business idle {idle_minutes}min - Possible disconnect\n")
+                print(f"💡 业务消息空闲 {idle_minutes} 分钟（正常现象，连接通过 ping 保持）")
 
-                    # 发送钉钉告警
-                    send_ws_alert(
-                        f"🚨 WebSocket 连接告警\n\n"
-                        f"状态: 业务消息空闲 {idle_minutes} 分钟\n"
-                        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                        f"AppID: {APP_ID[:8]}...\n\n"
-                        f"请检查飞书机器人服务状态",
-                        alert_type="disconnect"
-                    )
-            else:
-                if not connection_status["connected"]:
-                    # 连接恢复，发送恢复通知
-                    print(f"✅ 业务消息已恢复，连接正常")
-
-                    # 发送恢复通知
-                    send_ws_alert(
-                        f"✅ WebSocket 连接已恢复\n\n"
-                        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                        f"AppID: {APP_ID[:8]}...",
-                        alert_type="recover"
-                    )
-                    connection_status["connected"] = True
+                # 重置时间戳，避免频繁记录日志
+                connection_status["last_event"] = now
 
     # 启动监控线程
     monitor_thread = threading.Thread(target=connection_monitor, daemon=True)
