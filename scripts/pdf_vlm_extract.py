@@ -583,8 +583,6 @@ def main():
     except ImportError:
         print("❌ PyMuPDF 未安装，请运行: pip install pymupdf")
         return
-    except ImportError:
-        print("⚠️ Camelot 未安装，表格检测将不可用")
 
     # 创建输出目录
     OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
