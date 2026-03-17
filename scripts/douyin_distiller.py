@@ -177,7 +177,7 @@ class ShareTextExtractor:
 
     # 支持的 URL 模式（按优先级排序）
     URL_PATTERNS = [
-        r'https?://v\.douyin\.com/[A-Za-z0-9_/]+',           # 抖音短链
+        r'https?://v\.douyin\.com/[A-Za-z0-9_/-]+',           # 抖音短链
         r'https?://www\.douyin\.com/video/\d+',              # 抖音长链
         r'https?://www\.tiktok\.com/@[^/]+/video/\d+',       # TikTok
         r'https?://vm\.tiktok\.com/[A-Za-z0-9]+',            # TikTok 短链
