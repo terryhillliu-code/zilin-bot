@@ -1422,13 +1422,37 @@ class ImageVideoProcessor:
                 frame.description = "[VLM 不可用，无法识别图片内容]"
             return frames
 
-        default_prompt = """请详细描述这张图片的内容，包括：
-1. 主要文字信息（标题、要点等）
-2. 图表或数据可视化内容
-3. 关键视觉元素
-4. 如果是幻灯片，请提取主要知识点
+        # 方案B: VLM提取增强 - 结构化知识提取
+        default_prompt = """你是一个知识提取专家。请分析这张图片并提取结构化知识。
 
-请用简洁的语言概括核心内容。"""
+## 输出格式要求
+
+### 1. 图片类型识别
+[选择一项：信息图 / 流程图 / 思维导图 / 数据图表 / 代码截图 / 文字截图 / 幻灯片 / 照片 / 其他]
+
+### 2. 完整文字提取（OCR）
+请尽可能提取图片中的所有可见文字，包括：
+- 标题、副标题
+- 正文内容
+- 标注、注释
+- 图例说明
+
+### 3. 核心知识点
+用要点形式列出图片传达的核心知识：
+- 要点1：...
+- 要点2：...
+- ...
+
+### 4. 结构化信息
+如果是图表/流程图，请描述其结构：
+- 输入 → 处理 → 输出的流程
+- 层级关系
+- 数据对比
+
+### 5. 关键数据
+提取所有数值、比例、时间等关键数据。
+
+请确保提取的信息完整、准确，便于后续知识蒸馏。"""
 
         actual_prompt = prompt or default_prompt
 
@@ -1454,7 +1478,9 @@ class ImageVideoProcessor:
         frames: list[ImageFrame]
     ) -> TranscriptResult:
         """
-        将帧描述合成为转录结果
+        将帧描述合称为转录结果
+
+        方案C: 添加低信息密度检测
 
         Args:
             frames: 包含描述的帧列表
@@ -1465,6 +1491,17 @@ class ImageVideoProcessor:
         segments = []
         full_text_parts = []
 
+        # 统计有效帧数
+        valid_frames = [f for f in frames if f.description and not f.description.startswith("[")]
+        frame_count = len(valid_frames)
+
+        # 方案C: 添加图片内容标记
+        header = f"""[📷 图片内容提取 - 共{frame_count}张图片]
+
+---
+"""
+        full_text_parts.append(header)
+
         for frame in frames:
             if frame.description and not frame.description.startswith("["):
                 # 创建转录片段
@@ -1474,9 +1511,31 @@ class ImageVideoProcessor:
                     text=frame.description
                 )
                 segments.append(segment)
-                full_text_parts.append(f"[{self._format_time(frame.timestamp)}] {frame.description}")
+                full_text_parts.append(f"### 图片 {frame.index + 1}\n\n{frame.description}")
 
-        full_text = "\n\n".join(full_text_parts)
+        full_text = "\n\n---\n\n".join(full_text_parts)
+
+        # 方案C: 低信息密度检测
+        total_chars = len(full_text)
+        avg_chars_per_frame = total_chars // max(frame_count, 1)
+
+        # 检测低信息密度：平均每张图片 < 200 字符
+        is_low_density = avg_chars_per_frame < 200 and frame_count > 0
+
+        if is_low_density:
+            warning = f"""
+
+---
+
+⚠️ **低信息密度警告**
+- 图片数量: {frame_count}
+- 总字符数: {total_chars}
+- 平均每张: {avg_chars_per_frame} 字符
+
+该图文内容信息密度较低，可能为纯视觉内容或信息较少，建议人工审核。
+"""
+            full_text += warning
+            logger.warning(f"Low information density detected: {avg_chars_per_frame} chars/frame")
 
         return TranscriptResult(
             segments=segments,
