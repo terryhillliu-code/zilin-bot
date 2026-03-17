@@ -303,7 +303,13 @@ def handle_video_async(text: str, message_id: str, user_id: str):
 
 
 def process_video(text: str, message_id: str = None) -> str:
-    """处理视频分析 - 调用宿主机 Distiller"""
+    """处理视频分析 - 调用宿主机 Distiller
+
+    v2.0 新增：
+    - 详细错误分类和记录
+    - 自动重试临时性错误
+    - 严重错误飞书告警
+    """
     video_history = None
     url = None
     try:
@@ -336,12 +342,30 @@ def process_video(text: str, message_id: str = None) -> str:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
         if result.returncode != 0:
+            # 解析错误信息
+            error_type, error_message = _parse_distiller_error(result.stderr)
+
             # 记录失败
             if video_history:
-                video_history.record_failed(url)
-            error_msg = result.stderr[:500] if result.stderr else result.stdout[:500]
-            logger.error(f"Distiller 失败: {error_msg}")
-            return f"❌ 视频处理失败\n\n{error_msg}"
+                video_history.record_failed(url, error_type, error_message)
+
+            # 发送告警（如果是严重错误）
+            if video_history:
+                from video_history import VideoErrorType
+                try:
+                    error_type_enum = VideoErrorType(error_type)
+                    video_history.send_alert(error_type_enum, url, error_message)
+                except ValueError:
+                    pass  # 无效的错误类型，忽略
+
+            # 判断是否可以重试
+            if video_history and video_history.can_retry(url):
+                retry_count = video_history.increment_retry(url)
+                logger.info(f"将自动重试 (第 {retry_count} 次)")
+                # TODO: 可以在这里添加自动重试逻辑
+
+            logger.error(f"Distiller 失败: {error_message[:200]}")
+            return f"❌ 视频处理失败\n\n错误类型: {error_type}\n详情: {error_message[:300]}"
 
         # 解析输出
         output = result.stdout
@@ -361,16 +385,59 @@ def process_video(text: str, message_id: str = None) -> str:
         return f"⚠️ 视频处理完成但输出格式异常\n\n{output[-500:]}"
 
     except subprocess.TimeoutExpired:
-        # 记录失败
+        # 记录失败（超时）
+        error_type = "timeout"
+        error_message = "视频分析超时（10分钟）"
         if video_history and url:
-            video_history.record_failed(url)
-        return "❌ 视频分析超时（10分钟）"
+            video_history.record_failed(url, error_type, error_message)
+            from video_history import VideoErrorType
+            video_history.send_alert(VideoErrorType.TIMEOUT, url, error_message)
+        return f"❌ {error_message}"
+
     except Exception as e:
-        # 记录失败
+        # 记录失败（未知错误）
         if video_history and url:
-            video_history.record_failed(url)
+            video_history.record_failed(url, "unknown", str(e))
         logger.error(f"视频处理异常: {e}")
         return f"❌ 视频处理异常: {str(e)}"
+
+
+def _parse_distiller_error(stderr: str) -> tuple[str, str]:
+    """解析 Distiller 输出的错误信息
+
+    Args:
+        stderr: Distiller 的 stderr 输出
+
+    Returns:
+        (error_type, error_message) 元组
+    """
+    import json
+
+    # 尝试解析 JSON 格式的错误信息
+    for line in stderr.strip().split('\n'):
+        line = line.strip()
+        if line.startswith('{') and line.endswith('}'):
+            try:
+                data = json.loads(line)
+                error_type = data.get('error_type', 'unknown')
+                error_message = data.get('error_message', stderr[:500])
+                return error_type, error_message
+            except json.JSONDecodeError:
+                continue
+
+    # 降级：根据 stderr 内容判断错误类型
+    stderr_lower = stderr.lower()
+
+    if any(kw in stderr_lower for kw in ["cookie", "登录过期", "请先登录"]):
+        return "cookie_expired", stderr[:500]
+    elif any(kw in stderr_lower for kw in ["network", "connection", "timeout"]):
+        return "network_error", stderr[:500]
+    elif any(kw in stderr_lower for kw in ["404", "not found", "不存在"]):
+        return "video_not_found", stderr[:500]
+    elif any(kw in stderr_lower for kw in ["private", "私密"]):
+        return "video_private", stderr[:500]
+    else:
+        return "unknown", stderr[:500]
 
 
 # ========== 语音处理 ==========

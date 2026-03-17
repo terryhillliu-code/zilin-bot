@@ -7,7 +7,7 @@
 URL → 解析 → 字幕/ASR → LLM 蒸馏 → Markdown 输出
 
 作者: 知微系统
-版本: v1.0.0
+版本: v1.1.0 (新增失败处理机制)
 """
 
 import os
@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
+from enum import Enum
 
 import requests
 from dotenv import load_dotenv
@@ -33,6 +34,93 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# 错误分类
+# ============================================================================
+
+class VideoErrorType(Enum):
+    """视频处理错误类型"""
+    COOKIE_EXPIRED = "cookie_expired"      # Cookie 过期
+    NETWORK_ERROR = "network_error"        # 网络问题
+    VIDEO_NOT_FOUND = "video_not_found"    # 视频不存在
+    VIDEO_PRIVATE = "video_private"        # 私密视频
+    ASR_FAILED = "asr_failed"              # 语音识别失败
+    LLM_FAILED = "llm_failed"              # LLM 处理失败
+    API_ERROR = "api_error"                # API 错误（如 400/500）
+    TIMEOUT = "timeout"                    # 超时
+    UNKNOWN = "unknown"                    # 未知错误
+
+
+# 可重试的错误类型
+RETRYABLE_ERRORS = [VideoErrorType.NETWORK_ERROR, VideoErrorType.ASR_FAILED, VideoErrorType.TIMEOUT]
+MAX_RETRIES = 3
+
+
+def classify_error(exception: Exception, stderr: str = "") -> tuple[VideoErrorType, str]:
+    """根据异常类型和错误输出分类错误
+
+    Args:
+        exception: 捕获的异常
+        stderr: 命令执行的 stderr 输出
+
+    Returns:
+        (错误类型, 错误信息) 元组
+    """
+    error_str = str(exception).lower()
+    stderr_str = stderr.lower() if stderr else ""
+
+    # 合并错误信息用于判断
+    combined = error_str + " " + stderr_str
+
+    # Cookie 过期
+    if any(kw in combined for kw in ["cookie", "fresh cookies", "cookies expired", "登录过期", "请先登录"]):
+        return VideoErrorType.COOKIE_EXPIRED, str(exception) or stderr[:500]
+
+    # 网络错误
+    if any(kw in combined for kw in ["network", "connection", "connect", "timeout", "timed out", "网络", "连接"]):
+        return VideoErrorType.NETWORK_ERROR, str(exception) or stderr[:500]
+
+    # 超时
+    if "timeout" in combined or "timed out" in combined:
+        return VideoErrorType.TIMEOUT, str(exception) or stderr[:500]
+
+    # 视频不存在
+    if any(kw in combined for kw in ["not found", "404", "视频不存在", "已被删除", "作品不存在"]):
+        return VideoErrorType.VIDEO_NOT_FOUND, str(exception) or stderr[:500]
+
+    # 私密视频
+    if any(kw in combined for kw in ["private", "私密", "仅自己可见", "私密账号"]):
+        return VideoErrorType.VIDEO_PRIVATE, str(exception) or stderr[:500]
+
+    # API 错误
+    if any(kw in combined for kw in ["400", "401", "403", "500", "502", "503", "api error", "api请求"]):
+        return VideoErrorType.API_ERROR, str(exception) or stderr[:500]
+
+    # ASR 失败
+    if any(kw in combined for kw in ["asr", "transcri", "转录", "语音识别"]):
+        return VideoErrorType.ASR_FAILED, str(exception) or stderr[:500]
+
+    # LLM 失败
+    if any(kw in combined for kw in ["llm", "qwen", "kimi", "distill", "蒸馏"]):
+        return VideoErrorType.LLM_FAILED, str(exception) or stderr[:500]
+
+    # 默认未知错误
+    return VideoErrorType.UNKNOWN, str(exception) or stderr[:500] or "未知错误"
+
+
+def should_retry(error_type: VideoErrorType, retry_count: int) -> bool:
+    """判断是否应该重试
+
+    Args:
+        error_type: 错误类型
+        retry_count: 当前重试次数
+
+    Returns:
+        True 如果应该重试
+    """
+    return error_type in RETRYABLE_ERRORS and retry_count < MAX_RETRIES
 
 
 # ============================================================================
@@ -2071,6 +2159,9 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
         0: 成功
         1: 失败
         2: 跳过（已处理过）
+
+    失败时输出 JSON 格式错误信息到 stderr:
+    {"error_type": "xxx", "error_message": "xxx"}
     """
     resolver = URLResolver()
 
@@ -2080,6 +2171,9 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
     try:
         video_info = resolver.resolve(url)
     except Exception as e:
+        error_type, error_msg = classify_error(e)
+        error_json = json.dumps({"error_type": error_type.value, "error_message": error_msg})
+        print(error_json, file=sys.stderr)
         logger.error(f"URL 解析失败: {e}")
         return 1
 
@@ -2109,10 +2203,20 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
         logger.info(f"Using cookies from browser: {cookies_browser}")
     if cookies_file:
         logger.info(f"Using cookies file: {cookies_file}")
-    provider = TranscriptProvider(config, cookies_browser, cookies_file)
-    transcript = provider.get_transcript(video_info)
+
+    try:
+        provider = TranscriptProvider(config, cookies_browser, cookies_file)
+        transcript = provider.get_transcript(video_info)
+    except Exception as e:
+        error_type, error_msg = classify_error(e)
+        error_json = json.dumps({"error_type": error_type.value, "error_message": error_msg})
+        print(error_json, file=sys.stderr)
+        logger.error(f"获取转录失败: {e}")
+        return 1
 
     if not transcript.full_text:
+        error_json = json.dumps({"error_type": VideoErrorType.ASR_FAILED.value, "error_message": "无法获取转录文本"})
+        print(error_json, file=sys.stderr)
         logger.error("Failed to get transcript")
         return 1
 
@@ -2140,7 +2244,15 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
     logger.info("=" * 50)
     logger.info("Step 4: Distilling knowledge")
     distiller = KnowledgeDistiller(config)
-    knowledge = distiller.distill(video_info, transcript)
+    try:
+        knowledge = distiller.distill(video_info, transcript)
+    except Exception as e:
+        error_type, error_msg = classify_error(e)
+        error_json = json.dumps({"error_type": error_type.value, "error_message": error_msg})
+        print(error_json, file=sys.stderr)
+        logger.error(f"知识蒸馏失败: {e}")
+        return 1
+
     logger.info(f"Title: {knowledge.title}")
     logger.info(f"Key points: {len(knowledge.key_points)}")
     logger.info(f"Tags: {knowledge.tags}")
