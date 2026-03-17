@@ -328,7 +328,8 @@ def process_video(text: str, message_id: str = None) -> str:
         cmd = [
             venv_python, distiller_path,
             "--from-text", text,
-            "--output-dir", os.path.expanduser("~/Documents/ZhiweiVault/Inbox")
+            "--output-dir", os.path.expanduser("~/Documents/ZhiweiVault/Inbox"),
+            "--cookies", os.path.expanduser("~/zhiwei-bot/secrets/douyin_cookies.txt")  # 使用 cookies 文件获取抖音字幕
         ]
 
         logger.info(f"🎬 调用 Distiller: {' '.join(cmd[:3])}...")

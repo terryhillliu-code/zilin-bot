@@ -498,9 +498,10 @@ class DouyinAPIClient:
 class MediaExtractor:
     """使用 yt-dlp 提取字幕和音频，抖音使用本地 API"""
 
-    def __init__(self, cookies_browser: Optional[str] = None):
+    def __init__(self, cookies_browser: Optional[str] = None, cookies_file: Optional[str] = None):
         self.yt_dlp_path = self._find_yt_dlp()
         self.cookies_browser = cookies_browser
+        self.cookies_file = cookies_file
 
     def _find_yt_dlp(self) -> str:
         """查找 yt-dlp 可执行文件"""
@@ -529,7 +530,9 @@ class MediaExtractor:
         }
 
         # 添加 cookies 支持
-        if self.cookies_browser:
+        if self.cookies_file:
+            ydl_opts["cookiefile"] = self.cookies_file
+        elif self.cookies_browser:
             ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
 
         try:
@@ -657,7 +660,9 @@ class MediaExtractor:
         }
 
         # 添加 cookies 支持
-        if self.cookies_browser:
+        if self.cookies_file:
+            ydl_opts["cookiefile"] = self.cookies_file
+        elif self.cookies_browser:
             ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
 
         try:
@@ -763,7 +768,9 @@ class MediaExtractor:
         }
 
         # 添加 cookies 支持
-        if self.cookies_browser:
+        if self.cookies_file:
+            ydl_opts["cookiefile"] = self.cookies_file
+        elif self.cookies_browser:
             ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
 
         try:
@@ -1530,10 +1537,11 @@ class ImageVideoProcessor:
 class TranscriptProvider:
     """转录服务路由"""
 
-    def __init__(self, config: AppConfig, cookies_browser: Optional[str] = None):
+    def __init__(self, config: AppConfig, cookies_browser: Optional[str] = None, cookies_file: Optional[str] = None):
         self.config = config
         self.cookies_browser = cookies_browser
-        self.media_extractor = MediaExtractor(cookies_browser)
+        self.cookies_file = cookies_file
+        self.media_extractor = MediaExtractor(cookies_browser, cookies_file)
         self.dashscope_transcriber = DashScopeASRTranscriber(
             config.dashscope_api_key,
             config.asr_model
@@ -2037,9 +2045,12 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
     logger.info("=" * 50)
     logger.info("Step 2: Getting transcript")
     cookies_browser = getattr(args, 'cookies_from_browser', None)
+    cookies_file = getattr(args, 'cookies', None)
     if cookies_browser:
         logger.info(f"Using cookies from browser: {cookies_browser}")
-    provider = TranscriptProvider(config, cookies_browser)
+    if cookies_file:
+        logger.info(f"Using cookies file: {cookies_file}")
+    provider = TranscriptProvider(config, cookies_browser, cookies_file)
     transcript = provider.get_transcript(video_info)
 
     if not transcript.full_text:
@@ -2137,6 +2148,8 @@ def main():
     parser.add_argument("--output-dir", type=str, help="自定义输出目录")
     parser.add_argument("--cookies-from-browser", type=str, metavar="BROWSER",
                         help="从浏览器加载 cookies（chrome/safari/firefox/edge）")
+    parser.add_argument("--cookies", type=str, metavar="FILE",
+                        help="cookies 文件路径（Netscape 格式）")
     parser.add_argument("--debug", action="store_true", help="启用调试模式")
     parser.add_argument("--openclaw-payload", type=str, help="OpenClaw 消息 payload（JSON 或纯文本）")
     parser.add_argument("--json", action="store_true", help="JSON 格式输出结果")
