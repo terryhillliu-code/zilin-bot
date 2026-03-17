@@ -85,6 +85,21 @@ connection_status = {
     "last_event": time.time(),       # 业务事件（收到消息）
 }
 
+# ========== WebSocket 心跳监控 (v44.4) ==========
+HEARTBEAT_FILE = os.path.expanduser("~/logs/ws_heartbeat.json")
+
+def write_heartbeat(conn_id: str = "", status: str = "connected"):
+    """写入心跳状态文件，供 watchdog 检测"""
+    try:
+        with open(HEARTBEAT_FILE, "w") as f:
+            json.dump({
+                "timestamp": time.time(),
+                "conn_id": conn_id,
+                "status": status
+            }, f)
+    except Exception:
+        pass
+
 # 审批待确认 (T-056)
 pending_review = {}  # user_id -> task_id
 
@@ -493,17 +508,22 @@ def main():
         return False
 
     def connection_monitor():
-        """连接监控线程 - 优化版 (v44.3)
+        """连接监控线程 - 优化版 (v44.4)
 
-        修正：业务消息空闲 ≠ 连接异常
-        - 业务消息空闲是正常现象（夜间、午休等），不发送钉钉告警
-        - 仅记录日志用于排查
-        - 真正的连接问题由 SDK 的 ping/重连机制处理
+        功能：
+        1. 每分钟写入心跳文件（供 watchdog 检测）
+        2. 业务消息空闲时记录日志（不发送钉钉告警，避免误报）
         """
+        # 启动时立即写入心跳
+        write_heartbeat(status="starting")
+
         while True:
             time.sleep(60)  # 每分钟检查一次
             now = time.time()
             event_idle = now - connection_status.get("last_event", now)
+
+            # 写入心跳（即使空闲也写入，表示服务存活）
+            write_heartbeat(status="connected")
 
             # 业务消息空闲超过 30 分钟才记录日志（不再发送钉钉告警）
             if event_idle > 1800:  # 30 分钟
