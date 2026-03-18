@@ -8,7 +8,9 @@ Library 文档摘要生成器
 2. 提取文本（PyMuPDF/ebooklib）
 3. 判断文档类型（中文研报/英文电子书）
 4. 调用 LLM 生成摘要
-5. 生成 Markdown 笔记
+5. 调用 zhiwei-obsidian 服务导出到 Obsidian
+
+优先使用 zhiwei-obsidian 服务，服务不可用时回退到本地实现。
 """
 
 import os
@@ -26,6 +28,14 @@ from ebooklib import epub
 # 添加 zhiwei-bot 路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from scripts.obsidian_summary_filler import generate_ai_summary, get_text_for_summary
+
+# 导入 Obsidian 客户端
+try:
+    from core.obsidian_client import obsidian_client
+    HAS_OBSIDIAN_CLIENT = True
+except ImportError:
+    HAS_OBSIDIAN_CLIENT = False
+    print("⚠️ Obsidian 客户端不可用，使用本地实现")
 
 # ============================================================================
 # 配置
@@ -228,7 +238,10 @@ def safe_filename(title: str) -> str:
 # ============================================================================
 
 def process_file(file_info: dict, category: str) -> dict:
-    """处理单个文件"""
+    """处理单个文件
+
+    优先使用 zhiwei-obsidian 服务，服务不可用时回退到本地实现。
+    """
     file_path = Path(file_info["original_path"])
 
     # 检查文件是否存在
@@ -259,26 +272,41 @@ def process_file(file_info: dict, category: str) -> dict:
 
     # 3. 生成摘要
     summary = ""
-    if is_cn_report:
-        # 中文研报：使用 AI 硬件架构师模板
-        print(f"  🤖 生成 AI 摘要...")
-        truncated = get_text_for_summary(text)
-        summary = generate_ai_summary(truncated, doc_type)
-        if summary.startswith("❌"):
-            print(f"  ⚠️ 摘要生成失败: {summary}")
-        else:
-            print(f"  ✅ 摘要生成成功: {len(summary)} 字符")
+    print(f"  🤖 生成 AI 摘要...")
+    truncated = get_text_for_summary(text)
+    summary = generate_ai_summary(truncated, doc_type)
+    if summary.startswith("❌"):
+        print(f"  ⚠️ 摘要生成失败: {summary}")
     else:
-        # 英文电子书：也生成摘要
-        print(f"  🤖 生成摘要...")
-        truncated = get_text_for_summary(text)
-        summary = generate_ai_summary(truncated, doc_type)
-        if summary.startswith("❌"):
-            print(f"  ⚠️ 摘要生成失败")
-        else:
-            print(f"  ✅ 摘要生成成功: {len(summary)} 字符")
+        print(f"  ✅ 摘要生成成功: {len(summary)} 字符")
 
-    # 4. 生成笔记
+    # 4. 尝试使用 zhiwei-obsidian 服务导出
+    if HAS_OBSIDIAN_CLIENT and obsidian_client.is_available():
+        print(f"  📤 使用 zhiwei-obsidian 服务导出...")
+        result = obsidian_client.export_report(
+            title=title,
+            summary=summary,
+            source=str(file_path),
+            pages=pages,
+            doc_type=doc_type,
+        )
+
+        if result.get("success"):
+            print(f"  ✅ 服务导出成功: {Path(result['md_path']).name}")
+            return {
+                "status": "success",
+                "file": str(file_path),
+                "title": title,
+                "note": result.get("md_path", ""),
+                "pages": pages,
+                "is_chinese": is_cn_report,
+                "summary_length": len(summary) if summary else 0,
+                "export_method": "service"
+            }
+        else:
+            print(f"  ⚠️ 服务导出失败: {result.get('error')}，回退到本地实现")
+
+    # 5. 本地实现：生成并保存笔记
     if is_cn_report:
         note_content = generate_chinese_report_note(
             title, summary, file_path, category, pages, doc_type
@@ -288,7 +316,7 @@ def process_file(file_info: dict, category: str) -> dict:
             title, summary, file_path, category, pages, doc_type
         )
 
-    # 5. 保存笔记
+    # 6. 保存笔记
     date_prefix = datetime.now().strftime("%Y%m%d")
     safe_title = safe_filename(title)
     note_filename = f"{date_prefix}_{safe_title}.md"
