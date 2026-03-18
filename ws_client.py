@@ -35,6 +35,7 @@ from memory_manager import MemoryManager
 from task_logger import TaskLogger
 from intent_router import IntentRouter
 from message_log import message_log  # 入站消息日志
+from offline_recovery import init_offline_recovery, get_offline_recovery  # 离线消息恢复
 
 # 导入飞书 API 模块
 from feishu_api import reply_message, reply_card
@@ -473,6 +474,20 @@ def main():
     print("   支持：文字 | 图片 | 网页链接 | 视频链接")
     print("-" * 50)
 
+    # ⭐ 初始化离线恢复模块（需要获取 bot_id）
+    try:
+        from lark_oapi.api.bot.v3 import GetBotInfoRequest
+        bot_request = GetBotInfoRequest.builder().build()
+        bot_response = client.bot.v3.botInfo.get(bot_request)
+        if bot_response.success() and bot_response.data:
+            bot_id = bot_response.data.bot.app_id
+            init_offline_recovery(client, bot_id)
+            print(f"✅ 离线恢复模块已初始化 (bot_id: {bot_id[:8]}...)")
+        else:
+            print(f"⚠️ 获取 bot_id 失败: {bot_response.msg}")
+    except Exception as e:
+        print(f"⚠️ 离线恢复模块初始化失败: {e}")
+
     # ISSUE-003: 断连监控和告警线程
     from datetime import datetime
 
@@ -538,14 +553,18 @@ def main():
         return False
 
     def connection_monitor():
-        """连接监控线程 - 优化版 (v44.4)
+        """连接监控线程 - 优化版 (v44.5)
 
         功能：
         1. 每分钟写入心跳文件（供 watchdog 检测）
         2. 业务消息空闲时记录日志（不发送钉钉告警，避免误报）
+        3. ⭐ 离线恢复检测：长时间空闲后恢复时尝试恢复离线消息
         """
         # 启动时立即写入心跳
         write_heartbeat(status="starting")
+
+        # 离线检测状态
+        was_idle_long = False  # 上一次检查时是否长时间空闲
 
         while True:
             time.sleep(60)  # 每分钟检查一次
@@ -554,6 +573,47 @@ def main():
 
             # 写入心跳（即使空闲也写入，表示服务存活）
             write_heartbeat(status="connected")
+
+            # 检测长时间空闲（超过 5 分钟）
+            is_idle_long = event_idle > 300  # 5 分钟
+
+            # ⭐ 离线恢复检测：从长时间空闲恢复到活跃
+            if was_idle_long and not is_idle_long:
+                # 刚从长时间空闲恢复，尝试离线恢复
+                offline_recovery = get_offline_recovery()
+                if offline_recovery and offline_recovery.should_recover(threshold_seconds=300):
+                    idle_minutes = int(event_idle / 60)
+                    print(f"🔄 检测到离线恢复（空闲 {idle_minutes} 分钟），尝试恢复离线消息...")
+
+                    # 获取最近活跃用户
+                    active_user = load_active_user()
+                    if active_user:
+                        try:
+                            # 获取私聊会话 ID
+                            chat_id = offline_recovery.get_p2p_chat_id(active_user)
+                            if chat_id:
+                                # 恢复离线消息
+                                since_time = offline_recovery.state.get("last_disconnect_time", time.time() - 3600)
+                                messages = offline_recovery.recover_messages(chat_id, since_time)
+                                if messages:
+                                    print(f"📬 恢复了 {len(messages)} 条离线消息")
+                                    # 处理恢复的消息（模拟消息事件）
+                                    for msg in messages[-5:]:  # 最多处理最近 5 条
+                                        print(f"   📨 离线消息: {msg.content[:50] if msg.content else 'N/A'}...")
+                        except Exception as e:
+                            print(f"⚠️ 离线恢复失败: {e}")
+
+                    # 记录重连时间
+                    offline_recovery.record_reconnect()
+
+            # 更新空闲状态
+            was_idle_long = is_idle_long
+
+            # 长时间空闲时记录断连时间
+            if is_idle_long and not was_idle_long:
+                offline_recovery = get_offline_recovery()
+                if offline_recovery:
+                    offline_recovery.record_disconnect()
 
             # 业务消息空闲超过 30 分钟才记录日志（不再发送钉钉告警）
             if event_idle > 1800:  # 30 分钟
