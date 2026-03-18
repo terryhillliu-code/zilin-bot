@@ -231,8 +231,8 @@ class AppConfig:
         self.asr_policy = os.getenv("ASR_POLICY", "auto")
         self.local_asr_model = os.getenv("LOCAL_ASR_MODEL", "small")
 
-        # 输出配置
-        output_dir = os.getenv("OUTPUT_DIR", "~/Documents/ZhiweiVault/Inbox")
+        # 输出配置（视频笔记专属目录）
+        output_dir = os.getenv("OUTPUT_DIR", "~/Documents/ZhiweiVault/70-79_个人笔记_Personal/72_视频笔记_Video-Distill")
         self.output_dir = Path(output_dir).expanduser()
 
         # 日志级别
