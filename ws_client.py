@@ -34,6 +34,7 @@ import signal
 from memory_manager import MemoryManager
 from task_logger import TaskLogger
 from intent_router import IntentRouter
+from message_log import message_log  # 入站消息日志
 
 # 导入飞书 API 模块
 from feishu_api import reply_message, reply_card
@@ -281,10 +282,39 @@ def do_p2_im_message_receive_v1(data) -> None:
         pass
 
     print(f"📡 [Event] 收到消息：type={msg_type}, id={message_id}")
-    
+
     # 更新最后事件时间以监控连接状态
     connection_status["last_event"] = time.time()
     connection_status["connected"] = True
+
+    # ⭐ 入站消息日志（在去重之前记录，确保所有消息都被记录）
+    try:
+        # 提取用户 ID 用于日志
+        sender = data.event.sender if hasattr(data, 'event') else None
+        log_user_id = "unknown"
+        if sender and hasattr(sender, 'sender_id') and sender.sender_id:
+            log_user_id = sender.sender_id.open_id or sender.sender_id.user_id or "unknown"
+
+        # 提取内容摘要
+        log_content = None
+        try:
+            if hasattr(data.event, 'message') and data.event.message.content:
+                import json
+                content_dict = json.loads(data.event.message.content)
+                if msg_type == "text":
+                    log_content = content_dict.get("text", "")[:500]
+                elif msg_type == "image":
+                    log_content = f"image_key: {content_dict.get('image_key', '')}"
+                elif msg_type == "audio":
+                    log_content = f"file_key: {content_dict.get('file_key', '')}"
+                else:
+                    log_content = str(content_dict)[:500]
+        except:
+            pass
+
+        message_log.log(message_id, log_user_id, msg_type, log_content)
+    except Exception as e:
+        print(f"⚠️ 消息日志记录异常: {e}")
 
     try:
         event = data.event
