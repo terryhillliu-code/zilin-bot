@@ -833,9 +833,13 @@ class MediaExtractor:
 
         抖音平台：使用本地 douyin-api 服务获取下载链接
         其他平台：使用 yt-dlp 下载
+
+        Raises:
+            ValueError: 抖音 API 调用失败时抛出，包含详细错误信息
         """
         # 抖音平台：使用本地 API
         if video_info.platform == "douyin":
+            # 不捕获异常，让 API 错误正确传播
             return self._extract_douyin_audio(video_info, output_path)
 
         # 其他平台：使用 yt-dlp
@@ -963,13 +967,14 @@ class MediaExtractor:
 
         except ValueError as e:
             logger.error(f"Douyin API error: {e}")
-            return False
+            # ⭐ 重新抛出异常，让上层能够正确分类和记录错误
+            raise
         except subprocess.TimeoutExpired:
             logger.error("ffmpeg timeout (>120s)")
-            return False
+            raise TimeoutError("ffmpeg timeout while extracting audio")
         except Exception as e:
             logger.error(f"Douyin audio extraction failed: {e}")
-            return False
+            raise
 
 
 # ============================================================================
