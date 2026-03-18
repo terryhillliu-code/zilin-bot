@@ -10,7 +10,7 @@ Created: 2026-03-18
 import time
 import json
 import lark_oapi as lark
-from lark_oapi.api.im.v1 import ListMessageRequest, GetConversationRequest
+from lark_oapi.api.im.v1 import ListMessageRequest
 from typing import Optional, List
 from pathlib import Path
 
