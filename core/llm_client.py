@@ -71,12 +71,12 @@ class LLMClient:
     # 角色到模型的映射
     ROLE_MODELS = {
         "chat": "qwen3.5-plus",      # 知微 - 对话
-        "research": "kimi-k2.5",     # 探微 - 研究
+        "research": "qwen3.5-plus",  # 探微 - 研究
         "format": "qwen3.5-plus",    # 通微 - 格式化
-        "distill": "kimi-k2.5",      # 蒸微 - 视频知识蒸馏（快速、精炼）
+        "distill": "qwen3.5-plus",   # 蒸微 - 视频知识蒸馏
         "dev": "glm-5",             # 执微 - 代码开发（与 Claude Code 默认模型一致）
         "main": "qwen3.5-plus",      # 兼容 OpenClaw main agent
-        "researcher": "kimi-k2.5",   # 兼容 OpenClaw researcher agent
+        "researcher": "qwen3.5-plus", # 兼容 OpenClaw researcher agent
         "operator": "qwen3.5-plus",  # 兼容 OpenClaw operator agent
     }
 
@@ -96,9 +96,7 @@ class LLMClient:
     # 模型降级链
     FALLBACK_CHAIN = {
         "qwen3.5-plus": ["glm-5", "MiniMax-M2.5"],
-        "kimi-k2.5": ["qwen3-max-2026-01-23", "qwen3.5-plus", "glm-5"],
         "qwen3-max-2026-01-23": ["qwen3.5-plus", "glm-5"],
-        "glm-5": ["MiniMax-M2.5"],
         "glm-5": [],  # 执微使用 glm-5，无需降级
     }
 

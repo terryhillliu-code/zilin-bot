@@ -1828,7 +1828,7 @@ class KnowledgeDistiller:
     知识蒸馏引擎
 
     使用统一 LLM 客户端 (llm_client.py) 进行知识提取
-    默认使用 kimi-k2.5 模型，自动降级到 qwen3-max-2026-01-23 → qwen3.5-plus → glm-5
+    默认使用 qwen3.5-plus 模型，自动降级到 glm-5 → MiniMax-M2.5
     """
 
     SYSTEM_PROMPT = """你是一个专业的知识提取助手，擅长将视频内容转化为结构化的知识笔记。
@@ -1926,11 +1926,11 @@ class KnowledgeDistiller:
         from llm_client import llm_client
 
         self.llm_client = llm_client
-        logger.info("Using unified LLM client with distill role (kimi-k2.5)")
+        logger.info("Using unified LLM client with distill role (qwen3.5-plus)")
 
     def distill(self, video_info: VideoInfo, transcript: TranscriptResult) -> DistilledKnowledge:
         """执行知识蒸馏（使用统一客户端自动降级）"""
-        logger.info("Distilling knowledge with distill role (kimi-k2.5 + auto-fallback)")
+        logger.info("Distilling knowledge with distill role (qwen3.5-plus + auto-fallback)")
 
         # 构建提示
         user_prompt = self.USER_PROMPT_TEMPLATE.format(
