@@ -7,6 +7,7 @@
 - Prompt 资产化（存放在 prompts/ 目录）
 - 记忆管理（通过 memory_manager）
 - RAG 增强（通过 zhiwei-rag，可选降级）
+- 问题分解（复杂问题自动拆分）⭐ v46.0 新增
 
 使用：
     from chat_handler import chat_handler
@@ -36,17 +37,22 @@ class ChatHandler:
     核心方法：
     - handle(message, session_id) -> str  # 异步
     - handle_sync(message, session_id) -> str  # 同步包装
+
+    v46.0 新增：
+    - 问题分解能力（复杂问题自动拆分为子问题）
     """
 
     def __init__(
         self,
         prompts_dir: Optional[str] = None,
         enable_rag: bool = True,
-        enable_memory: bool = True
+        enable_memory: bool = True,
+        enable_decompose: bool = True  # ⭐ v46.0 新增
     ):
         self.prompts_dir = Path(prompts_dir or Path(__file__).parent / "prompts")
         self.enable_rag = enable_rag
         self.enable_memory = enable_memory
+        self.enable_decompose = enable_decompose
 
         # 导入 LLM 客户端
         try:
@@ -83,6 +89,17 @@ class ChatHandler:
             except ImportError:
                 logger.warning("⚠️ RAG 桥接不可用")
                 self.enable_rag = False
+
+        # 问题分解器 ⭐ v46.0 新增
+        self._decomposer = None
+        if self.enable_decompose and self.llm:
+            try:
+                from core.question_decomposer import QuestionDecomposer
+                self._decomposer = QuestionDecomposer(self.llm)
+                logger.info("✅ 问题分解器加载成功")
+            except ImportError:
+                logger.warning("⚠️ 问题分解器不可用")
+                self.enable_decompose = False
 
         # 加载 system prompt
         self._system_prompt_cache = {}
@@ -185,6 +202,30 @@ class ChatHandler:
             return "❌ 系统暂时不可用，请稍后重试"
 
         try:
+            # ⭐ v46.0 新增：问题分解
+            if self.enable_decompose and self._decomposer:
+                if self._decomposer.should_decompose(message):
+                    return await self._handle_complex_question(message, session_id, role)
+
+            # 直接回答（简单问题）
+            return await self._answer_single(message, session_id, role)
+
+        except Exception as e:
+            logger.error(f"❌ 对话处理异常: {e}")
+            return f"❌ 处理出错: {str(e)}"
+
+    async def _answer_single(
+        self,
+        message: str,
+        session_id: str,
+        role: str = "main"
+    ) -> str:
+        """
+        回答单个问题（内部方法）
+
+        用于处理简单问题，或分解后的子问题。
+        """
+        try:
             # 1. 加载 system prompt
             system_prompt = self._load_prompt("main_agent")
 
@@ -229,8 +270,59 @@ class ChatHandler:
             return response
 
         except Exception as e:
-            logger.error(f"❌ 对话处理异常: {e}")
+            logger.error(f"❌ 单问题处理异常: {e}")
             return f"❌ 处理出错: {str(e)}"
+
+    async def _handle_complex_question(
+        self,
+        message: str,
+        session_id: str,
+        role: str = "main"
+    ) -> str:
+        """
+        处理复杂问题（分解模式）
+
+        工作流程：
+        1. 分解问题为子问题
+        2. 逐一回答子问题
+        3. 综合答案生成最终回复
+        """
+        logger.info(f"[ChatHandler] 进入问题分解模式: {message[:50]}...")
+
+        # 1. 分解问题
+        sub_questions = await asyncio.get_event_loop().run_in_executor(
+            None,
+            self._decomposer.decompose,
+            message
+        )
+
+        if len(sub_questions) == 1:
+            # 分解失败，退化为直接回答
+            return await self._answer_single(message, session_id, role)
+
+        # 2. 逐一回答子问题
+        sub_answers = []
+        for i, sq in enumerate(sub_questions):
+            logger.info(f"[ChatHandler] 回答子问题 {i+1}/{len(sub_questions)}: {sq[:30]}...")
+            answer = await self._answer_single(sq, session_id, role)
+            sub_answers.append(answer)
+
+        # 3. 综合答案
+        logger.info("[ChatHandler] 综合各子问题答案...")
+        final_response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            self._decomposer.synthesize,
+            message,
+            sub_answers
+        )
+
+        # 4. 保存记忆（保存完整对话）
+        if self.enable_memory:
+            mm = self._get_memory_manager(session_id)
+            if mm:
+                mm.add_turn(message, final_response)
+
+        return final_response
 
     def handle_sync(
         self,
