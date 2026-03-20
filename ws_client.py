@@ -243,24 +243,13 @@ def call_openclaw_agent(message: str, session_id: str, agent: str = "main") -> s
     handler = get_chat_handler()
     return handler.handle_sync(message, session_id, role=agent)
 
-
-# 占位函数（遗留接口兼容）
-def detect_chain_intent(text: str):
-    """检测链式意图 - 占位函数"""
-    return None
-
-def execute_chain(intent: str, context: dict):
-    """执行链式操作 - 占位函数"""
-    return None
-
-
 # 初始化命令处理模块（需要 call_openclaw_agent 已定义）
 from command_handler import init_command_handler
 init_command_handler(
     reply_message, reply_card, call_openclaw_agent, query_knowledge_base,
     get_memory, add_to_history, get_history,
     is_article_url, is_video_url, summarize_url, handle_video_async,
-    extract_video_url, extract_article_url, TaskLogger, detect_chain_intent, execute_chain,
+    extract_video_url, extract_article_url, TaskLogger,
     IntentRouter, save_active_user, load_active_user,
     chat_history, pending_voice, pending_image, pending_review,
     MAX_HISTORY, RATE_LIMIT_SECONDS, user_last_request, memory_cache,
