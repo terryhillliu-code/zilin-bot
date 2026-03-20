@@ -68,14 +68,7 @@ RATE_LIMIT_SECONDS = 2
 user_last_request = None
 memory_cache = None
 
-# PDF 解析模块依赖
-pdf_parser = None
-
 # 文章写作模块依赖
-article_writer = None
-
-# 技术对比模块依赖
-tech_compare = None
 
 
 # ========== ISSUE-029: 异步任务超时兜底 ==========
@@ -121,7 +114,6 @@ def init_command_handler(
     global_chat_history, global_pending_voice, global_pending_image, global_pending_review,
     global_MAX_HISTORY, global_RATE_LIMIT_SECONDS, global_user_last_request, global_memory_cache,
     global_get_chat_handler=None,  # V2-203: 新增 chat_handler
-    global_article_writer=None, global_tech_compare=None,
     global_pending_video_confirm=None  # 视频重复确认
 ):
     """初始化命令处理模块的全局依赖"""
@@ -132,7 +124,6 @@ def init_command_handler(
     global save_active_user, load_active_user
     global chat_history, pending_voice, pending_image, pending_review, pending_video_confirm
     global MAX_HISTORY, RATE_LIMIT_SECONDS, user_last_request, memory_cache
-    global pdf_parser, article_writer, tech_compare
     global get_chat_handler  # V2-203: 新增
 
     reply_message = global_reply_message
@@ -162,8 +153,6 @@ def init_command_handler(
     RATE_LIMIT_SECONDS = global_RATE_LIMIT_SECONDS
     user_last_request = global_user_last_request
     memory_cache = global_memory_cache
-    article_writer = global_article_writer
-    tech_compare = global_tech_compare
     get_chat_handler = global_get_chat_handler  # V2-203: 新增
     pending_video_confirm = global_pending_video_confirm  # 视频重复确认
 
@@ -171,33 +160,30 @@ def init_command_handler(
 # ========== 帮助信息 ==========
 
 def show_help() -> str:
-    return """🤖 知微 v2.1 - AI 助手 (RAG增强版 PDF版)
+    return """🤖 知微 v2.2 - AI 助手 (RAG增强版)
 
 【智能分工】
 📝 普通对话 → 知微直接回答
 📚 知识库 → 自动触发或用 /ask
-🔍 研究分析 → 自动转给探微
-💻 编程开发 → 自动转给筑微
-📢 推送运营 → 自动转给通微
+💻 开发任务 → /dev 提交
 
-【新增命令】
+【命令列表】
 /dev <需求> - 提交开发任务（修改代码/配置）
 /收录 <URL> - 收录网页到知识库
 /ask <问题> - 强制查询本地知识库
-/pdf <file_key> - 解析飞书PDF文档（异步）
-/写稿 <主题> - 撰写文章（自动检索 + AI生成）
-/对比 A vs B - 技术对比（生成对比表格）
-/status - 查看知识库收录状态（含向量化进度）
-回复「好」或「不要」 - 审批开发任务
+/status - 查看系统状态
+/reset - 重置对话记忆
+/tasks - 查看待办任务
+/model - 查看当前模型
 
-【性能优化】
-⚡ RAG 检索延迟已优化，响应更快
+【审批确认】
+回复「好」或「不要」- 审批/拒绝开发任务
 
 【原有支持】
 📝 文字 - AI 多轮对话（带记忆）
 🖼️ 图片 - 图片分析 + 追问
 🌐 网页链接 - 自动抓取总结
-🎬 视频链接 - 抖音/YouTube/B站
+🎬 视频链接 - 抖音/B站等平台
 
 💡 直接发消息，我会自动判断是否查资料！"""
 
@@ -575,120 +561,6 @@ def handle_text_async(text: str, user_id: str, message_id: str):
                 reply_message(message_id, f"📚 **知识库结果 (旧)**\n\n{rag_result}")
             else:
                 reply_message(message_id, "❌ 知识库中未找到相关内容")
-            return
-
-        # PDF 文档解析 (knowledge-collect 子功能)
-        if text_lower.startswith("/pdf ") or text_lower.startswith("解析PDF "):
-            file_key = text_stripped.split(" ", 1)[1] if " " in text_stripped else ""
-            if not file_key:
-                reply_message(message_id, "❌ 请提供 PDF 文件的 file_key\n\n用法: /pdf <file_key>")
-                return
-
-            reply_message(message_id, f"📄 正在解析 PDF 文档...\n\n⏳ 请稍候，提取内容可能需要几分钟")
-
-            # 异步调用 PDF 解析模块
-            def _process_pdf_task():
-                try:
-                    _add_scheduler_path()
-                    # 动态导入 pdf_parser 模块
-                    import pdf_parser as pdf_mod
-
-                    # 检查模块是否已初始化
-                    if pdf_mod.client is None:
-                        pdf_mod.init_pdf_parser(client, reply_message, TaskLogger, time)
-
-                    pdf_mod.handle_pdf_async(message_id, file_key, user_id)
-                except Exception as e:
-                    traceback.print_exc()
-                    reply_message(message_id, f"❌ PDF 解析异常: {str(e)}")
-
-            thread = threading.Thread(target=_process_pdf_task, daemon=True)
-            thread.start()
-            return
-
-        # T-069: /写稿 命令 - 生成文章 (ISSUE-029: 添加超时兜底)
-        if text_lower.startswith("/写稿 ") or text_lower.startswith("写稿 "):
-            topic = text_stripped.split(" ", 1)[1] if " " in text_stripped else ""
-            if not topic:
-                reply_message(message_id, "❌ 请提供文章主题\n\n用法：/写稿 AI Agent 技术趋势")
-                return
-
-            # 发送确认消息，告知已开始生成
-            reply_message(message_id, f"✅ /写稿 任务已接收，主题：「{topic}」\n\n📝 文章生成中，请稍候...\n⏰ 预计 2-3 分钟，完成后将主动推送给您")
-
-            # 传递用户 ID，用于后续主动推送结果
-            user_id_for_callback = user_id
-
-            # 异步调用文章写作模块 (ISSUE-029: 使用 run_with_timeout 包装)
-            def _process_article_task():
-                try:
-                    _add_scheduler_path()
-                    # 动态导入 article_writer 模块
-                    import article_writer as aw
-
-                    # 调用修改后的 write_article，传入用户 ID 用于回调
-                    article = aw.write_article(topic, user_id_for_callback)
-
-                    # 不再使用 reply_message，因为是在后台线程中执行
-                    # 结果将由 article_writer 通过 send_direct_message 主动推送
-                except Exception as e:
-                    print(f"❌ 文章写作异常：{e}")
-                    traceback.print_exc()
-                    # 发送错误信息给用户
-                    from feishu_api import send_direct_message
-                    send_direct_message(user_id_for_callback, f"❌ 文章生成失败：{str(e)}")
-
-            # ISSUE-029: 使用超时包装，180 秒超时
-            result, error = run_with_timeout(_process_article_task, timeout=180, task_name="写稿")
-            if error:
-                from feishu_api import send_direct_message
-                send_direct_message(user_id_for_callback, error)
-            return
-
-        # T-071: /对比 命令 - 技术对比 (ISSUE-029: 添加超时兜底)
-        if text_lower.startswith("/对比 ") or text_lower.startswith("对比 "):
-            comparison_text = text_stripped.split(" ", 1)[1] if " " in text_stripped else ""
-            if not comparison_text:
-                reply_message(message_id, "❌ 请提供对比项\n\n用法：/对比 React vs Vue")
-                reply_message(message_id, "支持格式：/对比 A vs B / 对比 A vs B / 对比 A 与 B")
-                return
-
-            # 立即回复用户，告知已开始生成
-            reply_message(message_id, f"📊 已开始生成「{comparison_text}」对比\n\n⏳ 预计 2-3 分钟，完成后将主动推送结果")
-
-            # 启动后台线程处理对比任务 (ISSUE-029: 使用 run_with_timeout 包装)
-            def _process_compare_task():
-                try:
-                    _add_scheduler_path()
-                    # 动态导入 tech_compare 模块
-                    import tech_compare as tc
-
-                    # 先解析对比项
-                    item_a, item_b = tc.parse_comparison(comparison_text)
-                    if not item_b:
-                        reply_message(message_id, "❌ 无法解析对比项，请使用 'A vs B' 格式")
-                        return
-
-                    # 调用对比函数并传入用户 ID 以便主动推送结果
-                    result = tc.compare_tech(item_a, item_b, user_id)
-
-                    # 如果推送失败，可以提供一个备用的反馈
-                    print(f"📊 技术对比任务完成，结果已推送给用户 {user_id}")
-                except Exception as e:
-                    print(f"❌ 技术对比异常：{e}")
-                    traceback.print_exc()
-                    # 尝试推送错误信息给用户
-                    try:
-                        from feishu_api import send_direct_message
-                        send_direct_message(user_id, f"❌ 对比生成失败：{str(e)}")
-                    except:
-                        reply_message(message_id, f"❌ 对比生成失败：{str(e)}")
-
-            # ISSUE-029: 使用超时包装，90 秒超时
-            result, error = run_with_timeout(_process_compare_task, timeout=90, task_name="对比")
-            if error:
-                from feishu_api import send_direct_message
-                send_direct_message(user_id, error)
             return
 
         # T-065: 收录网页到知识库 — 调用 knowledge-collect Skill
