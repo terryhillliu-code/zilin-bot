@@ -474,17 +474,14 @@ def main():
     print("   支持：文字 | 图片 | 网页链接 | 视频链接")
     print("-" * 50)
 
-    # ⭐ 初始化离线恢复模块（需要获取 bot_id）
+    # ⭐ 初始化离线恢复模块（直接从环境变量获取 bot_id）
     try:
-        from lark_oapi.api.bot.v3 import GetBotInfoRequest
-        bot_request = GetBotInfoRequest.builder().build()
-        bot_response = client.bot.v3.botInfo.get(bot_request)
-        if bot_response.success() and bot_response.data:
-            bot_id = bot_response.data.bot.app_id
+        bot_id = os.getenv("FEISHU_APP_ID")
+        if bot_id:
             init_offline_recovery(client, bot_id)
             print(f"✅ 离线恢复模块已初始化 (bot_id: {bot_id[:8]}...)")
         else:
-            print(f"⚠️ 获取 bot_id 失败: {bot_response.msg}")
+            print("⚠️ 未找到 FEISHU_APP_ID 环境变量，离线恢复模块未启用")
     except Exception as e:
         print(f"⚠️ 离线恢复模块初始化失败: {e}")
 
