@@ -1,6 +1,8 @@
 """
 命令处理模块
 处理所有飞书命令和核心文本消息逻辑
+
+v47.0 重构: 使用 CommandContext 替代全局变量
 """
 
 import os
@@ -13,9 +15,17 @@ import re
 import threading
 import datetime
 import sys
-from collections import deque
+from collections import deque, defaultdict
 import traceback
 from pathlib import Path
+
+# 导入上下文模块
+from command_context import (
+    CommandContext,
+    get_context,
+    set_context,
+    init_context_from_globals
+)
 
 # 导入 RAG 桥接
 try:
@@ -38,72 +48,9 @@ def _add_scheduler_path():
         sys.path.insert(0, os.path.expanduser("~/zhiwei-scheduler"))
         sys_path_added = True
 
-# 导入依赖（由 ws_client.py 初始化）
-reply_message = None
-reply_card = None
-call_openclaw_agent = None
-get_chat_handler = None  # V2-203: 新增
-query_knowledge_base = None
-get_memory = None
-add_to_history = None
-get_history = None
-is_article_url = None
-is_video_url = None
-summarize_url = None
-handle_video_async = None
-extract_video_url = None
-TaskLogger = None
-detect_chain_intent = None
-execute_chain = None
-IntentRouter = None
-save_active_user = None
-load_active_user = None
-chat_history = None
-pending_voice = None
-pending_image = None
-pending_review = None
-pending_video_confirm = None  # 等待视频重复确认
-MAX_HISTORY = 20
-RATE_LIMIT_SECONDS = 2
-user_last_request = None
-memory_cache = None
 
-# 文章写作模块依赖
-
-
-# ========== ISSUE-029: 异步任务超时兜底 ==========
-
-def run_with_timeout(func, args=(), timeout=300, task_name="任务"):
-    """带超时的线程执行器 (ISSUE-029)
-    
-    Args:
-        func: 要执行的函数
-        args: 函数参数
-        timeout: 超时时间 (秒)
-        task_name: 任务名称 (用于错误提示)
-    
-    Returns:
-        (result, error): 成功时 result 为返回值，失败时 error 为错误信息
-    """
-    result = {"done": False, "error": None, "output": None}
-    
-    def wrapper():
-        try:
-            result["output"] = func(*args)
-            result["done"] = True
-        except Exception as e:
-            result["error"] = str(e)
-    
-    thread = threading.Thread(target=wrapper, daemon=True)
-    thread.start()
-    thread.join(timeout)
-    
-    if not result["done"]:
-        return None, f"⏰ {task_name}超时（超过 {timeout} 秒），请稍后重试"
-    elif result["error"]:
-        return None, f"❌ {task_name}失败：{result['error']}"
-    return result["output"], None
-
+# ========== 兼容接口: init_command_handler ==========
+# 保留旧的初始化函数签名，内部使用 CommandContext
 
 def init_command_handler(
     global_reply_message, global_reply_card, global_call_openclaw_agent, global_query_knowledge_base,
@@ -113,46 +60,84 @@ def init_command_handler(
     global_IntentRouter, global_save_active_user, global_load_active_user,
     global_chat_history, global_pending_voice, global_pending_image, global_pending_review,
     global_MAX_HISTORY, global_RATE_LIMIT_SECONDS, global_user_last_request, global_memory_cache,
-    global_get_chat_handler=None,  # V2-203: 新增 chat_handler
-    global_pending_video_confirm=None  # 视频重复确认
+    global_get_chat_handler=None,
+    global_pending_video_confirm=None
 ):
-    """初始化命令处理模块的全局依赖"""
-    global reply_message, reply_card, call_openclaw_agent, query_knowledge_base
-    global get_memory, add_to_history, get_history
-    global is_article_url, is_video_url, summarize_url, handle_video_async, extract_video_url, extract_article_url
-    global TaskLogger, IntentRouter
-    global save_active_user, load_active_user
-    global chat_history, pending_voice, pending_image, pending_review, pending_video_confirm
-    global MAX_HISTORY, RATE_LIMIT_SECONDS, user_last_request, memory_cache
-    global get_chat_handler  # V2-203: 新增
+    """
+    初始化命令处理模块（兼容接口）
 
-    reply_message = global_reply_message
-    reply_card = global_reply_card
-    call_openclaw_agent = global_call_openclaw_agent
-    query_knowledge_base = global_query_knowledge_base
-    get_memory = global_get_memory
-    add_to_history = global_add_to_history
-    get_history = global_get_history
-    is_article_url = global_is_article_url
-    is_video_url = global_is_video_url
-    summarize_url = global_summarize_url
-    handle_video_async = global_handle_video_async
-    extract_video_url = global_extract_video_url
-    extract_article_url = global_extract_article_url
-    TaskLogger = global_TaskLogger
-    IntentRouter = global_IntentRouter
-    save_active_user = global_save_active_user
-    load_active_user = global_load_active_user
-    chat_history = global_chat_history
-    pending_voice = global_pending_voice
-    pending_image = global_pending_image
-    pending_review = global_pending_review
-    MAX_HISTORY = global_MAX_HISTORY
-    RATE_LIMIT_SECONDS = global_RATE_LIMIT_SECONDS
-    user_last_request = global_user_last_request
-    memory_cache = global_memory_cache
-    get_chat_handler = global_get_chat_handler  # V2-203: 新增
-    pending_video_confirm = global_pending_video_confirm  # 视频重复确认
+    v47.0: 内部使用 CommandContext 替代全局变量
+    """
+    context = init_context_from_globals(
+        reply_message=global_reply_message,
+        reply_card=global_reply_card,
+        call_openclaw_agent=global_call_openclaw_agent,
+        query_knowledge_base=global_query_knowledge_base,
+        get_memory=global_get_memory,
+        add_to_history=global_add_to_history,
+        get_history=global_get_history,
+        is_article_url=global_is_article_url,
+        is_video_url=global_is_video_url,
+        summarize_url=global_summarize_url,
+        handle_video_async=global_handle_video_async,
+        extract_video_url=global_extract_video_url,
+        extract_article_url=global_extract_article_url,
+        TaskLogger=global_TaskLogger,
+        IntentRouter=global_IntentRouter,
+        save_active_user=global_save_active_user,
+        load_active_user=global_load_active_user,
+        chat_history=global_chat_history,
+        pending_voice=global_pending_voice,
+        pending_image=global_pending_image,
+        pending_review=global_pending_review,
+        MAX_HISTORY=global_MAX_HISTORY,
+        RATE_LIMIT_SECONDS=global_RATE_LIMIT_SECONDS,
+        user_last_request=global_user_last_request,
+        memory_cache=global_memory_cache,
+        get_chat_handler=global_get_chat_handler,
+        pending_video_confirm=global_pending_video_confirm,
+    )
+
+    # 验证必需的依赖
+    missing = context.validate()
+    if missing:
+        print(f"⚠️ CommandContext 缺少必需依赖: {missing}")
+
+    return context
+
+
+# ========== ISSUE-029: 异步任务超时兜底 ==========
+
+def run_with_timeout(func, args=(), timeout=300, task_name="任务"):
+    """带超时的线程执行器 (ISSUE-029)
+
+    Args:
+        func: 要执行的函数
+        args: 函数参数
+        timeout: 超时时间 (秒)
+        task_name: 任务名称 (用于错误提示)
+
+    Returns:
+        (result, error): 成功时 result 为返回值，失败时 error 为错误信息
+    """
+    result = {"done": False, "error": None, "output": None}
+
+    def wrapper():
+        try:
+            result["output"] = func(*args)
+            result["done"] = True
+        except Exception as e:
+            result["error"] = str(e)
+
+    thread = threading.Thread(target=wrapper, daemon=True)
+    thread.start()
+    thread.join(timeout)
+
+    if not result["done"]:
+        return None, f"⏰ {task_name}超时（超过 {timeout} 秒），请稍后重试"
+    elif result["error"]:
+        return None, f"❌ {task_name}失败：{result['error']}"
+    return result["output"], None
 
 
 # ========== 帮助信息 ==========
@@ -189,7 +174,39 @@ def show_help() -> str:
 # ========== 核心：文本消息处理 ==========
 
 def handle_text_async(text: str, user_id: str, message_id: str):
-    """异步处理文本消息 - 带记忆、路由和RAG"""
+    """异步处理文本消息 - 带记忆、路由和RAG
+
+    v47.0: 使用 CommandContext 替代全局变量
+    """
+    # 从上下文获取依赖
+    ctx = get_context()
+
+    # 解构上下文到局部变量（兼容旧代码）
+    reply_message = ctx.reply_message
+    reply_card = ctx.reply_card
+    pending_review = ctx.pending_review
+    pending_video_confirm = ctx.pending_video_confirm
+    pending_voice = ctx.pending_voice
+    pending_image = ctx.pending_image
+    get_memory = ctx.get_memory
+    add_to_history = ctx.add_to_history
+    get_history = ctx.get_history
+    get_chat_handler = ctx.get_chat_handler
+    call_openclaw_agent = ctx.call_openclaw_agent
+    query_knowledge_base = ctx.query_knowledge_base
+    TaskLogger = ctx.TaskLogger
+    IntentRouter = ctx.IntentRouter
+    is_article_url = ctx.is_article_url
+    is_video_url = ctx.is_video_url
+    summarize_url = ctx.summarize_url
+    handle_video_async = ctx.handle_video_async
+    extract_video_url = ctx.extract_video_url
+    extract_article_url = ctx.extract_article_url
+    detect_chain_intent = ctx.detect_chain_intent
+    execute_chain = ctx.execute_chain
+    user_last_request = ctx.user_last_request
+    RATE_LIMIT_SECONDS = ctx.RATE_LIMIT_SECONDS
+
     try:
         text_stripped = text.strip()
         text_lower = text_stripped.lower()
