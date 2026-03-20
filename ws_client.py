@@ -340,6 +340,12 @@ def do_p2_im_message_receive_v1(data) -> None:
         if temp_user_id != "unknown":
             save_active_user(temp_user_id)
 
+            # ⭐ 同时缓存 chat_id 用于离线恢复
+            if hasattr(message, 'chat_id') and message.chat_id:
+                offline_recovery = get_offline_recovery()
+                if offline_recovery:
+                    offline_recovery.cache_chat_id(temp_user_id, message.chat_id)
+
         if not check_rate_limit(temp_user_id):
             print(f"⚠️ 限流：{temp_user_id}")
             return

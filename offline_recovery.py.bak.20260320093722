@@ -5,7 +5,6 @@
 - Phase 3 of 飞书消息离线恢复方案
 
 Created: 2026-03-18
-Updated: 2026-03-20 - 移除不存在的 API，改用运行时缓存 chat_id
 """
 
 import time
@@ -29,16 +28,11 @@ class OfflineRecovery:
 
     def _load_state(self):
         """加载离线状态"""
-        self.state = {
-            "last_disconnect_time": None,
-            "last_reconnect_time": None,
-            "chat_id_cache": {}  # user_id -> chat_id 映射
-        }
+        self.state = {"last_disconnect_time": None, "last_reconnect_time": None}
         try:
             if OFFLINE_STATE_FILE.exists():
                 with open(OFFLINE_STATE_FILE) as f:
-                    loaded = json.load(f)
-                    self.state.update(loaded)
+                    self.state = json.load(f)
         except Exception:
             pass
 
@@ -47,35 +41,9 @@ class OfflineRecovery:
         try:
             OFFLINE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
             with open(OFFLINE_STATE_FILE, "w") as f:
-                json.dump(self.state, f, indent=2)
+                json.dump(self.state, f)
         except Exception as e:
             print(f"⚠️ 保存离线状态失败: {e}")
-
-    def cache_chat_id(self, user_id: str, chat_id: str):
-        """
-        缓存用户 chat_id（在收到消息时调用）
-
-        Args:
-            user_id: 用户 ID (open_id)
-            chat_id: 私聊会话 ID
-        """
-        if "chat_id_cache" not in self.state:
-            self.state["chat_id_cache"] = {}
-        self.state["chat_id_cache"][user_id] = chat_id
-        self._save_state()
-
-    def get_cached_chat_id(self, user_id: str) -> Optional[str]:
-        """
-        获取缓存的 chat_id
-
-        Args:
-            user_id: 用户 ID (open_id)
-
-        Returns:
-            chat_id 或 None
-        """
-        cache = self.state.get("chat_id_cache", {})
-        return cache.get(user_id)
 
     def record_disconnect(self):
         """记录断连时间"""
@@ -101,23 +69,42 @@ class OfflineRecovery:
 
     def get_p2p_chat_id(self, user_id: str, id_type: str = "open_id") -> Optional[str]:
         """
-        获取与用户的私聊会话 ID（从缓存中获取）
+        获取与用户的私聊会话 ID
 
         Args:
             user_id: 用户 ID
-            id_type: ID 类型 (open_id, user_id, union_id) - 保留参数兼容性
+            id_type: ID 类型 (open_id, user_id, union_id)
 
         Returns:
             私聊会话 ID 或 None
         """
-        # 优先从缓存获取
-        cached = self.get_cached_chat_id(user_id)
-        if cached:
-            return cached
+        try:
+            request = GetConversationRequest.builder() \
+                .build()
 
-        print(f"⚠️ 未找到用户 {user_id[:8]}... 的缓存 chat_id，无法恢复离线消息")
-        print(f"   提示：chat_id 会在收到用户消息时自动缓存")
-        return None
+            # 使用 batch_get_conversation 获取或创建私聊会话
+            # 简化方案：直接使用 user_id 作为 chat_id（私聊场景）
+            # 飞书私聊的 chat_id 格式通常是 oc_ 开头
+
+            # 更可靠的方案：通过 create_conversation API 获取
+            from lark_oapi.api.im.v1 import CreateConversationRequest, CreateConversationRequestBody
+
+            request = CreateConversationRequest.builder() \
+                .request_body(CreateConversationRequestBody.builder()
+                    .user_id_list([user_id])
+                    .build()) \
+                .build()
+
+            response = self.client.im.v1.conversation.create(request)
+            if response.success() and response.data:
+                return response.data.conversation_id
+
+            print(f"⚠️ 获取私聊会话失败: {response.msg}")
+            return None
+
+        except Exception as e:
+            print(f"⚠️ 获取私聊会话异常: {e}")
+            return None
 
     def recover_messages(self, chat_id: str, since_time: float) -> List[dict]:
         """
@@ -131,10 +118,13 @@ class OfflineRecovery:
             消息列表
         """
         try:
-            # 获取最近消息（不使用时间过滤，避免 API 参数问题）
+            # 转换为毫秒时间戳
+            start_time = str(int(since_time * 1000))
+
             request = ListMessageRequest.builder() \
                 .container_id_type("chat") \
                 .container_id(chat_id) \
+                .start_time(start_time) \
                 .page_size(50) \
                 .build()
 
@@ -148,22 +138,11 @@ class OfflineRecovery:
             if messages:
                 print(f"📬 获取到 {len(messages)} 条历史消息")
 
-            # 过滤：1) 机器人发送的消息 2) 时间早于 since_time 的消息
-            since_ms = since_time * 1000
-            user_messages = []
-            for msg in messages:
-                # 跳过机器人发送的消息
-                if not msg.sender or msg.sender.id == self.bot_id:
-                    continue
-                # 按时间过滤（create_time 是毫秒时间戳，可能是字符串或整数）
-                msg_time = getattr(msg, 'create_time', 0)
-                if msg_time:
-                    try:
-                        msg_time = int(msg_time) if isinstance(msg_time, str) else msg_time
-                        if msg_time >= since_ms:
-                            user_messages.append(msg)
-                    except (ValueError, TypeError):
-                        user_messages.append(msg)  # 时间解析失败时保留消息
+            # 过滤机器人发送的消息，只返回用户消息
+            user_messages = [
+                msg for msg in messages
+                if msg.sender and msg.sender.id != self.bot_id
+            ]
 
             return user_messages
 
