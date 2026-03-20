@@ -131,27 +131,51 @@ class OfflineRecovery:
             消息列表
         """
         try:
-            # 获取最近消息（不使用时间过滤，避免 API 参数问题）
-            request = ListMessageRequest.builder() \
-                .container_id_type("chat") \
-                .container_id(chat_id) \
-                .page_size(50) \
-                .build()
+            import time
 
-            response = self.client.im.v1.message.list(request)
+            # 飞书 API 返回消息是时间正序（旧的在前）
+            # 使用 end_time 获取最新消息，然后遍历到末尾
+            now_ms = int(time.time() * 1000)
+            since_ms = since_time * 1000
 
-            if not response.success():
-                print(f"❌ 获取离线消息失败: code={response.code}, msg={response.msg}")
-                return []
+            all_messages = []
+            page_token = None
 
-            messages = response.data.items or []
-            if messages:
-                print(f"📬 获取到 {len(messages)} 条历史消息")
+            # 遍历所有页面获取完整消息列表
+            for _ in range(20):  # 最多 20 页
+                builder = ListMessageRequest.builder() \
+                    .container_id_type("chat") \
+                    .container_id(chat_id) \
+                    .page_size(50)
+
+                if page_token:
+                    builder = builder.page_token(page_token)
+
+                request = builder.build()
+                response = self.client.im.v1.message.list(request)
+
+                if not response.success():
+                    print(f"❌ 获取离线消息失败: code={response.code}, msg={response.msg}")
+                    break
+
+                messages = response.data.items or []
+                all_messages.extend(messages)
+
+                # 检查是否有更多
+                has_more = getattr(response.data, 'has_more', False)
+                if not has_more:
+                    break
+
+                page_token = response.data.page_token
+                if not page_token:
+                    break
+
+            if all_messages:
+                print(f"📬 获取到 {len(all_messages)} 条历史消息")
 
             # 过滤：1) 机器人发送的消息 2) 时间早于 since_time 的消息
-            since_ms = since_time * 1000
             user_messages = []
-            for msg in messages:
+            for msg in all_messages:
                 # 跳过机器人发送的消息
                 if not msg.sender or msg.sender.id == self.bot_id:
                     continue
