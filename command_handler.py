@@ -981,10 +981,21 @@ def get_quick_status() -> str:
 
 
 def check_rate_limit(user_id: str) -> bool:
-    # user_last_request 在 init_command_handler 中初始化为 defaultdict(float)
-    global user_last_request
-    if user_last_request is None:
+    """
+    检查用户请求频率限制
+
+    v47.0 修复: 从 CommandContext 获取变量，而不是使用未定义的全局变量
+    """
+    ctx = get_context()
+    if ctx is None:
         return True  # 未初始化时跳过限流
+
+    user_last_request = ctx.user_last_request
+    RATE_LIMIT_SECONDS = ctx.RATE_LIMIT_SECONDS
+
+    if user_last_request is None:
+        return True
+
     now = time.time()
     last = user_last_request[user_id]
     if now - last < RATE_LIMIT_SECONDS:
