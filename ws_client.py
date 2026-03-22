@@ -140,29 +140,28 @@ def load_active_user() -> str:
 # ========== RAG 知识库功能 (Phase 4 新增) ==========
 
 def query_knowledge_base(query: str, top_k: int = 3) -> str:
-    """通过 rag-api HTTP 接口检索知识库"""
-    import requests
+    """通过子进程调用 bridge.py 检索知识库 (V2-204-Fix2: 隔离依赖环境)"""
+    import subprocess
     try:
-        print(f"📚 RAG 检索：{query}")
-        resp = requests.post(
-            "http://127.0.0.1:8765/search",
-            json={"query": query, "top_k": top_k},
-            timeout=30
+        print(f"📚 RAG 检索 (子进程)：{query}")
+        rag_venv = "/Users/liufang/zhiwei-rag/venv/bin/python3"
+        bridge_script = "/Users/liufang/zhiwei-rag/bridge.py"
+        
+        result = subprocess.run(
+            [rag_venv, bridge_script, "context", query, "--top-k", str(top_k)],
+            capture_output=True, text=True, timeout=40
         )
-        if resp.ok:
-            results = resp.json().get("results", [])
-            if not results:
-                return None
-            return "\n\n".join([r.get("text", "") for r in results])
+        if result.returncode == 0:
+            return result.stdout.strip()
         else:
-            print(f"❌ RAG 检索失败：HTTP {resp.status_code}")
+            print(f"❌ RAG 子进程失败：{result.stderr}")
             return None
-    except requests.Timeout:
-        print("❌ RAG 检索超时")
-        return None
     except Exception as e:
         print(f"❌ RAG 调用异常：{e}")
         return None
+
+
+
 
 # ========== 应用配置 ==========
 

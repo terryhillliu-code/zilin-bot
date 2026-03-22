@@ -178,6 +178,7 @@ def handle_text_async(text: str, user_id: str, message_id: str):
 
     v47.0: 使用 CommandContext 替代全局变量
     """
+    print(f"DEBUG [0]: 进入 handle_text_async, msg_id={message_id}")
     # 从上下文获取依赖
     ctx = get_context()
 
@@ -210,6 +211,25 @@ def handle_text_async(text: str, user_id: str, message_id: str):
     try:
         text_stripped = text.strip()
         text_lower = text_stripped.lower()
+        print(f"DEBUG [1]: 开始处理消息 {message_id}, 内容: {text_stripped[:20]}...")
+
+        # ========== 0. NotebookLM 快速指令 (重构 v2.0) ==========
+        if text_lower.startswith("/notebooklm ") or text_lower.startswith("/report "):
+            try:
+                topic = text_stripped.split(maxsplit=1)[1]
+                reply_message(message_id, f"🚀 收到指令！正在为您深度检索 “{topic}” 的高质量文献并打包素材，请稍候...")
+                
+                # 直接触发执行器
+                from core.research_report_executor import research_executor
+                threading.Thread(
+                    target=research_executor.execute,
+                    args=(topic, user_id, message_id, reply_message, reply_card),
+                    daemon=True
+                ).start()
+                return
+            except IndexError:
+                reply_message(message_id, "❌ 请提供关键词，例如: `/notebooklm 混合专家模型`")
+                return
 
         # ===== 0. 审批确认流程 (T-056) + v34.0: awaiting_review 支持 =====
         if user_id in pending_review:
@@ -833,25 +853,29 @@ def handle_text_async(text: str, user_id: str, message_id: str):
 
         # 6a. 记录到轻量历史
         add_to_history(user_id, "user", text_stripped)
+        print(f"DEBUG [2]: 已记录历史")
 
         # 6b. 获取记忆上下文
         memory = get_memory(user_id)
+        print(f"DEBUG [3]: 已获取 MemoryManager")
         context_prompt = memory.build_context_prompt()
+        print(f"DEBUG [4]: 已构建 Context Prompt (长度: {len(context_prompt)})")
 
-        # 6b-2. 协作链检测
-        chain_name = detect_chain_intent(text_stripped)
-        if chain_name:
-            reply_message(message_id, f"🔗 检测到协作链任务，开始执行...")
-            try:
-                session_id = get_session_id(user_id)
-                chain_response = execute_chain(chain_name, text_stripped, session_id)
-                reply_message(message_id, chain_response)
-                TaskLogger.log_task("协作链", chain_name, text_stripped[:50])
-                return
-            except Exception as e:
-                print(f"❌ 协作链异常: {e}")
-                reply_message(message_id, f"❌ 协作链执行失败: {e}")
-                return
+        # 6b-2. 协作链检测 (仅在已初始化时)
+        if detect_chain_intent and execute_chain:
+            chain_name = detect_chain_intent(text_stripped)
+            if chain_name:
+                reply_message(message_id, f"🔗 检测到协作链任务，开始执行...")
+                try:
+                    session_id = get_session_id(user_id)
+                    chain_response = execute_chain(chain_name, text_stripped, session_id)
+                    reply_message(message_id, chain_response)
+                    TaskLogger.log_task("协作链", chain_name, text_stripped[:50])
+                    return
+                except Exception as e:
+                    print(f"❌ 协作链异常: {e}")
+                    reply_message(message_id, f"❌ 协作链执行失败: {e}")
+                    return
 
         # Phase 4 新增: 智能 RAG 触发 (检测关键词)
         # 如果问题中包含明显查资料意图，或者涉及知识库关键词，自动补充 RAG 结果
@@ -865,7 +889,9 @@ def handle_text_async(text: str, user_id: str, message_id: str):
                 print("✅ 智能 RAG 触发成功")
 
         # 6c. 意图路由
+        print(f"DEBUG [5]: 开始路由意图")
         target_agent = IntentRouter.route(text_stripped)
+        print(f"DEBUG [6]: 路由结果 -> {target_agent}")
 
         # 6d. 构建增强消息 (上下文 + RAG + 问题)
         enriched_message = ""
@@ -914,7 +940,9 @@ def handle_text_async(text: str, user_id: str, message_id: str):
         # 6h. 记录到轻量历史
         add_to_history(user_id, "bot", response)
 
-        # 6i. 回复
+        # 6i. 检查指令拦截 (Research Report) - 已废弃，采用前端本地指令拦截实现
+        
+        # 7. 回复用户
         reply_message(message_id, response)
 
     except Exception as e:
@@ -930,54 +958,14 @@ def get_session_id(user_id: str) -> str:
 
 
 def get_quick_status() -> str:
-    lines = ["📊 系统状态 (v2.1 RAG版)\n"]
-
-    # Docker
+    """获取系统快速状态 (V2-205 优化：复用统一健康检查)"""
     try:
-        result = subprocess.run(
-            "docker ps --format '{{.Names}}: {{.Status}}' | head -3",
-            shell=True, capture_output=True, text=True, timeout=5
-        )
-        lines.append("**容器:**")
-        for line in result.stdout.strip().split('\n')[:3]:
-            if line:
-                lines.append(f"  • {line}")
-    except:
-        lines.append("  • 容器状态获取失败")
-
-    # 模型
-    try:
-        config_path = os.path.expanduser("~/logs/current_model.json")
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                data = json.load(f)
-                lines.append(f"\n**模型:** {data.get('name', '未知')}")
-    except:
-        pass
-
-    # 知识库状态 (查询 Core/Important/Reference 进度)
-    try:
-        db_path = os.path.expanduser("~/Documents/Library/klib.db")
-        conn = sqlite3.connect(db_path)
-        rows = conn.execute(
-            "SELECT priority, COUNT(*) as total, "
-            "SUM(CASE WHEN vectorized = 1 THEN 1 ELSE 0 END) as done "
-            "FROM books GROUP BY priority"
-        ).fetchall()
-        conn.close()
-        
-        lines.append("\n**📊 向量化进度:**")
-        priority_order = ['core', 'important', 'reference']
-        progress = {row[0].lower(): (row[2], row[1]) for row in rows if row[0]}
-        for p in priority_order:
-            done, total = progress.get(p, (0, 0))
-            pct = (done / total * 100) if total > 0 else 0
-            emoji = "🔴" if p == "core" else "🟡" if p == "important" else "⚪"
-            lines.append(f"  {emoji} {p.capitalize()}: {pct:.0f}% ({done}/{total})")
+        from core.health_check import get_system_health_dict, format_health_status
+        status_dict = get_system_health_dict()
+        return format_health_status(status_dict)
     except Exception as e:
-        lines.append(f"  • 向量化进度查询失败: {e}")
+        return f"📊 系统状态获取失败: {e}"
 
-    return "\n".join(lines)
 
 
 def check_rate_limit(user_id: str) -> bool:

@@ -226,8 +226,12 @@ class ChatHandler:
         用于处理简单问题，或分解后的子问题。
         """
         try:
-            # 1. 加载 system prompt
-            system_prompt = self._load_prompt("main_agent")
+            # 1. 加载 system prompt (根据角色加载)
+            prompt_name = f"{role}_agent" if role != "main" else "main_agent"
+            system_prompt = self._load_prompt(prompt_name)
+            if not system_prompt and role != "main":
+                logger.warning(f"⚠️ 角色 {role} 的 Prompt 不存在，退化回 main_agent")
+                system_prompt = self._load_prompt("main_agent")
 
             # 2. RAG 检索增强
             context = ""
