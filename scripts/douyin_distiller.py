@@ -4,10 +4,10 @@
 从抖音/短视频链接自动生成 Obsidian Markdown 笔记
 
 核心流程：
-URL → 解析 → 字幕/ASR → LLM 蒸馏 → Markdown 输出
+URL → 解析 → 字幕/ASR → RAG 背景增强 → LLM 蒸馏 → Markdown 输出
 
 作者: 知微系统
-版本: v1.1.0 (新增失败处理机制)
+版本: v1.2.0 (新增 RAG 背景增强)
 """
 
 import os
@@ -1820,6 +1820,95 @@ class TranscriptPostProcessor:
 
 
 # ============================================================================
+# RAG 背景增强 (v1.2.0 新增)
+# ============================================================================
+
+def extract_keywords_from_transcript(transcript: str, top_n: int = 5) -> list[str]:
+    """
+    从转录文本中提取核心关键词
+
+    策略：提取技术名词、产品名、专有名词
+
+    Args:
+        transcript: 转录文本
+        top_n: 返回关键词数量
+
+    Returns:
+        关键词列表
+    """
+    import re
+
+    # 技术名词模式（大写开头、包含数字版本号、英文术语）
+    tech_patterns = [
+        r'[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*',  # CamelCase
+        r'[A-Z]{2,}',  # 缩写
+        r'\b[A-Za-z]+\d+(?:\.\d+)*\b',  # 带版本号 GPT-4, LLaMA2
+        r'[\u4e00-\u9fa5]{2,}(?:模型|框架|算法|架构|网络|引擎)',  # 中文技术词
+    ]
+
+    keywords = []
+    for pattern in tech_patterns:
+        matches = re.findall(pattern, transcript)
+        keywords.extend(matches)
+
+    # 统计频率并返回 top_n
+    from collections import Counter
+    counter = Counter(keywords)
+
+    # 过滤常见词
+    stopwords = {'的', '了', '是', '在', '我', '我们', '这个', '那个', '就是', '可以'}
+    filtered = [(k, c) for k, c in counter.most_common(20)
+                if k.lower() not in stopwords and len(k) > 1]
+
+    return [k for k, _ in filtered[:top_n]]
+
+
+def retrieve_background_knowledge(keywords: list[str], top_k: int = 3) -> str:
+    """
+    从 zhiwei-rag 检索背景知识
+
+    Args:
+        keywords: 关键词列表
+        top_k: 每个关键词检索数量
+
+    Returns:
+        格式化的背景知识文本
+    """
+    if not keywords:
+        return ""
+
+    try:
+        # 动态导入避免循环依赖
+        rag_path = Path.home() / "zhiwei-rag"
+        if str(rag_path) not in sys.path:
+            sys.path.insert(0, str(rag_path))
+        from retrieve.hybrid_retriever import HybridRetriever
+
+        retriever = HybridRetriever()
+        background_parts = []
+
+        for kw in keywords[:3]:  # 最多检索 3 个关键词
+            results = retriever.search(kw, top_k=top_k, use_rerank=False)
+
+            if results:
+                background_parts.append(f"**{kw}** 相关资料：")
+                for r in results[:2]:  # 每个关键词取前 2 条
+                    source = Path(r.source).stem if r.source else "未知来源"
+                    text = (r.text or r.raw_text or "")[:200]
+                    background_parts.append(f"  - {source}: {text}...")
+                background_parts.append("")
+
+        if background_parts:
+            logger.info(f"[RAG] 检索到 {len(keywords)} 个关键词的背景知识")
+            return "\n".join(background_parts)
+
+    except Exception as e:
+        logger.warning(f"[RAG] 背景检索失败: {e}")
+
+    return ""
+
+
+# ============================================================================
 # 知识蒸馏器
 # ============================================================================
 
@@ -1913,6 +2002,8 @@ class KnowledgeDistiller:
 转录文本：
 {transcript}
 
+{background_section}
+
 请提取知识点并输出 JSON 格式结果。"""
 
     def __init__(self, config: AppConfig):
@@ -1929,15 +2020,35 @@ class KnowledgeDistiller:
         logger.info("Using unified LLM client with distill role (qwen3.5-plus)")
 
     def distill(self, video_info: VideoInfo, transcript: TranscriptResult) -> DistilledKnowledge:
-        """执行知识蒸馏（使用统一客户端自动降级）"""
+        """执行知识蒸馏（使用统一客户端自动降级）
+
+        v1.2.0 新增：RAG 背景增强
+        """
         logger.info("Distilling knowledge with distill role (qwen3.5-plus + auto-fallback)")
+
+        # v1.2.0: RAG 背景增强
+        transcript_text = transcript.to_text()[:8000]  # 限制长度
+        background_section = ""
+
+        try:
+            # 提取关键词
+            keywords = extract_keywords_from_transcript(transcript_text)
+            if keywords:
+                logger.info(f"[RAG] 提取关键词: {keywords}")
+                # 检索背景知识
+                background_knowledge = retrieve_background_knowledge(keywords)
+                if background_knowledge:
+                    background_section = f"**背景知识（来自本地知识库）：**\n{background_knowledge}"
+        except Exception as e:
+            logger.warning(f"[RAG] 背景增强失败，继续无背景处理: {e}")
 
         # 构建提示
         user_prompt = self.USER_PROMPT_TEMPLATE.format(
             platform=video_info.platform,
             duration=video_info.duration,
             author=video_info.author or "未知",
-            transcript=transcript.to_text()[:8000]  # 限制长度
+            transcript=transcript_text,
+            background_section=background_section
         )
 
         try:
