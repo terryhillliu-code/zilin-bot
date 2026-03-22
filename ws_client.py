@@ -388,18 +388,51 @@ def do_p2_im_message_receive_v1(data) -> None:
 
 
 def do_p2_card_action_trigger_v1(data) -> None:
-    """处理卡片交互事件 (审批按钮)"""
+    """处理卡片交互事件 (审批按钮 + v47.0 研究卡片)"""
     try:
         action = data.action
         value = action.value  # 这是一个 dict，包含在卡片定义中
         user_id = data.operator.user_id
-        
+        message_id = data.context.open_message_id
+
         action_type = value.get("action")
         task_id = value.get("task_id")
         plan_name = value.get("plan_name")
-        
+
         print(f"🔘 卡片交互：{action_type} for {plan_name or task_id} by {user_id}")
-        
+
+        # ⭐ v47.0: 研究卡片回调处理
+        if action_type == "start_research":
+            topic = value.get("topic", "")
+            include_videos = value.get("include_videos", "true").lower() == "true"
+
+            print(f"[WSClient] 研究卡片确认: topic={topic}, videos={include_videos}")
+
+            reply_message(message_id, f"🚀 正在为您准备「{topic}」的研究素材...")
+
+            # 触发研究执行器
+            from core.research_report_executor import research_executor
+            research_topic = topic
+            if include_videos:
+                research_topic += " --include-videos"
+
+            threading.Thread(
+                target=research_executor.execute,
+                args=(research_topic, user_id, message_id, reply_message, reply_card),
+                daemon=True
+            ).start()
+            return
+
+        elif action_type == "cancel_research":
+            reply_message(message_id, "✅ 已取消研究")
+            return
+
+        elif action_type == "show_config_form":
+            # TODO: 显示详细配置表单
+            reply_message(message_id, "⚙️ 详细配置功能开发中...")
+            return
+
+        # 原有审批逻辑
         if action_type in ["approve", "reject"]:
             # 发送响应消息到 MessageBus
             mb = MessageBus()
@@ -414,10 +447,10 @@ def do_p2_card_action_trigger_v1(data) -> None:
                     "timestamp": time.time()
                 }
             )
-            
+
             # 更新卡片状态（可选，这里先简单回复一条消息）
-            reply_message(data.context.open_message_id, f"✅ 已收到您的「{ '批准' if action_type == 'approve' else '拒绝' }」操作。正在处理中...")
-            
+            reply_message(message_id, f"✅ 已收到您的「{ '批准' if action_type == 'approve' else '拒绝' }」操作。正在处理中...")
+
     except Exception as e:
         print(f"❌ 处理卡片回调失败：{e}")
 

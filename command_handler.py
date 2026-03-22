@@ -931,19 +931,9 @@ def handle_text_async(text: str, user_id: str, message_id: str):
 
             print(f"[CommandHandler] 触发研究意图: topic={topic}, videos={include_videos}")
 
-            # 发送确认消息
-            reply_message(message_id, f"🚀 检测到研究意图！正在为您准备「{topic}」的研究素材...")
-
-            # 触发研究执行器
-            from core.research_report_executor import research_executor
-            research_topic = topic
-            if include_videos:
-                research_topic += " --include-videos"
-            threading.Thread(
-                target=research_executor.execute,
-                args=(research_topic, user_id, message_id, reply_message, reply_card),
-                daemon=True
-            ).start()
+            # ⭐ v47.0 Phase 2: 发送确认卡片
+            from core.research_card import send_research_config_card
+            send_research_config_card(reply_card, message_id, topic, include_videos)
             return
 
         # 6f. 如果路由到其他Agent，加标注
