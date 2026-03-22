@@ -26,17 +26,34 @@ class ResearchReportExecutor:
             if self.export_root.exists():
                 logger.info(f"清理导出分区... {self.export_root}")
 
-            # 2. 解析 Topic 和 Template
-            # 兼容格式: "主题 --template=podcast" 或 "主题"
+            # 2. 解析 Topic、Template 和 Videos 参数
+            # 兼容格式: "主题 --template=podcast --include-videos" 或 "主题"
             template_key = "default"
             actual_topic = topic
-            if " --template=" in topic:
-                actual_topic, template_key = topic.split(" --template=", 1)
-            elif " --" in topic:
-                 actual_topic = topic.split(" --", 1)[0].strip()
+            include_videos = False
+            video_limit = 5
+
+            # 解析参数
+            remaining = topic
+            if " --template=" in remaining:
+                remaining, template_key = remaining.split(" --template=", 1)
+                template_key = template_key.split(" --")[0].strip()
+            if " --include-videos" in remaining:
+                include_videos = True
+                remaining = remaining.replace(" --include-videos", "")
+            if " --video-limit=" in topic:
+                match = re.search(r"--video-limit=(\d+)", topic)
+                if match:
+                    video_limit = int(match.group(1))
+                    remaining = re.sub(r"--video-limit=\d+", "", remaining)
+            if " --" in remaining:
+                remaining = remaining.split(" --", 1)[0].strip()
+
+            actual_topic = remaining.strip()
 
             # 3. 调用 manage.py export-notebook 执行过滤和导出
             # v2.1: 默认启用 --auto-search，自动从 ArXiv 补充
+            # v2.2: 支持 --include-videos 多源混合导出
             cmd = [
                 str(self.analyzer_python), "scripts/manage.py", "export-notebook",
                 "--query", actual_topic,
@@ -45,6 +62,10 @@ class ResearchReportExecutor:
                 "--template", template_key,
                 "--auto-search"
             ]
+
+            # v2.2: 视频笔记混合导出
+            if include_videos:
+                cmd.extend(["--include-videos", "--video-limit", str(video_limit)])
 
             logger.info(f"执行同步指令: {' '.join(cmd)}")
             result = subprocess.run(cmd, cwd=str(self.analyzer_dir), capture_output=True, text=True, timeout=120)
@@ -56,13 +77,27 @@ class ResearchReportExecutor:
             # 3. 检查生成结果
             # 根据日志判断成功数量 (注意: logging 默认在 stderr)
             combined_output = result.stdout + result.stderr
-            success_match = re.search(r"成功: (\d+) / (\d+)", combined_output)
-            success_count = int(success_match.group(1)) if success_match else 0
+
+            # v2.2: 支持多源导出结果解析
+            total_match = re.search(r"总计: (\d+) 个素材", combined_output)
+            paper_match = re.search(r"- 论文: (\d+)", combined_output)
+            video_match = re.search(r"- 视频笔记: (\d+)", combined_output)
+
+            if total_match:
+                total_count = int(total_match.group(1))
+                paper_count = int(paper_match.group(1)) if paper_match else 0
+                video_count = int(video_match.group(1)) if video_match else 0
+            else:
+                # 兼容旧格式
+                success_match = re.search(r"成功: (\d+) / (\d+)", combined_output)
+                total_count = int(success_match.group(1)) if success_match else 0
+                paper_count = total_count
+                video_count = 0
 
             # 检查是否触发了 ArXiv 搜索
             arxiv_search_triggered = "ArXiv 全时域搜索" in combined_output
 
-            if success_count == 0:
+            if total_count == 0:
                 if arxiv_search_triggered:
                     reply_func(message_id, f"🔍 已尝试从 ArXiv 搜索，但仍未找到关于「{actual_topic}」的高质量文献。请尝试更具体的关键词。")
                 else:
@@ -76,8 +111,13 @@ class ResearchReportExecutor:
             card_content = f"### 📊 「{actual_topic}」研究素材已就绪\n\n"
             if arxiv_search_triggered:
                 card_content += "🌐 已自动从 ArXiv 搜索并补充文献。\n\n"
-            card_content += f"我为您精准筛选并清洗了 **{success_count}** 篇核心文献报告。\n\n"
-            card_content += f"📂 **本地暂存路径**：\n`{self.export_root}`\n\n"
+
+            # v2.2: 多源导出结果展示
+            card_content += f"我为您精准筛选并清洗了 **{total_count}** 个核心素材：\n\n"
+            card_content += f"- 📄 论文：{paper_count} 篇\n"
+            if include_videos and video_count > 0:
+                card_content += f"- 📹 视频笔记：{video_count} 篇\n"
+            card_content += f"\n📂 **本地暂存路径**：\n`{self.export_root}`\n\n"
             card_content += "---\n"
             card_content += "#### 💡 NotebookLM 进阶指令 (建议复制使用)\n"
             card_content += "请将上述文件夹内的文件导入 NotebookLM 后，使用以下提示词开启深度研究：\n\n"
