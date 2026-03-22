@@ -151,7 +151,7 @@ class ChatHandler:
 
     def _retrieve_context(self, query: str, top_k: int = 5) -> str:
         """
-        RAG 检索上下文
+        RAG 检索上下文 (v47.8: 增强来源标注)
 
         Returns:
             检索结果文本，失败返回空字符串
@@ -168,12 +168,59 @@ class ChatHandler:
             for r in results[:3]:
                 source = r.get('source', '')
                 text = r.get('raw_text', r.get('text', ''))[:300]
-                context_parts.append(f"【{source}】\n{text}")
+                metadata = r.get('metadata', {})
+
+                # v47.8: 构建来源标注
+                citation = self._build_citation(source, metadata)
+                context_parts.append(f"{citation}\n{text}")
 
             return "\n\n".join(context_parts)
         except Exception as e:
             logger.warning(f"⚠️ RAG 检索失败: {e}")
             return ""
+
+    def _build_citation(self, source: str, metadata: dict) -> str:
+        """
+        构建来源标注 (v47.8)
+
+        Args:
+            source: 来源文件名
+            metadata: 元数据（含 page, chunk_type, h1 等）
+
+        Returns:
+            格式化的引用标注，如 【PAPER_xxx.pdf, p.3】
+        """
+        # 提取关键信息
+        page = metadata.get('page', 0)
+        chunk_type = metadata.get('chunk_type', 'text')
+        h1 = metadata.get('h1', '')
+
+        # 简化 source 显示（去掉路径前缀）
+        if '/' in source:
+            source = source.split('/')[-1]
+
+        # 构建标注
+        parts = [source]
+
+        # 添加页码（仅 PDF 类型）
+        if page and page > 0:
+            parts.append(f"p.{page}")
+
+        # 添加章节信息（如果有）
+        if h1 and len(h1) < 30:
+            parts.append(f"「{h1}」")
+
+        # 添加内容类型标记（非普通文本）
+        if chunk_type and chunk_type != 'text':
+            type_map = {
+                'figure': '图',
+                'table': '表',
+                'code': '代码',
+            }
+            if chunk_type in type_map:
+                parts.append(f"[{type_map[chunk_type]}]")
+
+        return f"【{' '.join(parts)}】"
 
     def _build_message(
         self,
