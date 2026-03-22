@@ -8,6 +8,7 @@
 - 记忆管理（通过 memory_manager）
 - RAG 增强（通过 zhiwei-rag，可选降级）
 - 问题分解（复杂问题自动拆分）⭐ v46.0 新增
+- 意图识别（NLU 驱动研究触发）⭐ v47.0 新增
 
 使用：
     from chat_handler import chat_handler
@@ -40,6 +41,9 @@ class ChatHandler:
 
     v46.0 新增：
     - 问题分解能力（复杂问题自动拆分为子问题）
+
+    v47.0 新增：
+    - 意图识别（NLU 驱动研究触发）
     """
 
     def __init__(
@@ -47,12 +51,14 @@ class ChatHandler:
         prompts_dir: Optional[str] = None,
         enable_rag: bool = True,
         enable_memory: bool = True,
-        enable_decompose: bool = True  # ⭐ v46.0 新增
+        enable_decompose: bool = True,  # ⭐ v46.0 新增
+        enable_intent: bool = True  # ⭐ v47.0 新增
     ):
         self.prompts_dir = Path(prompts_dir or Path(__file__).parent / "prompts")
         self.enable_rag = enable_rag
         self.enable_memory = enable_memory
         self.enable_decompose = enable_decompose
+        self.enable_intent = enable_intent
 
         # 导入 LLM 客户端
         try:
@@ -62,6 +68,17 @@ class ChatHandler:
         except ImportError as e:
             logger.error(f"❌ LLM 客户端导入失败: {e}")
             self.llm = None
+
+        # ⭐ v47.0 意图识别器
+        self._intent_recognizer = None
+        if self.enable_intent:
+            try:
+                from core.intent_recognizer import IntentRecognizer
+                self._intent_recognizer = IntentRecognizer()
+                logger.info("✅ 意图识别器加载成功")
+            except ImportError as e:
+                logger.warning(f"⚠️ 意图识别器不可用: {e}")
+                self.enable_intent = False
 
         # 导入记忆管理器
         self._memory_manager_class = None
@@ -202,6 +219,13 @@ class ChatHandler:
             return "❌ 系统暂时不可用，请稍后重试"
 
         try:
+            # ⭐ v47.0 新增：意图识别
+            if self.enable_intent and self._intent_recognizer:
+                intent_result = self._intent_recognizer.recognize(message)
+                if intent_result.is_research_intent():
+                    logger.info(f"[ChatHandler] 检测到研究意图: {intent_result.entities.get('topic')}")
+                    return await self._handle_research_intent(intent_result, session_id)
+
             # ⭐ v46.0 新增：问题分解
             if self.enable_decompose and self._decomposer:
                 if self._decomposer.should_decompose(message):
@@ -213,6 +237,42 @@ class ChatHandler:
         except Exception as e:
             logger.error(f"❌ 对话处理异常: {e}")
             return f"❌ 处理出错: {str(e)}"
+
+    async def _handle_research_intent(
+        self,
+        intent_result,
+        session_id: str
+    ) -> str:
+        """
+        处理研究意图 (v47.0 新增)
+
+        当检测到用户想要进行研究时，触发研究执行器。
+
+        Args:
+            intent_result: 意图识别结果
+            session_id: 会话 ID
+
+        Returns:
+            研究确认消息或研究结果
+        """
+        entities = intent_result.entities
+        topic = entities.get("topic", "")
+
+        if not topic:
+            return "请告诉我您想研究什么主题？"
+
+        # 返回特殊标记，让 ws_client 或 command_handler 处理
+        # 格式：[INTENT:RESEARCH]topic|include_videos|source
+        include_videos = entities.get("include_videos")
+        source = entities.get("source")
+
+        params = [topic]
+        if include_videos is not None:
+            params.append(f"videos={'true' if include_videos else 'false'}")
+        if source:
+            params.append(f"source={source}")
+
+        return f"[INTENT:RESEARCH]|{'|'.join(params)}"
 
     async def _answer_single(
         self,

@@ -914,6 +914,38 @@ def handle_text_async(text: str, user_id: str, message_id: str):
         else:
             response = call_openclaw_agent(enriched_message, session_id, agent=target_agent)
 
+        # ⭐ v47.0: 意图识别 - 检测研究意图
+        if response.startswith("[INTENT:RESEARCH]"):
+            # 解析意图参数
+            parts = response.split("|")
+            topic = parts[1] if len(parts) > 1 else text_stripped
+
+            # 解析额外参数
+            include_videos = True  # 默认包含视频
+            source = None
+            for part in parts[2:]:
+                if part.startswith("videos="):
+                    include_videos = part.split("=")[1].lower() == "true"
+                elif part.startswith("source="):
+                    source = part.split("=")[1]
+
+            print(f"[CommandHandler] 触发研究意图: topic={topic}, videos={include_videos}")
+
+            # 发送确认消息
+            reply_message(message_id, f"🚀 检测到研究意图！正在为您准备「{topic}」的研究素材...")
+
+            # 触发研究执行器
+            from core.research_report_executor import research_executor
+            research_topic = topic
+            if include_videos:
+                research_topic += " --include-videos"
+            threading.Thread(
+                target=research_executor.execute,
+                args=(research_topic, user_id, message_id, reply_message, reply_card),
+                daemon=True
+            ).start()
+            return
+
         # 6f. 如果路由到其他Agent，加标注
         if target_agent != "main":
             agent_names = {
