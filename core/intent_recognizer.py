@@ -186,22 +186,53 @@ class IntentRecognizer:
         """
         提取研究主题
 
-        策略：移除匹配的模式词，取剩余部分作为主题
+        策略：识别并移除触发词和修饰词，保留核心主题
         """
-        # 移除匹配的模式
-        cleaned = matched_pattern.sub("", text).strip()
+        topic = text
 
-        # 清理常见虚词
-        stop_words = ["一下", "下", "看看", "有什么", "关于", "的", "相关", "资料",
-                      "技术", "研究", "报告", "分析", "整理", "了解"]
-        for word in stop_words:
-            cleaned = re.sub(word, "", cleaned)
+        # 1. 移除触发动词短语
+        trigger_patterns = [
+            r"帮我研究(一下|下)?",
+            r"研究(一下|下)?",
+            r"整理(一份)?",
+            r"分析(一下|下)?",
+            r"了解(一下|下)?",
+            r"看看有什么",
+            r"看看",
+        ]
+        for pattern in trigger_patterns:
+            topic = re.sub(pattern, "", topic, flags=re.IGNORECASE)
 
-        # 清理多余空格
-        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        # 2. 移除名词后缀
+        suffix_patterns = [
+            r"的研究报告?",
+            r"研究报告?",
+            r"报告",
+            r"资料",
+            r"相关.*",
+        ]
+        for pattern in suffix_patterns:
+            topic = re.sub(pattern, "", topic, flags=re.IGNORECASE)
 
-        # 如果清理后为空，返回原文
-        return cleaned if cleaned else text
+        # 3. 移除视频相关短语（已作为单独实体处理）
+        video_patterns = [
+            r"，包括视频.*",
+            r"，含.*视频.*",
+            r"加上视频.*",
+            r"包括视频",
+            r"含视频",
+        ]
+        for pattern in video_patterns:
+            topic = re.sub(pattern, "", topic, flags=re.IGNORECASE)
+
+        # 4. 清理标点和多余空格
+        topic = re.sub(r"[，。、！？、]", "", topic)
+        topic = re.sub(r"\s+", " ", topic).strip()
+
+        # 5. 移除首尾的虚词
+        topic = topic.strip("的下关于 ")
+
+        return topic if topic else text
 
     def _extract_entities(self, text: str) -> Dict[str, Any]:
         """提取实体"""
