@@ -7,6 +7,7 @@
 
 # 加载全局密钥 (必须在最前面，在导入其他模块之前)
 import sys
+from pathlib import Path
 sys.path.insert(0, str(Path.home() / "scripts"))
 from load_secrets import load_secrets
 load_secrets(silent=True)
@@ -21,7 +22,6 @@ import tempfile
 import base64
 import threading
 import time
-from pathlib import Path
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 import signal
