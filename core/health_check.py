@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-知微系统健康检查工具类
+知微系统健康检查工具类 (v1.3.0 - 缓存增强版)
 """
 
 import subprocess
 import json
 import os
 from pathlib import Path
+from datetime import datetime
 
 def get_system_health_dict() -> dict:
     """获取系统健康状态字典"""
@@ -64,31 +65,55 @@ def get_system_health_dict() -> dict:
     except Exception as e:
         status["services"]["error"] = str(e)
 
-    # 2. 检查 Docker (优化版：增加环境兼容性处理)
-    try:
-        # 使用更稳健的命令，硬熔断：超时设为 2s，避免假死卡顿
-        result = subprocess.run(
-            ["docker", "ps", "--format", "{{.Names}}\t{{.Status}}"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            env={**os.environ, "DOCKER_API_VERSION": "1.41"} # 尝试锁定较低的 API 版本以提高兼容性
-        )
+    # 2. 检查 Docker (优先使用缓存以规避 P0 级假死风险)
+    cache_path = Path.home() / ".cache" / "docker_status.json"
+    used_cache = False
+    
+    if cache_path.exists():
+        try:
+            with open(cache_path, "r") as f:
+                cache_data = json.load(f)
+            
+            # 校验缓存时效性 (120秒内视为有效)
+            updated_at_str = cache_data.get("updated_at", "")
+            if updated_at_str:
+                updated_at = datetime.fromisoformat(updated_at_str)
+                # 处理可能带时区的情况
+                now = datetime.now()
+                if updated_at.tzinfo:
+                    from datetime import timezone
+                    now = datetime.now(timezone.utc)
+                
+                if (now - updated_at).total_seconds() < 120:
+                    for name, info in cache_data.get("containers", {}).items():
+                        # 转换格式以匹配原有输出：Up 10m (healthy)
+                        status_str = f"{info.get('status', 'unknown')}"
+                        if info.get('health') and info.get('health') != "N/A":
+                            status_str += f" ({info.get('health')})"
+                        if info.get('uptime') and info.get('uptime') != "N/A":
+                            status_str = f"Up {info.get('uptime')} / {status_str}"
+                        
+                        status["docker"][name] = status_str
+                    status["docker_checked_at"] = updated_at_str
+                    used_cache = True
+        except Exception:
+            pass
 
-        if result.returncode == 0:
-            for line in result.stdout.strip().split("\n"):
-                if line:
-                    parts = line.split("\t")
-                    if len(parts) >= 2:
-                        status["docker"][parts[0]] = parts[1]
-        else:
-            # 降级：仅列出容器名，极速模式：1s 超时
-            result = subprocess.run(["docker", "ps", "-a", "--format", "{{.Names}}"], capture_output=True, text=True, timeout=1)
+    if not used_cache:
+        try:
+            # 只有在缓存失效时才尝试直接查询，且严格限制 2s 超时
+            result = subprocess.run(
+                ["docker", "ps", "--format", "{{.Names}}\t{{.Status}}"],
+                capture_output=True, text=True, timeout=2,
+                env={**os.environ, "DOCKER_API_VERSION": "1.41"}
+            )
             if result.returncode == 0:
-                for name in result.stdout.strip().split("\n"):
-                    if name: status["docker"][name] = "unknown (API Error)"
-    except Exception as e:
-        status["docker"]["error"] = f"Timeout or Error (>2s 断路保护): {str(e)}"
+                for line in result.stdout.strip().split("\n"):
+                    if line:
+                        parts = line.split("\t")
+                        if len(parts) >= 2: status["docker"][parts[0]] = parts[1]
+        except Exception as e:
+            status["docker"]["error"] = f"Timeout or Error (>2s 断路保护): {str(e)}"
 
     return status
 
@@ -107,9 +132,13 @@ def format_health_status(status: dict) -> str:
     # Docker
     docker = status.get("docker", {})
     if docker and "error" not in docker:
-        lines.append("\n**容器状态:**")
+        checked_at = status.get("docker_checked_at", "实时")
+        if "T" in checked_at:
+            checked_at = checked_at.split("T")[1][:5] # 提取时间部分 HH:MM
+        
+        lines.append(f"\n**容器状态 ({checked_at}):**")
         for name, s in docker.items():
-            emoji = "✅" if "Up" in s else "❌"
+            emoji = "✅" if "Up" in s or "running" in s else "❌"
             lines.append(f"  • {emoji} {name}: {s}")
     elif "error" in docker:
         lines.append(f"\n⚠️ **Docker 检查失败**: {docker['error']}")

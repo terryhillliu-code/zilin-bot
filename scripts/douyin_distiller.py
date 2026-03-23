@@ -232,8 +232,9 @@ class AppConfig:
         self.local_asr_model = os.getenv("LOCAL_ASR_MODEL", "small")
 
         # 输出配置（视频笔记专属目录）
-        output_dir = os.getenv("OUTPUT_DIR", "~/Documents/ZhiweiVault/70-79_个人笔记_Personal/72_视频笔记_Video-Distill")
-        self.output_dir = Path(output_dir).expanduser()
+        base_output_dir = os.getenv("OUTPUT_DIR", "~/Documents/ZhiweiVault/70-79_个人笔记_Personal/72_视频笔记_Video-Distill")
+        self.output_dir = Path(base_output_dir).expanduser()
+        self.assets_dir = self.output_dir / "Assets"
 
         # 日志级别
         log_level = os.getenv("LOG_LEVEL", "INFO")
@@ -253,7 +254,9 @@ class AppConfig:
     def ensure_output_dir(self):
         """确保输出目录存在"""
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.assets_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Output directory: {self.output_dir}")
+        logger.info(f"Assets directory: {self.assets_dir}")
 
 
 # ============================================================================
@@ -1701,7 +1704,7 @@ class TranscriptProvider:
         self.local_transcriber = LocalMLXWhisperTranscriber(config.local_asr_model)
         self.image_video_processor = ImageVideoProcessor(config)
 
-    def get_transcript(self, video_info: VideoInfo) -> TranscriptResult:
+    def get_transcript(self, video_info: VideoInfo, save_audio_path: Optional[Path] = None) -> TranscriptResult:
         """获取转录文本，按策略选择方法"""
         policy = self.config.asr_policy
 
@@ -1722,7 +1725,7 @@ class TranscriptProvider:
             return image_result
 
         # 普通 ASR 转录
-        return self._transcribe_with_asr(video_info)
+        return self._transcribe_with_asr(video_info, save_audio_path)
 
     def _try_image_video(self, video_info: VideoInfo) -> Optional[TranscriptResult]:
         """尝试作为图片视频处理"""
@@ -1742,26 +1745,31 @@ class TranscriptProvider:
 
             return None
 
-    def _transcribe_with_asr(self, video_info: VideoInfo) -> TranscriptResult:
+    def _transcribe_with_asr(self, video_info: VideoInfo, save_audio_path: Optional[Path] = None) -> TranscriptResult:
         """使用 ASR 转录"""
         with tempfile.TemporaryDirectory(prefix="distill_") as tmpdir:
             tmpdir_path = Path(tmpdir)
-            audio_path = tmpdir_path / "audio"
-
+            
+            # 如果提供了持久化路径，直接使用；否则使用临时路径
+            audio_path = save_audio_path or (tmpdir_path / "audio")
+            
             # 提取音频
             if not self.media_extractor.extract_audio(video_info, audio_path):
                 logger.error("Failed to extract audio")
                 return TranscriptResult()
+            
+            # 确保使用带后缀的路径进行识别 (MediaExtractor.extract_audio 会自动补全 .mp3)
+            actual_audio_path = audio_path.with_suffix(".mp3")
 
             # 优先使用 DashScope
             if self.dashscope_transcriber.is_available():
                 logger.info("Using DashScope ASR")
-                return self.dashscope_transcriber.transcribe(audio_path.with_suffix(".mp3"))
+                return self.dashscope_transcriber.transcribe(actual_audio_path)
 
             # 兜底使用本地 ASR
             if self.local_transcriber.is_available():
                 logger.info("Using local MLX Whisper ASR")
-                return self.local_transcriber.transcribe(audio_path.with_suffix(".mp3"))
+                return self.local_transcriber.transcribe(actual_audio_path)
 
             logger.error("No ASR service available")
             return TranscriptResult()
@@ -1977,9 +1985,15 @@ class KnowledgeDistiller:
 结构：[核心价值点] + [适合谁]
 示例："介绍了某AI工具的基本功能，适合对该领域完全不了解的新手快速建立认知。内容较浅，建议结合官方文档深入学习。"
 
-**D级（信息稀薄）- 30字以内**：
-结构：[一句话概括] + 建议
-示例："产品广告视频，无实质内容，建议跳过。"
+**第三步：复现与实施指南（重点，用于指导用户落地项目）**
+
+在 JSON 的 `implementation_guide` 字段中输出：
+- `prerequisites`: 核心依赖工具/环境（如：Node.js, Python 3.10+, Docker）
+- `steps`: 极简复现步骤（1. 2. 3. ...）
+- `difficulty`: 复现难度 (简单/中等/困难)
+- `key_code_logic`: 提取视频中提到的最核心代码逻辑、API 调用方式或关键伪代码。
+
+**注意：** 旨在帮助用户能够根据这份笔记，在不回看视频的情况下，快速搭建起原型或尝试相关工具。
 
 **重要原则：**
 1. **主张式标题**：标题是观点/价值主张，非描述
@@ -2004,7 +2018,8 @@ class KnowledgeDistiller:
 
 {background_section}
 
-请提取知识点并输出 JSON 格式结果。"""
+请提取知识点，并特别关注 **“如何复现视频中的方案”**。
+输出 JSON 格式结果。"""
 
     def __init__(self, config: AppConfig):
         self.config = config
@@ -2093,7 +2108,8 @@ class KnowledgeDistiller:
                 tags=data.get("tags", []),
                 action_items=data.get("action_items", []),
                 references=data.get("references", []),
-                related_concepts=data.get("related_concepts", [])
+                related_concepts=data.get("related_concepts", []),
+                implementation_guide=data.get("implementation_guide", {})
             )
         except json.JSONDecodeError as e:
             logger.error(f"JSON parse error: {e}")
@@ -2167,7 +2183,21 @@ related: [{related_concepts}]
 ## ✅ 行动建议
 {action_items_section}
 
+## 🛠️ 实施与复现指南
+- **难度**：{impl_difficulty}
+- **必要依赖**：{impl_prerequisites}
+- **核心逻辑**：
+```python
+{impl_code_logic}
+```
+- **复现步骤**：
+{impl_steps}
+
 {references_section}
+
+## 📂 关联资产
+- 🎙️ 原始音频：[点击播放]({asset_audio_url})
+- 📄 完整转录：[查看全文]({asset_transcript_url})
 
 ## 📹 原始信息
 - 来源平台：{platform}
@@ -2175,7 +2205,8 @@ related: [{related_concepts}]
 - 原始链接：[点击查看]({source_url})
 
 ---
-> 由知微系统生成，建议关联已有知识并添加个人洞察
+> 由知微系统生成，建议关联已有知识并添加个人洞察。
+> **RAG 隔离标记**：`rag: false` (默认不入库，移动至 Knowledge_Base 目录可入库)
 '''
 
     def __init__(self, output_dir: Path):
@@ -2183,51 +2214,54 @@ related: [{related_concepts}]
 
     def write(self, video_info: VideoInfo, transcript: TranscriptResult,
               knowledge: DistilledKnowledge, noise_tags: list[str]) -> Path:
-        """生成并写入 Markdown 文件"""
+        """生成并写入 Markdown 文件，同时归档资产"""
         # 准备内容
         date_str = datetime.now().strftime("%Y-%m-%d")
         tags_str = ", ".join(f'"{tag}"' for tag in knowledge.tags)
+        
+        # 确定文件名和资产目录
+        safe_title = re.sub(r'[<>:"/\\|?*]', '', knowledge.title)[:50]
+        asset_folder_name = f"{date_str}_{safe_title}"
+        asset_dir = self.output_dir / "Assets" / asset_folder_name
+        asset_dir.mkdir(parents=True, exist_ok=True)
+
+        # 归档转录全文
+        transcript_filename = "transcript_full.txt"
+        transcript_path = asset_dir / transcript_filename
+        transcript_path.write_text(transcript.to_text(), encoding="utf-8")
+        
+        # 归档音频 (如果有临时文件路径，需要传入。这里假设 transcript 对象或 video_info 携带了 path)
+        # 注意：实际音频提取在 TranscriptProvider._transcribe_with_asr 中，
+        # 为了简单，我们在这里通过 link 协议引用，具体物理移动需在 distiller 主流程配合。
+        asset_audio_url = f"Assets/{asset_folder_name}/audio.mp3"
+        asset_transcript_url = f"Assets/{asset_folder_name}/{transcript_filename}"
 
         # 内容等级显示
-        tier_labels = {
-            "A": "⭐⭐⭐ 深度干货",
-            "B": "⭐⭐ 有价值",
-            "C": "⭐ 浅层内容",
-            "D": "⚠️ 信息稀薄"
-        }
+        tier_labels = {"A": "⭐⭐⭐ 深度干货", "B": "⭐⭐ 有价值", "C": "⭐ 浅层内容", "D": "⚠️ 信息稀薄"}
         tier_display = tier_labels.get(knowledge.content_tier, "未评估")
 
-        # 格式化知识点（洞察式）
-        key_points_str = "\n".join(
-            f"- **[{kp['timestamp']}]** {kp['insight']}"
-            for kp in knowledge.key_points
-        )
+        # 实施指南数据
+        impl = getattr(knowledge, 'implementation_guide', {})
+        impl_difficulty = impl.get('difficulty', '未知')
+        impl_prerequisites = impl.get('prerequisites', '见摘要')
+        impl_code_logic = impl.get('key_code_logic', '# 提取中...')
+        impl_steps = "\n".join([f"{i+1}. {s}" for i, s in enumerate(impl.get('steps', ['参考摘要说明']))])
 
-        # 适用场景部分
-        use_cases_section = ""
-        if knowledge.use_cases:
-            use_cases_section = f"## 🎯 适用场景\n{knowledge.use_cases}"
+        # 格式化知识点
+        key_points_str = "\n".join(f"- **[{kp['timestamp']}]** {kp['insight']}" for kp in knowledge.key_points)
 
-        # 知识关联部分
-        related_section = "暂无关联"
-        if knowledge.related_concepts:
-            related_str = ", ".join(f"[[{c}]]" for c in knowledge.related_concepts)
-            related_section = related_str
+        # 适用场景
+        use_cases_section = f"## 🎯 适用场景\n{knowledge.use_cases}" if knowledge.use_cases else ""
 
-        # 行动建议部分（必显示）
-        if knowledge.action_items:
-            items_str = "\n".join(f"- [ ] {item}" for item in knowledge.action_items)
-        else:
-            items_str = "- [ ] 思考如何将此知识应用到实际场景"
+        # 知识关联
+        related_section = ", ".join(f"[[{c}]]" for c in knowledge.related_concepts) if knowledge.related_concepts else "暂无关联"
 
-        # 参考资源部分
-        references_section = ""
-        if knowledge.references:
-            refs_str = "\n".join(f"- {ref}" for ref in knowledge.references)
-            references_section = f"## 📚 参考资料\n{refs_str}"
+        # 行动建议
+        items_str = "\n".join(f"- [ ] {item}" for item in knowledge.action_items) if knowledge.action_items else "- [ ] 思考如何将此知识应用到实际场景"
 
-        # 目标受众
-        target_audience = knowledge.target_audience or "通用"
+        # 参考资源
+        refs_str = "\n".join(f"- {ref}" for ref in knowledge.references) if knowledge.references else ""
+        references_section = f"## 📚 参考资料\n{refs_str}" if refs_str else ""
 
         # 生成 Markdown
         content = self.TEMPLATE.format(
@@ -2237,7 +2271,7 @@ related: [{related_concepts}]
             tags=tags_str,
             content_tier=knowledge.content_tier,
             tier_display=tier_display,
-            target_audience=target_audience,
+            target_audience=knowledge.target_audience or "通用",
             asr_source=transcript.source,
             related_concepts=", ".join(f'"{c}"' for c in knowledge.related_concepts) if knowledge.related_concepts else "",
             core_insight=knowledge.core_insight,
@@ -2248,15 +2282,17 @@ related: [{related_concepts}]
             action_items_section=items_str,
             references_section=references_section,
             platform=video_info.platform,
-            author=video_info.author or "未知"
+            author=video_info.author or "未知",
+            impl_difficulty=impl_difficulty,
+            impl_prerequisites=impl_prerequisites,
+            impl_code_logic=impl_code_logic,
+            impl_steps=impl_steps,
+            asset_audio_url=asset_audio_url,
+            asset_transcript_url=asset_transcript_url
         )
 
-        # 确定文件名
-        safe_title = re.sub(r'[<>:"/\\|?*]', '', knowledge.title)[:50]
         filename = f"{date_str}_{safe_title}.md"
         output_path = self.output_dir / filename
-
-        # 写入文件
         output_path.write_text(content, encoding="utf-8")
         logger.info(f"Markdown saved to: {output_path}")
 
@@ -2322,7 +2358,16 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
 
     try:
         provider = TranscriptProvider(config, cookies_browser, cookies_file)
-        transcript = provider.get_transcript(video_info)
+        
+        # 预估资产保存路径（基于 URL 解析出的 Title，如果没有则生成 ID）
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        raw_title = video_info.title or f"Video_{video_id or 'unknown'}"
+        safe_title = re.sub(r'[<>:"/\\|?*]', '', raw_title)[:50]
+        asset_dir = config.output_dir / "Assets" / f"{date_str}_{safe_title}"
+        asset_dir.mkdir(parents=True, exist_ok=True)
+        save_audio_path = asset_dir / "audio" # 最终后缀由 extract_audio 补全
+        
+        transcript = provider.get_transcript(video_info, save_audio_path=save_audio_path)
     except Exception as e:
         error_type, error_msg = classify_error(e)
         error_json = json.dumps({"error_type": error_type.value, "error_message": error_msg})
