@@ -481,18 +481,11 @@ def transcribe_audio(audio_path: str) -> str:
         import dashscope
         from dashscope.audio.asr import Recognition
 
-        # 获取 API key
+        # 获取 API key（由 ws_client.py 通过 load_secrets() 加载）
         api_key = os.getenv("DASHSCOPE_API_KEY")
-        if not api_key:
-            # 尝试从 .env 文件加载
-            env_path = os.path.expanduser("~/zhiwei-bot/.env")
-            if os.path.exists(env_path):
-                from dotenv import load_dotenv
-                load_dotenv(env_path)
-                api_key = os.getenv("DASHSCOPE_API_KEY")
 
         if not api_key:
-            logger.error("DASHSCOPE_API_KEY 未配置")
+            logger.error("DASHSCOPE_API_KEY 未配置，请检查 ~/.secrets/global.env")
             return None
 
         dashscope.api_key = api_key
