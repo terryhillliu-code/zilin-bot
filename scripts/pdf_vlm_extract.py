@@ -68,6 +68,23 @@ VLM_PROMPT = """分析此页面内容，按以下 JSON 格式输出：
 - 如果只是文字：type 设为 "text"，在 description 中总结内容"""
 
 
+# 智能预检配置 (Smart Filter) ⭐ v3.0
+SMART_FILTER_MODEL = "qwen3.5-plus"
+SMART_FILTER_PROMPT = """你是一个资深的硬件系统架构师。请评估以下PDF文档前几页的内容，判断它是否是一份包含高价值图表、架构分析或对比数据的【深度硬件/系统技术研报】。
+
+高价值主题特征：服务器处理器、GPU架构演进、芯片互联(CXL/NVLink)、网络通信(RDMA)、数据中心基础设施(液冷/供电)、硬件TCO分析等。
+低价值主题特征：纯深度学习算法原理、纯数学公式推导、内容空泛的宏观新闻、纯软件工程（如前端开发）。
+
+请在分析后，在最后一行输出一个 0 到 100 的整数评分。
+评分标准：
+- 90-100分：极高价值的硬件架构白皮书、厂商Specs、券商深度硬核研报（必须做图表提取）。
+- 70-89分：包含具体硬件对比数据、性能压测分析的有效报告。
+- <70分：偏软件算法、宏观简报，或不需要提取图表的普通文档。
+
+请在最后一行强制输出且仅输出两部分内容：[分析结论] 和 [评分: xx]。例如：
+分析结论：本文档详细分析了HBM的带宽瓶颈...
+评分: 85"""
+
 def find_pdf_files():
     """找出所有 PDF 文件"""
     pdf_files = []
@@ -278,6 +295,57 @@ def call_vlm(image_data: bytes, prompt: str = "请详细描述这张图片中的
     return None, "VLM 调用失败，超过最大重试次数"
 
 
+    return None, "VLM 调用失败，超过最大重试次数"
+
+
+# ============ 智能预检 (Smart Filter) ⭐ v3.0 ============
+
+def preflight_scan(text: str) -> tuple:
+    """
+    预检文本前几页，判断是否值得发起 VLM
+    Returns: (score: int, reason: str)
+    """
+    import requests
+    import re
+
+    if not DASHSCOPE_API_KEY:
+        return 100, "未配置 API Key，跳过预检"
+
+    # 截取前 4000 字符（大约前 5-10 页内容）
+    preview_text = text[:4000]
+
+    headers = {
+        "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": SMART_FILTER_MODEL,
+        "messages": [
+            {"role": "system", "content": SMART_FILTER_PROMPT},
+            {"role": "user", "content": f"以下是研报前几页的文本提取内容：\n\n{preview_text}"}
+        ],
+        "temperature": 0.1
+    }
+
+    try:
+        response = requests.post(VLM_API_URL, headers=headers, json=payload, timeout=30)
+        if response.status_code == 200:
+            content = response.json()['choices'][0]['message']['content']
+            
+            # 正则提取评分
+            score_match = re.search(r'评分:\s*(\d+)', content)
+            if score_match:
+                score = int(score_match.group(1))
+                reason = content.replace(f"评分: {score}", "").strip()
+                return score, reason
+            else:
+                return 100, "预检解析失败，默认放行"
+    except Exception as e:
+        return 100, f"预检请求异常，默认放行: {e}"
+
+    return 100, "预检响应异常，默认放行"
+
 # ============ 结构化输出解析 ⭐ v2.0 ============
 
 def parse_vlm_response(response: str) -> dict:
@@ -413,7 +481,7 @@ def analyze_pages(pdf_path: Path) -> dict:
 
 # ============ 主处理函数 ============
 
-def process_pdf(pdf_path: Path, dry_run: bool = False) -> dict:
+def process_pdf(pdf_path: Path, dry_run: bool = False, smart_filter: bool = False) -> dict:
     """
     处理单个 PDF 文件
 
@@ -435,7 +503,8 @@ def process_pdf(pdf_path: Path, dry_run: bool = False) -> dict:
         'pages': 0,
         'images': 0,
         'vlm_calls': 0,
-        'error': None
+        'error': None,
+        'smart_score': None
     }
 
     try:
@@ -462,10 +531,21 @@ def process_pdf(pdf_path: Path, dry_run: bool = False) -> dict:
             result['error'] = text_error
             return result
 
+        # 智能预检 (Smart Filter)
+        skip_vlm = False
+        if smart_filter and text:
+            print(f"  🧠 智能预检 (Smart Filter)...")
+            score, reason = preflight_scan(text)
+            result['smart_score'] = score
+            print(f"     预检得分: {score}/100")
+            if score < 70:
+                print(f"     ⏭️ 判定为非高价值硬件研报，跳过 VLM 识别。\n     原因: {reason[:100]}...")
+                skip_vlm = True
+        
         # VLM 处理 ⭐ v2.0 纯 VLM 方案
         vlm_outputs = []
 
-        if not dry_run and page_info['image_pages']:
+        if not dry_run and page_info['image_pages'] and not skip_vlm:
             print(f"  🤖 VLM 描述 ({len(page_info['image_pages'])} 页)...")
 
             for page_num in page_info['image_pages']:
@@ -521,6 +601,7 @@ extracted_at: {datetime.now().isoformat()}
 pages: {result['pages']}
 images: {result['images']}
 vlm_calls: {result['vlm_calls']}
+smart_score: {result.get('smart_score', 'N/A')}
 ---
 
 ## 正文内容
@@ -534,6 +615,8 @@ vlm_calls: {result['vlm_calls']}
             md_content += "## 图表描述\n\n"
             for item in vlm_outputs:
                 md_content += item['formatted']
+        elif skip_vlm:
+            md_content += f"## 图表描述\n\n本文档经 Smart Filter 预检得分为 {result.get('smart_score')} (阈值 70)，判定为非高价值硬件研报，自动跳过 VLM 昂贵的图表提取过程。\n"
         elif page_info['image_pages']:
             md_content += "## 图表描述\n\n本文档含图页面 VLM 处理失败。\n"
         else:
@@ -559,12 +642,14 @@ def main():
     parser.add_argument("--all", action="store_true", help="处理所有 PDF")
     parser.add_argument("--pdf", type=str, help="处理单个 PDF 文件")
     parser.add_argument("--workers", type=int, default=1, help="并发数（默认 1，VLM 调用不建议高并发）")
+    parser.add_argument("--smart-filter", action="store_true", help="开启智能过滤，由极廉价模型预读判定为高价值研报后才发起 VLM（适合盲扫大批量 PDF）")
     args = parser.parse_args()
 
     print("=" * 60)
-    print("PDF-VLM 处理管线 v2.0")
+    print("PDF-VLM 处理管线 v3.0 (Smart Filter 增强)")
     print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"模式: {'预览' if args.dry_run else '写入'}")
+    print(f"智能预检: {'开启' if args.smart_filter else '关闭'}")
     print(f"并发: {args.workers}")
     print("=" * 60)
 
@@ -629,7 +714,7 @@ def main():
         rel_path = pdf_path.relative_to(SOURCE_BASE) if pdf_path.is_relative_to(SOURCE_BASE) else pdf_path.name
         print(f"\n[{i}/{len(pdf_files)}] {rel_path}")
 
-        result = process_pdf(pdf_path, args.dry_run)
+        result = process_pdf(pdf_path, args.dry_run, args.smart_filter)
 
         if result['success']:
             success_count += 1
