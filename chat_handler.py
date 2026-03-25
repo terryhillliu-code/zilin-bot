@@ -266,9 +266,16 @@ class ChatHandler:
             return "❌ 系统暂时不可用，请稍后重试"
 
         try:
+            # ⭐ v47.0 修复：意图识别只对原始用户输入进行，而非 enriched_message
+            # 从 enriched_message 中提取"当前问题"部分
+            original_message = message
+            if "---\n当前问题: " in message:
+                # 提取当前问题部分
+                original_message = message.split("---\n当前问题: ")[-1].split("\n")[0]
+
             # ⭐ v47.0 新增：意图识别
             if self.enable_intent and self._intent_recognizer:
-                intent_result = self._intent_recognizer.recognize(message)
+                intent_result = self._intent_recognizer.recognize(original_message)
                 if intent_result.is_research_intent():
                     logger.info(f"[ChatHandler] 检测到研究意图: {intent_result.entities.get('topic')}")
                     return await self._handle_research_intent(intent_result, session_id)
