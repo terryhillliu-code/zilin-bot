@@ -1,4 +1,7 @@
-"""研究报告执行器 - 处理 [ACTION: RESEARCH_REPORT] 指令"""
+"""研究报告执行器 - 处理 [ACTION: RESEARCH_REPORT] 指令
+
+v3.0: Obsidian 优先 + 快速模式默认 + 自动模板选择
+"""
 import os
 import sys
 import json
@@ -7,10 +10,21 @@ import logging
 import re
 import yaml
 from pathlib import Path
+from .persona_service import persona_service
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("research_executor")
+
+# 硬件相关关键词 (用于自动选择 hardware_report 模板)
+HARDWARE_KEYWORDS = [
+    "处理器", "CPU", "GPU", "海光", "鲲鹏", "飞腾", "Intel", "AMD",
+    "芯片", "Die", "NUMA", "DDR", "PCIe", "NVMe", "CXL", "服务器",
+    "内存", "架构", "选型", "TCO", "散热", "液冷", "加速器", "DPU",
+    "Hygon", "Ampere", "Graviton", "存储", "网卡", "RDMA", "InfiniBand",
+    "chiplet", "互联", "HBM", "SPEC", "功耗", "TDP"
+]
+
 
 class ResearchReportExecutor:
     def __init__(self):
@@ -19,6 +33,15 @@ class ResearchReportExecutor:
         self.analyzer_python = self.analyzer_dir / "venv" / "bin" / "python3"
         self.export_root = Path("/tmp/notebooklm_export")
 
+    def _detect_template(self, topic: str) -> str:
+        """基于主题自动选择最合适的模板"""
+        topic_lower = topic.lower()
+        for kw in HARDWARE_KEYWORDS:
+            if kw.lower() in topic_lower:
+                logger.info(f"🔧 自动选择 hardware_report 模板 (命中关键词: {kw})")
+                return "hardware_report"
+        return "default"
+
     def execute(self, topic: str, user_id: str, message_id: str, reply_func, reply_card_func):
         """执行研究报告生成流程"""
         try:
@@ -26,14 +49,13 @@ class ResearchReportExecutor:
             if self.export_root.exists():
                 logger.info(f"清理导出分区... {self.export_root}")
 
-            # 2. 解析 Topic、Template 和 Videos 参数
-            # 兼容格式: "主题 --template=podcast --include-videos" 或 "主题"
-            template_key = "default"
+            # 2. 解析参数
+            template_key = None  # None = 自动检测
             actual_topic = topic
             include_videos = False
             video_limit = 5
+            deep_mode = False
 
-            # 解析参数
             remaining = topic
             if " --template=" in remaining:
                 remaining, template_key = remaining.split(" --template=", 1)
@@ -46,85 +68,105 @@ class ResearchReportExecutor:
                 if match:
                     video_limit = int(match.group(1))
                     remaining = re.sub(r"--video-limit=\d+", "", remaining)
+            if " --deep" in remaining:
+                deep_mode = True
+                remaining = remaining.replace(" --deep", "")
             if " --" in remaining:
                 remaining = remaining.split(" --", 1)[0].strip()
 
             actual_topic = remaining.strip()
 
-            # 3. 调用 manage.py export-notebook 执行过滤和导出
-            # v2.1: 默认启用 --auto-search，自动从 ArXiv 补充
-            # v2.2: 支持 --include-videos 多源混合导出
+            # 3. 自动选择模板 (如果用户未显式指定)
+            if template_key is None:
+                template_key = self._detect_template(actual_topic)
+
+            # 4. 构建 manage.py 命令
             cmd = [
                 str(self.analyzer_python), "scripts/manage.py", "export-notebook",
                 "--query", actual_topic,
                 "--limit", "10",
                 "--tiers", "A,B",
                 "--template", template_key,
-                "--auto-search"
+                "--obsidian-limit", "10",
             ]
 
-            # v2.2: 视频笔记混合导出
+            # v3.0: 仅在 deep 模式下启用 ArXiv 搜索
+            if deep_mode:
+                cmd.append("--auto-search")
+
+            # 5. 获取并注入个人画像
+            persona_text = persona_service.get_persona()
+            if persona_text:
+                safe_persona = persona_text[:1500].replace('"', "'")
+                cmd.extend(["--persona", safe_persona])
+
+            # 视频笔记
             if include_videos:
                 cmd.extend(["--include-videos", "--video-limit", str(video_limit)])
 
-            logger.info(f"执行同步指令: {' '.join(cmd)}")
-            result = subprocess.run(cmd, cwd=str(self.analyzer_dir), capture_output=True, text=True, timeout=120)
+            logger.info(f"执行指令 (deep={deep_mode}): {' '.join(cmd[:8])}...")
+
+            # v3.0: 快速模式 timeout=60s, 深度模式 timeout=300s
+            timeout = 300 if deep_mode else 60
+            result = subprocess.run(cmd, cwd=str(self.analyzer_dir),
+                                    capture_output=True, text=True, timeout=timeout)
 
             if result.returncode != 0:
                 reply_func(message_id, f"❌ 研究包准备失败:\n{result.stderr[:200]}")
                 return
 
-            # 3. 检查生成结果
-            # 根据日志判断成功数量 (注意: logging 默认在 stderr)
+            # 6. 解析结果
             combined_output = result.stdout + result.stderr
 
-            # v2.2: 支持多源导出结果解析
             total_match = re.search(r"总计: (\d+) 个素材", combined_output)
+            obsidian_match = re.search(r"- Obsidian 笔记: (\d+)", combined_output)
             paper_match = re.search(r"- 论文: (\d+)", combined_output)
             video_match = re.search(r"- 视频笔记: (\d+)", combined_output)
 
             if total_match:
                 total_count = int(total_match.group(1))
+                obsidian_count = int(obsidian_match.group(1)) if obsidian_match else 0
                 paper_count = int(paper_match.group(1)) if paper_match else 0
                 video_count = int(video_match.group(1)) if video_match else 0
             else:
-                # 兼容旧格式
                 success_match = re.search(r"成功: (\d+) / (\d+)", combined_output)
                 total_count = int(success_match.group(1)) if success_match else 0
+                obsidian_count = 0
                 paper_count = total_count
                 video_count = 0
 
-            # 检查是否触发了 ArXiv 搜索
-            arxiv_search_triggered = "ArXiv 全时域搜索" in combined_output
-
             if total_count == 0:
-                if arxiv_search_triggered:
-                    reply_func(message_id, f"🔍 已尝试从 ArXiv 搜索，但仍未找到关于「{actual_topic}」的高质量文献。请尝试更具体的关键词。")
-                else:
-                    reply_func(message_id, f"🔍 抱歉，在本地库中未找到关于「{actual_topic}」的高质量已分析文献 (Tier A/B)。建议您先收录相关 ArXiv 论文。")
+                reply_func(message_id,
+                    f"🔍 未找到关于「{actual_topic}」的素材。\n"
+                    f"💡 提示: 使用 `/research {actual_topic} --deep` 可从 ArXiv 搜索并深度分析。")
                 return
 
-            # 4. 获取对应的超级提示词显示
+            # 7. 发送结果卡片
             super_prompt = self._get_template_prompt(template_key, actual_topic)
 
-            # 5. 发送精美的结果卡片
             card_content = f"### 📊 「{actual_topic}」研究素材已就绪\n\n"
-            if arxiv_search_triggered:
-                card_content += "🌐 已自动从 ArXiv 搜索并补充文献。\n\n"
-
-            # v2.2: 多源导出结果展示
-            card_content += f"我为您精准筛选并清洗了 **{total_count}** 个核心素材：\n\n"
+            card_content += f"精准筛选了 **{total_count}** 个核心素材：\n\n"
+            if obsidian_count > 0:
+                card_content += f"- 📓 Obsidian 笔记：{obsidian_count} 篇\n"
             card_content += f"- 📄 论文：{paper_count} 篇\n"
-            if include_videos and video_count > 0:
+            if video_count > 0:
                 card_content += f"- 📹 视频笔记：{video_count} 篇\n"
-            card_content += f"\n📂 **本地暂存路径**：\n`{self.export_root}`\n\n"
+            card_content += f"\n📂 **本地路径**：`{self.export_root}`\n"
+            card_content += f"🎨 **使用模板**：`{template_key}`\n\n"
+
+            if not deep_mode:
+                card_content += f"💡 需要更多学术论文？发送 `/research {actual_topic} --deep`\n\n"
+
             card_content += "---\n"
-            card_content += "#### 💡 NotebookLM 进阶指令 (建议复制使用)\n"
-            card_content += "请将上述文件夹内的文件导入 NotebookLM 后，使用以下提示词开启深度研究：\n\n"
+            card_content += "#### 💡 NotebookLM 进阶指令\n"
             card_content += f"```markdown\n{super_prompt}\n```"
 
             reply_card_func(message_id, f"📑 {actual_topic} 研究情报就绪", card_content)
 
+        except subprocess.TimeoutExpired:
+            reply_func(message_id,
+                f"⏱ 研究任务超时。快速模式已优先导出 Obsidian 笔记。\n"
+                f"请检查 `{self.export_root}` 中的已完成部分。")
         except Exception as e:
             logger.error(f"执行研究任务异常: {e}")
             reply_func(message_id, f"❌ 研究流程中断：{str(e)}")

@@ -300,15 +300,7 @@ class ObsidianClient:
             return {"success": False, "error": str(e)}
 
     def copy_attachment(self, source_path: str, dest_name: str = None) -> Dict[str, str]:
-        """复制附件到 Obsidian 附件目录。
-
-        Args:
-            source_path: 源文件路径
-            dest_name: 目标文件名
-
-        Returns:
-            {success, attachment_path, obsidian_link, error}
-        """
+        """复制附件到 Obsidian 附件目录。"""
         try:
             response = httpx.post(
                 f"{self.base_url}/attachments/copy",
@@ -319,6 +311,32 @@ class ObsidianClient:
             return response.json()
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def search_vault(self, query: str, folder: str = None, limit: int = 10) -> Dict[str, Any]:
+        """全文检索 Vault。"""
+        try:
+            response = httpx.post(
+                f"{self.base_url}/vault/search",
+                json={"query": query, "folder": folder, "limit": limit},
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            return {"results": [], "total": 0, "error": str(e)}
+
+    def read_note(self, path: str) -> Dict[str, Any]:
+        """读取笔记内容。"""
+        try:
+            response = httpx.post(
+                f"{self.base_url}/vault/read",
+                json={"path": path},
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            return {"success": False, "content": "", "metadata": {}, "error": str(e)}
 
 
 # 全局客户端实例
