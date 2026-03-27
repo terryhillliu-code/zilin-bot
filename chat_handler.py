@@ -98,7 +98,6 @@ class ChatHandler:
         self._rag_available = False
         if self.enable_rag:
             try:
-                sys.path.insert(0, str(Path.home() / "zhiwei-rag"))
                 from api import retrieve
                 self._rag_retrieve = retrieve
                 self._rag_available = True

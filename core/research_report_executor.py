@@ -1,6 +1,7 @@
 """研究报告执行器 - 处理 [ACTION: RESEARCH_REPORT] 指令
 
 v3.0: Obsidian 优先 + 快速模式默认 + 自动模板选择
+v8.0: 增加 RAG 反思层与执行前校准
 """
 import os
 import sys
@@ -11,6 +12,7 @@ import re
 import yaml
 from pathlib import Path
 from .persona_service import persona_service
+from .llm_client import llm_client
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -55,8 +57,12 @@ class ResearchReportExecutor:
             include_videos = False
             video_limit = 5
             deep_mode = False
+            auto_write = False
 
             remaining = topic
+            if " --auto-write" in remaining:
+                auto_write = True
+                remaining = remaining.replace(" --auto-write", "")
             if " --template=" in remaining:
                 remaining, template_key = remaining.split(" --template=", 1)
                 template_key = template_key.split(" --")[0].strip()
@@ -141,9 +147,56 @@ class ResearchReportExecutor:
                     f"💡 提示: 使用 `/research {actual_topic} --deep` 可从 ArXiv 搜索并深度分析。")
                 return
 
-            # 7. 发送结果卡片
             super_prompt = self._get_template_prompt(template_key, actual_topic)
 
+            # [Research V8.0] Reflection & Grounding Check
+            if auto_write and total_count > 0:
+                logger.info("🛡️ 执行反思层校验 (Reflection Layer)...")
+                # 这里我们抽样校验前 3 份素材
+                sources_sample = [md.name for md in list(self.export_root.glob("**/*.md"))[:3]]
+                is_aligned, reflection_msg = self._verify_relevance(actual_topic, sources_sample)
+                
+                if not is_aligned:
+                    reply_func(message_id, f"⚠️ **执行方案对齐警告**\n\nAI 在反思检索结果时发现素材与主题「{actual_topic}」的对齐度较低。\n\n**原因**: {reflection_msg}\n\n💡 建议: 请尝试更具体的技术关键词，或启用 `--deep` 模式进行全网论文搜索。")
+                    # 仍然发送卡片供用户手动检查，但不自动撰写
+                    auto_write = False
+
+            # [Research V4.0] End-to-End LLM Synthesis
+            if auto_write:
+                reply_func(message_id, f"📝 素材准备就绪 ({total_count}份)。正在使用内侧 AI 智库为您撰写端到端研究报告，请稍候约 1-2 分钟...")
+                
+                # 收集所有 Markdown 内容
+                context_texts = []
+                for md_file in self.export_root.glob("**/*.md"):
+                    try:
+                        with open(md_file, "r", encoding="utf-8") as f:
+                            content = f.read()
+                            # 限制单个文件长度防爆内存
+                            context_texts.append(f"文献来源: {md_file.name}\n{content[:15000]}")
+                    except Exception as e:
+                        logger.warning(f"读取素材失败 {md_file}: {e}")
+                
+                full_context = "\n\n---\n\n".join(context_texts)
+                final_prompt = f"{super_prompt}\n\n========== 检索到的参考素材 ==========\n{full_context}"
+                
+                logger.info(f"🚀 发起端到端撰写，上下文长度约 {len(final_prompt)} 字符...")
+                success, final_report = llm_client.call(
+                    role="research",
+                    message=final_prompt,
+                    system_prompt="你是知微系统内置的首席硬件系统架构师，请忽略 NotebookLM 专用的格式要求，直接输出最终的精美 Markdown 排版研报。字数不限，要深度且数据详实。",
+                    timeout=300
+                )
+                
+                if success:
+                    report_path = self.export_root / f"AI_Report_{actual_topic[:10].replace(' ', '_')}.md"
+                    with open(report_path, "w", encoding="utf-8") as rf:
+                        rf.write(final_report)
+                    reply_func(message_id, f"✅ **《{actual_topic}》自动研究报告已成稿** (保存在: {report_path})\n\n{final_report}")
+                    return
+                else:
+                    reply_func(message_id, f"⚠️ 自动撰写研报失败，退回到素材包模式。错误原因: {final_report}")
+
+            # 7. 发送常规结果卡片 (未开启 auto-write 或出错回退)
             card_content = f"### 📊 「{actual_topic}」研究素材已就绪\n\n"
             card_content += f"精准筛选了 **{total_count}** 个核心素材：\n\n"
             if obsidian_count > 0:
@@ -186,6 +239,37 @@ class ResearchReportExecutor:
             logger.error(f"加载模板失败: {e}")
 
         return f"请基于提供的关于 {topic} 的文献进行深度研究。"
+
+    def _verify_relevance(self, topic: str, source_names: list) -> tuple[bool, str]:
+        """[Research V8.0] 校验检索素材与主题的相关性
+        
+        通过 LLM 进行反思，确保执行方案满足用户真实意图。
+        """
+        if not source_names:
+            return False, "未检索到任何有效素材"
+
+        prompt = f"""作为首席架构师，请对以下检索结果进行【相关性反思】：
+研究主题: {topic}
+检索出的素材样例: {', '.join(source_names)}
+
+请判断这些素材是否足以支撑关于该主题的深度研究报告。
+如果相关度很高，请回复：OK
+如果相关度较低，请说明具体原因（一句话）。
+"""
+        try:
+            # 内部调用同步版本（因为 execute 在线程池中运行）
+            success, response = llm_client.call(
+                role="research",
+                message=prompt,
+                system_prompt="你是一个严谨的研究计划审计员。只输出 OK 或简单的原因说明。",
+                timeout=20
+            )
+            if success and response.strip().upper() == "OK":
+                return True, ""
+            return False, response.strip()
+        except Exception as e:
+            logger.error(f"相关性反思失败: {e}")
+            return True, "" # 容错处理：调用失败则默认允许执行
 
 # 单例
 research_executor = ResearchReportExecutor()

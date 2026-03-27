@@ -6,7 +6,7 @@
 - rag_client: RAG 检索
 - openclaw_adapter: OpenClaw 可选执行舱
 """
-from .llm_client import LLMClient, LLMConfig, call_llm, call_llm_with_session
+from zhiwei_common.llm import LLMClient, LLMConfig, call_llm, call_llm_with_session
 from .tracing import new_trace_id, log_structured, TraceContext
 from .schemas import TaskEnvelope, ResultEnvelope
 from .rag_client import RAGClient, get_rag_client, rag_search

@@ -282,11 +282,13 @@ class VideoHistory:
 
         try:
             # 延迟导入避免循环依赖
-            import sys
-            bot_dir = Path(__file__).parent
-            if str(bot_dir) not in sys.path:
-                sys.path.insert(0, str(bot_dir))
-            from feishu_api import send_direct_message
+            try:
+                from feishu_api import send_direct_message
+            except ImportError:
+                bot_dir = Path(__file__).parent
+                if str(bot_dir) not in sys.path:
+                    sys.path.insert(0, str(bot_dir))
+                from feishu_api import send_direct_message
 
             error_type_display = {
                 VideoErrorType.COOKIE_EXPIRED: "🍪 Cookie 过期",

@@ -22,18 +22,28 @@
 - 推送/格式化/通知 → 通微
 - 重要代码任务：筑微完成后自动转审微审查
 
-# 意图标记 (v47.0)
-当用户明确要求”研究、深度分析、打包资料、生成报告”时，系统会自动检测意图并发送确认卡片。
+# 意图标记 (v8.0: 结构化可靠性升级)
+当用户要求“研究、深度分析、打包资料、生成报告”时，您必须返回一个 **JSON 对象**，以便系统能够 100% 准确地解析您的执行方案（对齐审计）。
 
-如果需要手动触发研究流程，可在回复开头添加：
-```
-[INTENT:RESEARCH]|主题|videos=true
+**强制 JSON 格式：**
+```json
+{
+  "intent": "research",
+  "topic": "技术主题名称",
+  "confidence": 0.95,
+  "reasoning": "为什么要研究这个主题（基于前文 context 的理由）",
+  "entities": {
+    "include_videos": true,
+    "source": "online/local/all"
+  }
+}
 ```
 
-参数说明：
-- `主题` - 用户要研究的主题
-- `videos=true/false` - 是否包含视频笔记（可选）
-- `source=online/local` - 知识来源（可选）
+如果用户提供了简单的快捷指令，您也可以使用简易协议回退：
+```
+[INTENT:RESEARCH]|主题|videos=true|source=all
+```
+理由：JSON 格式更适合复杂场景下的执行对齐检查。
 
 # 禁止
 - 禁止 web_search

@@ -18,14 +18,24 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class IntentResult:
-    """意图识别结果"""
-    intent: str  # research, search, chat
+    """意图识别结果 (v8.0: 增强语义可靠性)"""
+    intent: str  # research, search, chat, status
     confidence: float  # 0.0 - 1.0
     entities: Dict[str, Any]
+    reasoning: str = ""  # LLM 决策理由 (用于对齐审计)
 
     def is_research_intent(self, threshold: float = 0.6) -> bool:
         """是否为研究意图"""
         return self.intent == "research" and self.confidence >= threshold
+
+    def to_json(self) -> str:
+        """转换为 JSON 字符串用于日志或传输"""
+        return json.dumps({
+            "intent": self.intent,
+            "confidence": self.confidence,
+            "reasoning": self.reasoning,
+            "entities": self.entities
+        }, ensure_ascii=False)
 
 
 class IntentRecognizer:
@@ -120,31 +130,60 @@ class IntentRecognizer:
 
     def recognize(self, text: str) -> IntentResult:
         """
-        识别文本意图
+        识别文本意图 (v8.0: 支持 JSON 语义解析优先)
 
         Args:
-            text: 用户输入文本
+            text: 用户输入文本（原始回复或命令）
 
         Returns:
             IntentResult 包含意图、置信度和实体
         """
-        # 1. 研究意图检测
+        if not text:
+            return IntentResult("chat", 0.0, {})
+
+        # 1. 优先尝试 JSON 解析（针对 LLM 返回的结构化意图）
+        if "{" in text and "}" in text:
+            try:
+                # 正则提取 JSON 块
+                json_match = re.search(r'(\{.*\})', text.replace('\n', ' '), re.DOTALL)
+                if json_match:
+                    data = json.loads(json_match.group(1))
+                    intent = data.get("intent", "chat").lower()
+                    
+                    # 实体归一化
+                    entities = data.get("entities", {})
+                    if not entities:
+                        for k in ["topic", "include_videos", "source"]:
+                            if k in data:
+                                entities[k] = data[k]
+                    
+                    confidence = data.get("confidence", 0.95)
+                    reasoning = data.get("reasoning", "LLM 结构化输出")
+                    
+                    logger.info(f"✨ 成功从 JSON 解析意图: {intent} (理由: {reasoning})")
+                    return IntentResult(intent, confidence, entities, reasoning)
+            except Exception as e:
+                logger.debug(f"JSON 预解析失败: {e}")
+
+        # 2. 回退到传统的正则表达式匹配 (针对快捷指令或简单输入)
+        # 研究意图检测
         research_result = self._detect_research_intent(text)
         if research_result:
             intent, confidence, entities = research_result
-            return IntentResult(intent, confidence, entities)
+            return IntentResult(intent, confidence, entities, "正则匹配命中")
 
-        # 2. 搜索意图检测
+        # 搜索意图检测
         search_result = self._detect_search_intent(text)
         if search_result:
             intent, confidence, entities = search_result
-            return IntentResult(intent, confidence, entities)
+            return IntentResult(intent, confidence, entities, "正则匹配命中")
 
         # 3. 默认为普通对话
         return IntentResult(
             intent="chat",
             confidence=0.9,
-            entities={"topic": None}
+            entities={"topic": None},
+            reasoning="未命中特殊意图"
         )
 
     def _detect_research_intent(self, text: str) -> Tuple[str, float, Dict] | None:

@@ -155,6 +155,7 @@ class TranscriptResult:
     source: str = "unknown"  # platform_subtitle | dashscope_asr | local_asr
     language: str = "zh"
     confidence: float = 0.0
+    error_details: str = "" # 新增：记录详细的 ASR 报错信息 (v5.9)
 
     def to_text(self) -> str:
         """转换为带时间戳的文本"""
@@ -187,7 +188,14 @@ class DistilledKnowledge:
     tags: list[str] = field(default_factory=list)
     action_items: list[str] = field(default_factory=list)
     references: list[str] = field(default_factory=list)
-    related_concepts: list[str] = field(default_factory=list)  # 可关联的知识概念
+    related_concepts: list[str] = field(default_factory=list)  # 可关联知识
+    technical_reconstruction: dict = field(default_factory=lambda: {
+        "architecture": "未提取",
+        "tooling": "未提取",
+        "metrics": "未提取",
+        "pitfalls": "未提取"
+    })
+    implementation_guide: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -278,6 +286,8 @@ class ShareTextExtractor:
         r'https?://www\.xiaohongshu\.com/explore/[a-f0-9]+', # 小红书长链
         r'https?://v\.kuaishou\.com/[A-Za-z0-9]+',           # 快手
         r'https?://www\.kuaishou\.com/short-video/[A-Za-z0-9]+',
+        r'https?://(?:www\.)?youtube\.com/watch\?v=[A-Za-z0-9_-]+', # YouTube
+        r'https?://youtu\.be/[A-Za-z0-9_-]+',                      # YouTube Short
         r'https?://t\.cn/[A-Za-z0-9]+',                      # 微博短链
         r'https?://weibo\.com/tv/show/[A-Za-z0-9]+',         # 微博视频
     ]
@@ -445,6 +455,7 @@ class URLResolver:
         "xiaohongshu": ["xiaohongshu.com", "xhslink.com"],
         "kuaishou": ["kuaishou.com", "kuaishou.cn"],
         "weibo": ["weibo.com", "weibo.cn", "t.cn"],
+        "youtube": ["youtube.com", "youtu.be"],
     }
 
     def __init__(self):
@@ -1065,15 +1076,18 @@ class DashScopeASRTranscriber(BaseTranscriber):
             if result.status_code == 200:
                 return self._parse_recognition_result(result)
             else:
-                logger.error(f"DashScope Recognition error: {result.message}")
-                return TranscriptResult()
+                msg = f"DashScope API Error (Code: {result.status_code}, Msg: {result.message})"
+                logger.error(msg)
+                return TranscriptResult(error_details=msg)
 
         except ImportError:
-            logger.error("dashscope not installed. Run: pip install dashscope")
-            return TranscriptResult()
+            msg = "dashscope not installed."
+            logger.error(msg)
+            return TranscriptResult(error_details=msg)
         except Exception as e:
-            logger.error(f"DashScope transcription error: {e}")
-            return TranscriptResult()
+            msg = f"DashScope internal error: {str(e)}"
+            logger.error(msg)
+            return TranscriptResult(error_details=msg)
 
     def _parse_recognition_result(self, result) -> TranscriptResult:
         """解析 Recognition API 返回结果"""
@@ -1109,8 +1123,9 @@ class DashScopeASRTranscriber(BaseTranscriber):
             )
 
         except Exception as e:
-            logger.error(f"Error parsing Recognition result: {e}")
-            return TranscriptResult(full_text=full_text, source="dashscope_recognition")
+            msg = f"Error parsing result: {str(e)}"
+            logger.error(msg)
+            return TranscriptResult(full_text=full_text, source="dashscope_recognition", error_details=msg)
 
     def _ensure_audio_format(self, audio_path: Path) -> Path:
         """确保音频格式符合 Recognition API 要求（16kHz 单声道）
@@ -1265,9 +1280,12 @@ class ImageVideoProcessor:
             try:
                 # 尝试导入 VLM 引擎
                 vlm_path = Path.home() / "zhiwei-rag" / "multimodal"
-                if vlm_path not in [Path(p) for p in sys.path]:
-                    sys.path.insert(0, str(vlm_path.parent))
-                from multimodal.vlm_engine import VLMEngine
+                try:
+                    from multimodal.vlm_engine import VLMEngine
+                except ImportError:
+                    if str(vlm_path.parent) not in sys.path:
+                        sys.path.insert(0, str(vlm_path.parent))
+                    from multimodal.vlm_engine import VLMEngine
 
                 self._vlm_engine = VLMEngine(
                     model_name="qwen-vl-plus",
@@ -1888,9 +1906,12 @@ def retrieve_background_knowledge(keywords: list[str], top_k: int = 3) -> str:
     try:
         # 动态导入避免循环依赖
         rag_path = Path.home() / "zhiwei-rag"
-        if str(rag_path) not in sys.path:
-            sys.path.insert(0, str(rag_path))
-        from retrieve.hybrid_retriever import HybridRetriever
+        try:
+            from retrieve.hybrid_retriever import HybridRetriever
+        except ImportError:
+            if str(rag_path) not in sys.path:
+                sys.path.insert(0, str(rag_path))
+            from retrieve.hybrid_retriever import HybridRetriever
 
         retriever = HybridRetriever()
         background_parts = []
@@ -1928,46 +1949,50 @@ class KnowledgeDistiller:
     默认使用 qwen3.5-plus 模型，自动降级到 glm-5 → MiniMax-M2.5
     """
 
-    SYSTEM_PROMPT = """你是一个专业的知识提取助手，擅长将视频内容转化为结构化的知识笔记。
+    SYSTEM_PROMPT = """你是一个顶级的技术研究员与情报分析师，擅长从视频内容中“脱水”出极高密度的技术情报。
+你的目标是：**拒绝泛泛而谈的摘要，追求能够直接指导工程实现的技术重建。**
 
-**第一步：评估内容质量等级（必须按以下量化标准判断）**
+**第一步：评估内容质量等级（量化标准）**
 
-| 等级 | 信息密度 | 可行动性 | 独特价值 | 判断标准 |
-|------|----------|----------|----------|----------|
-| A级 | 高 | 可直接实施 | 独家/深度 | 3个以上可执行知识点 + 有方法论/原理 + 无需额外资料即可应用 |
-| B级 | 中 | 有参考价值 | 有新信息 | 1-2个可执行知识点 + 介绍具体工具/方法 + 需要查阅文档补充 |
-| C级 | 低 | 启发有限 | 信息泛化 | 无明确可执行点 + 内容浅显/泛泛而谈 + 网上能找到类似内容 |
-| D级 | 极低 | 无 | 无 | 纯广告/重复内容/无实质信息/视频内容与标题不符 |
+| 等级 | 信息密度 | 核心价值 | 判断标准 |
+|------|----------|----------|----------|
+| A级 | 极大 | 能够闭环复现 | 包含详尽的技术路线、算法细节、工具链、对比数据和明确的避坑指南 |
+| B级 | 较大 | 关键点明确 | 介绍具体工具或方法，有清晰的逻辑链路，但部分细节需查阅文档 |
+| C级 | 一般 | 启发/快报性 | 只有概括性介绍，无代码细节或深度原理，仅供跟踪动态 |
+| D级 | 极低 | 无实质内容 | 纯广告、泛娱乐重复内容、或与技术/知识无关 |
 
-**判断流程**：
-1. 统计可执行知识点数量（能直接用起来的建议/方法）
-2. 评估信息独特性（网上是否容易找到同类内容）
-3. 检查是否有方法论/原理层面的解释
-4. 综合判断等级
+**第二步：技术情报重建（核心要求）**
 
-**示例判断**：
-- "介绍一个开源项目，5.3K star，一行代码集成，基于DOM操作..." → B级（有具体工具，需查文档）
-- "教你如何用React实现虚拟列表，包含原理讲解和代码演示..." → A级（有方法论，可直接实施）
-- "今天分享一个AI工具，很好用，大家试试..." → C级（泛泛而谈，无具体方法）
-- "这个产品太牛了，点击链接购买..." → D级（纯广告）
+请**务必且强制**在 `technical_reconstruction` 字段中提供以下详尽信息（严禁省略此字段）：
+1. **architecture**（架构/原理分析）：底层逻辑（如：自回归模型、向量检索等）。
+2. **tooling**（工具链细节）：工具、模型、库、API 版本、环境变量等。
+3. **metrics**（关键数据指标）：性能提升、成本降低、准确率等具体数值。
+4. **pitfalls**（实施细节/避坑指南）：注意点、常见的坑、方案对比。
 
-**第二步：根据等级输出 JSON**
+**第三步：输出 JSON 结构**
 
 ```json
 {
-  "title": "主张式标题（提炼核心观点/价值，而非描述内容）",
-  "core_insight": "核心观点（一句话陈述视频的核心论点或洞见）",
+  "title": "深度情报：[核心点] + [痛点]",
+  "core_insight": "一句话神谕",
   "content_tier": "A/B/C/D",
-  "key_points": [
-    {"timestamp": "MM:SS", "insight": "洞察点（为什么重要/如何应用）"}
-  ],
-  "summary": "见下方摘要模板",
-  "target_audience": "适合谁（如：前端开发者、产品经理、AI爱好者）",
-  "use_cases": "适用场景（如：快速原型开发、自动化测试）",
-  "tags": ["标签1", "标签2", "标签3"],
-  "action_items": ["具体可执行的建议"],
-  "references": ["提到的工具/项目名称"],
-  "related_concepts": ["可关联的知识概念"]
+  "key_points": [{"timestamp": "MM:SS", "insight": "技术锚点"}],
+  "technical_reconstruction": {
+    "architecture": "架构分析",
+    "tooling": "工具清单",
+    "metrics": "指标数据",
+    "pitfalls": "避坑指南"
+  },
+  "summary": "150-300字深度总结",
+  "action_items": ["具体工程建议"],
+  "implementation_guide": {
+    "prerequisites": "环境依赖",
+    "steps": ["复现路径"],
+    "difficulty": "难度",
+    "key_code_logic": "核心逻辑/代码"
+  },
+  "tags": ["标签"],
+  "related_concepts": ["关联知识"]
 }
 ```
 
@@ -2028,8 +2053,11 @@ class KnowledgeDistiller:
     def _init_client(self):
         """初始化统一 LLM 客户端"""
         # 导入统一客户端
-        sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
-        from llm_client import llm_client
+        try:
+            from core.llm_client import llm_client
+        except ImportError:
+            sys.path.insert(0, str(Path(__file__).parent.parent))
+            from core.llm_client import llm_client
 
         self.llm_client = llm_client
         logger.info("Using unified LLM client with distill role (qwen3.5-plus)")
@@ -2109,6 +2137,12 @@ class KnowledgeDistiller:
                 action_items=data.get("action_items", []),
                 references=data.get("references", []),
                 related_concepts=data.get("related_concepts", []),
+                technical_reconstruction=data.get("technical_reconstruction", {
+                    "architecture": "未提取",
+                    "tooling": "未提取",
+                    "metrics": "未提取",
+                    "pitfalls": "未提取"
+                }),
                 implementation_guide=data.get("implementation_guide", {})
             )
         except json.JSONDecodeError as e:
@@ -2164,45 +2198,65 @@ related: [{related_concepts}]
 
 # {title}
 
-> **内容等级：{tier_display}** | 适合：{target_audience}
+> **内容等级：{tier_display}** | **技术重建完成度：高**
 
-## 💡 核心观点
+## 💡 核心深度洞察
 {core_insight}
 
-## 🧠 关键洞察
+## 🏗️ 技术情报重建 (Technical Reconstruction)
+### 架构与原理
+{tech_arch}
+
+### 工具链详情
+{tech_tools}
+
+### 量化指标与数据
+{tech_metrics}
+
+### 实施细节与坑位
+{tech_pitfalls}
+
+## 🧠 关键技术锚点
 {key_points}
 
-## 📝 内容摘要
+## 📝 深度技术摘要 (Intel-Brief)
 {summary}
 
-{use_cases_section}
-
-## 🔗 知识关联
-{related_section}
-
-## ✅ 行动建议
+## ✅ 具体工程建议 (Action Items)
 {action_items_section}
 
-## 🛠️ 实施与复现指南
-- **难度**：{impl_difficulty}
-- **必要依赖**：{impl_prerequisites}
-- **核心逻辑**：
-```python
+## 🛠️ 研发/复现指南
+- **难度等级**：{impl_difficulty}
+- **环境依赖**：{impl_prerequisites}
+- **核心逻辑/代码**：
+```text
 {impl_code_logic}
 ```
-- **复现步骤**：
+- **复现路径**：
 {impl_steps}
 
 {references_section}
 
 ## 📂 关联资产
 - 🎙️ 原始音频：[点击播放]({asset_audio_url})
-- 📄 完整转录：[查看全文]({asset_transcript_url})
+- 📄 转录简报：[查看摘要]({asset_transcript_url})
+
+---
 
 ## 📹 原始信息
 - 来源平台：{platform}
 - 作者：{author}
 - 原始链接：[点击查看]({source_url})
+
+---
+
+## 📜 详细 ASR 转录文本 (完整保留)
+<details>
+<summary>点击展开 100% 原始转录细节（防止信息丢失）</summary>
+
+{full_transcript}
+
+</details>
 
 ---
 > 由知微系统生成，建议关联已有知识并添加个人洞察。
@@ -2288,7 +2342,12 @@ related: [{related_concepts}]
             impl_code_logic=impl_code_logic,
             impl_steps=impl_steps,
             asset_audio_url=asset_audio_url,
-            asset_transcript_url=asset_transcript_url
+            asset_transcript_url=asset_transcript_url,
+            tech_arch=knowledge.technical_reconstruction.get("architecture", "未提取"),
+            tech_tools=knowledge.technical_reconstruction.get("tooling", "未提取"),
+            tech_metrics=knowledge.technical_reconstruction.get("metrics", "未提取"),
+            tech_pitfalls=knowledge.technical_reconstruction.get("pitfalls", "未提取"),
+            full_transcript=transcript.to_text()
         )
 
         filename = f"{date_str}_{safe_title}.md"
@@ -2376,9 +2435,11 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
         return 1
 
     if not transcript.full_text:
-        error_json = json.dumps({"error_type": VideoErrorType.ASR_FAILED.value, "error_message": "无法获取转录文本"})
+        # 优先使用透传的详细报错
+        err_msg = transcript.error_details or "无法获取转录文本 (ASR 返回空或识别失败)"
+        error_json = json.dumps({"error_type": VideoErrorType.ASR_FAILED.value, "error_message": err_msg})
         print(error_json, file=sys.stderr)
-        logger.error("Failed to get transcript")
+        logger.error(f"Failed to get transcript: {err_msg}")
         return 1
 
     logger.info(f"Transcript source: {transcript.source}")

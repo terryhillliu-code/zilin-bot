@@ -6,10 +6,7 @@
 """
 
 # 加载全局密钥 (必须在最前面，在导入其他模块之前)
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path.home() / "scripts"))
-from load_secrets import load_secrets
+from zhiwei_common.secrets import load_secrets
 load_secrets(silent=True)
 
 import lark_oapi as lark
@@ -18,6 +15,7 @@ import json
 import re
 import subprocess
 import os
+import sys
 import tempfile
 import base64
 import threading
@@ -46,10 +44,8 @@ from media_handler import (
 
 from command_handler import handle_text_async, show_help, get_session_id, get_quick_status, check_rate_limit
 
-import sys
-import os
-sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
-from message_bus import MessageBus
+# 使用统一共享包 (v57.0)
+from zhiwei_common.message_client import MessageBus
 
 # ========== 全局状态 ==========
 
@@ -404,19 +400,24 @@ def do_p2_card_action_trigger_v1(data) -> None:
 
             print(f"[WSClient] 研究卡片确认: topic={topic}, videos={include_videos}")
 
-            reply_message(message_id, f"🚀 正在为您准备「{topic}」的研究素材...")
+            reply_message(message_id, f"🚀 确认收到调研请求：「{topic}」\n已提交至巡检中心 (zhiwei-dev)，正在排队执行。")
 
-            # 触发研究执行器
-            from core.research_report_executor import research_executor
+            # 统一入队 zhiwei-dev (backend='research')
+            from zhiwei_common import TaskStore
+            store = TaskStore()
+            
             research_topic = topic
             if include_videos:
                 research_topic += " --include-videos"
 
-            threading.Thread(
-                target=research_executor.execute,
-                args=(research_topic, user_id, message_id, reply_message, reply_card),
-                daemon=True
-            ).start()
+            task_id = store.enqueue(research_topic, message_id=message_id, backend="research")
+            
+            # 记录用户映射
+            user_mappings_dir = os.path.expanduser("~/zhiwei-dev/user_mappings")
+            os.makedirs(user_mappings_dir, exist_ok=True)
+            with open(os.path.join(user_mappings_dir, f"task_{task_id}_user.json"), "w") as f:
+                json.dump({"user_id": user_id, "message_id": message_id, "source": "feishu"}, f)
+            
             return
 
         elif action_type == "cancel_research":
@@ -546,8 +547,7 @@ def main():
 
         # 尝试通过钉钉发送
         try:
-            sys.path.insert(0, os.path.expanduser("~/zhiwei-scheduler"))
-            from pusher import DingTalkPusher
+            from zhiwei_common import DingTalkPusher
             import yaml
 
             config_path = os.path.expanduser("~/zhiwei-scheduler/config/settings.yaml")
@@ -670,8 +670,8 @@ def main():
 
         while True:
             try:
-                # 消费飞书通知和审批主题
-                topics = ["feishu_notification", "feishu_card_notification"]
+                # 消费飞书通知和审批主题 (v55.0: 包含 legacy notification)
+                topics = ["feishu_notification", "feishu_card_notification", "notification"]
                 for topic in topics:
                     try:
                         messages = mb.consume_pending(topic=topic, limit=5)
@@ -688,7 +688,7 @@ def main():
                                     mb.mark_failed(msg["id"], "No target user found")
                                     continue
 
-                                if topic == "feishu_notification":
+                                if topic in ["feishu_notification", "notification"]:
                                     success = _feishu_api_mod.send_direct_message(target_user, msg["content"])
                                 else:
                                     # 卡片消息 - 自动识别 ID 类型
