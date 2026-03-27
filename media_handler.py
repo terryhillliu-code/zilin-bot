@@ -181,19 +181,39 @@ def handle_image_async(message_id: str, image_key: str, user_id: str):
 # ========== 视频链接 ==========
 
 def extract_video_url(text: str) -> str:
-    """提取视频 URL"""
+    """提取视频 URL
+
+    支持格式：
+    - https://v.douyin.com/xxx/ (短链)
+    - https://www.douyin.com/video/xxx (长链)
+    - douyin.com/video/xxx (无协议前缀，抖音新分享格式)
+    - https://douyin.com/video/xxx (无 www)
+    - B站、YouTube 等
+    """
     patterns = [
+        # 抖音短链
         r'(https?://v\.douyin\.com/[A-Za-z0-9_-]+/?)',
+        # 抖音长链（带 www）
         r'(https?://www\.douyin\.com/video/\d+)',
+        # 抖音长链（无 www，新版分享格式）
+        r'(https?://douyin\.com/video/\d+)',
+        # 抖音长链（无协议前缀，需要补全）
+        r'(?<![\w./])(douyin\.com/video/\d+)',
+        # YouTube
         r'(https?://(?:www\.)?youtube\.com/watch\?v=[A-Za-z0-9_-]+)',
         r'(https?://youtu\.be/[A-Za-z0-9_-]+)',
+        # B站
         r'(https?://(?:www\.)?bilibili\.com/video/[A-Za-z0-9_-]+)',
         r'(https?://b23\.tv/[A-Za-z0-9_-]+)'
     ]
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
-            return match.group(1)
+            url = match.group(1)
+            # 补全协议前缀
+            if url.startswith('douyin.com'):
+                url = 'https://' + url
+            return url
     return None
 
 
