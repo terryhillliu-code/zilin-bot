@@ -509,6 +509,18 @@ def main():
     except Exception as e:
         print(f"⚠️ 离线恢复模块初始化失败: {e}")
 
+    # ⭐ 初始化视频处理告警用户
+    try:
+        from video_history import set_alert_user
+        alert_user_id = os.getenv("ALERT_USER_ID")
+        if alert_user_id:
+            set_alert_user(alert_user_id)
+            print(f"✅ 视频处理告警用户已设置: {alert_user_id[:8]}...")
+        else:
+            print("ℹ️ ALERT_USER_ID 未配置，视频处理告警未启用")
+    except Exception as e:
+        print(f"⚠️ 告警用户设置失败: {e}")
+
     # ISSUE-003: 断连监控和告警线程
     from datetime import datetime
 
