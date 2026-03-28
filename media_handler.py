@@ -14,6 +14,13 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+# 导入统一的 API Key 获取函数
+try:
+    from zhiwei_common import get_api_key
+except ImportError:
+    sys.path.insert(0, str(Path.home() / "zhiwei-common"))
+    from zhiwei_common import get_api_key
+
 # 引入 distiller 以便复用 ASR 逻辑 (v6.0)
 try:
     from scripts.douyin_distiller import DashScopeASRTranscriber
@@ -497,10 +504,10 @@ def transcribe_audio(audio_path: str) -> str:
         return None
 
     try:
-        # 获取 API key（由 ws_client.py 通过 load_secrets() 加载）
-        api_key = os.getenv("DASHSCOPE_API_KEY")
+        # 获取 API key（使用统一的延迟加载）
+        api_key = get_api_key(["BAILIAN_API_KEY", "CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY"])
         if not api_key:
-            logger.error("DASHSCOPE_API_KEY 未配置")
+            logger.error("API Key 未配置")
             return None
 
         transcriber = DashScopeASRTranscriber(api_key)

@@ -28,6 +28,13 @@ from enum import Enum
 import requests
 from dotenv import load_dotenv
 
+# 导入统一的 API Key 获取函数
+try:
+    from zhiwei_common import get_api_key
+except ImportError:
+    sys.path.insert(0, str(Path.home() / "zhiwei-common"))
+    from zhiwei_common import get_api_key
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -232,9 +239,9 @@ class AppConfig:
         if not loaded:
             logger.warning("No .env file found, using environment variables")
 
-        # API 配置
-        self.dashscope_api_key = os.getenv("DASHSCOPE_API_KEY", "")
-        self.qwen_model = os.getenv("QWEN_MODEL", "qwen-plus")
+        # API 配置 - 使用统一的延迟加载
+        self.dashscope_api_key = get_api_key(["BAILIAN_API_KEY", "CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY"]) or ""
+        self.qwen_model = os.getenv("QWEN_MODEL", "qwen3.5-plus")
         self.asr_model = os.getenv("ASR_MODEL", "paraformer-realtime-v2")
         self.asr_policy = os.getenv("ASR_POLICY", "auto")
         self.local_asr_model = os.getenv("LOCAL_ASR_MODEL", "small")
