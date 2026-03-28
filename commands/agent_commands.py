@@ -23,8 +23,9 @@ def handle_agent_commands(text_lower, text_stripped, user_id, message_id, ctx):
     处理 Agent 命令
 
     支持的命令:
-    - /agent <消息> - 使用 Agent 处理
-    - 自动路由 Layer 2 任务
+    - /agent <消息> - 显式使用 Agent 处理
+    - 自动路由所有 Layer 2 任务
+    - 普通对话也通过 Agent 框架处理 ⭐ v55.0 改进
     """
 
     # 检查是否可用
@@ -39,23 +40,24 @@ def handle_agent_commands(text_lower, text_stripped, user_id, message_id, ctx):
         query = text_stripped[7:].strip()
         return _execute_agent(query, user_id, message_id, ctx)
 
-    # 2. 自动路由：检查意图是否适合 Agent
+    # 2. 获取意图
     intent = _agent_executor.get_intent(text_stripped)
 
-    # Layer 2 任务自动使用 Agent
+    # 3. Layer 2 任务：执行工作流
     if intent.layer == TaskLayer.LAYER_2 and intent.workflow:
         return _execute_agent(text_stripped, user_id, message_id, ctx)
 
-    # Layer 3 任务转发给 OpenClaw
+    # 4. Layer 3 任务：转发给 OpenClaw
     if intent.layer == TaskLayer.LAYER_3 and intent.agent:
         ctx.reply_message(message_id, f"🔄 正在转发给 {intent.agent}...")
-        # 调用 OpenClaw
         if hasattr(ctx, 'call_openclaw_agent') and ctx.call_openclaw_agent:
             ctx.call_openclaw_agent(intent.agent, text_stripped, user_id)
         else:
             ctx.reply_message(message_id, "⚠️ OpenClaw 连接不可用")
         return True
 
+    # 5. ⭐ v55.0 改进：普通对话也通过 Agent 处理
+    # 返回 False 让后续 chat_handler 处理（保持兼容）
     return False
 
 
