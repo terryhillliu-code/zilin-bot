@@ -1772,32 +1772,50 @@ class TranscriptProvider:
             return None
 
     def _transcribe_with_asr(self, video_info: VideoInfo, save_audio_path: Optional[Path] = None) -> TranscriptResult:
-        """使用 ASR 转录"""
+        """使用 ASR 转录 - 带自动降级"""
         with tempfile.TemporaryDirectory(prefix="distill_") as tmpdir:
             tmpdir_path = Path(tmpdir)
-            
+
             # 如果提供了持久化路径，直接使用；否则使用临时路径
             audio_path = save_audio_path or (tmpdir_path / "audio")
-            
+
             # 提取音频
             if not self.media_extractor.extract_audio(video_info, audio_path):
                 logger.error("Failed to extract audio")
                 return TranscriptResult()
-            
+
             # 确保使用带后缀的路径进行识别 (MediaExtractor.extract_audio 会自动补全 .mp3)
             actual_audio_path = audio_path.with_suffix(".mp3")
 
-            # 优先使用 DashScope
+            # 策略：优先云端，失败自动降级到本地
+            transcript_result = None
+
+            # 1. 尝试 DashScope ASR
             if self.dashscope_transcriber.is_available():
-                logger.info("Using DashScope ASR")
-                return self.dashscope_transcriber.transcribe(actual_audio_path)
+                logger.info("尝试 DashScope ASR...")
+                try:
+                    transcript_result = self.dashscope_transcriber.transcribe(actual_audio_path)
+                    if transcript_result and transcript_result.full_text:
+                        logger.info(f"DashScope ASR 成功: {len(transcript_result.full_text)} 字符")
+                        return transcript_result
+                    logger.warning("DashScope ASR 返回空结果，尝试降级")
+                except Exception as e:
+                    logger.warning(f"DashScope ASR 失败: {e}，尝试降级到本地 Whisper")
 
-            # 兜底使用本地 ASR
+            # 2. 降级到本地 MLX Whisper
             if self.local_transcriber.is_available():
-                logger.info("Using local MLX Whisper ASR")
-                return self.local_transcriber.transcribe(actual_audio_path)
+                logger.info("使用本地 MLX Whisper ASR（降级模式）")
+                try:
+                    transcript_result = self.local_transcriber.transcribe(actual_audio_path)
+                    if transcript_result and transcript_result.full_text:
+                        logger.info(f"本地 Whisper ASR 成功: {len(transcript_result.full_text)} 字符")
+                        return transcript_result
+                    logger.warning("本地 Whisper ASR 返回空结果")
+                except Exception as e:
+                    logger.error(f"本地 Whisper ASR 也失败: {e}")
 
-            logger.error("No ASR service available")
+            # 3. 无可用服务
+            logger.error("No ASR service available (云端和本地都失败)")
             return TranscriptResult()
 
 
