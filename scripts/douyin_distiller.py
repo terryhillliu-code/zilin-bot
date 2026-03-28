@@ -30,10 +30,10 @@ from dotenv import load_dotenv
 
 # 导入统一的 API Key 获取函数
 try:
-    from zhiwei_common import get_api_key
+    from zhiwei_common import get_api_key, get_asr_key, get_llm_key
 except ImportError:
     sys.path.insert(0, str(Path.home() / "zhiwei-common"))
-    from zhiwei_common import get_api_key
+    from zhiwei_common import get_api_key, get_asr_key, get_llm_key
 
 # 配置日志
 logging.basicConfig(
@@ -239,9 +239,9 @@ class AppConfig:
         if not loaded:
             logger.warning("No .env file found, using environment variables")
 
-        # API 配置 - 使用统一的延迟加载
-        # ASR 优先使用 DASHSCOPE_API_KEY（百炼 key 对 DashScope ASR 无效）
-        self.dashscope_api_key = get_api_key(["DASHSCOPE_API_KEY", "BAILIAN_API_KEY", "CODING_PLAN_API_KEY"]) or ""
+        # API 配置 - 使用分离的 key 管理器
+        # ASR 专用 key（仅 DASHSCOPE_API_KEY 有效）
+        self.dashscope_api_key = get_asr_key() or ""
         self.qwen_model = os.getenv("QWEN_MODEL", "qwen3.5-plus")
         self.asr_model = os.getenv("ASR_MODEL", "paraformer-realtime-v2")
         self.asr_policy = os.getenv("ASR_POLICY", "auto")
