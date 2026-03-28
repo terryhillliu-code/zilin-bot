@@ -3,6 +3,7 @@ from .research_commands import handle_research_commands
 from .system_commands import handle_system_commands
 from .knowledge_commands import handle_knowledge_commands
 from .media_commands import handle_media_commands
+from .agent_commands import handle_agent_commands
 from .chat_handler import ChatHandler
 
 __all__ = [
@@ -11,5 +12,6 @@ __all__ = [
     "handle_system_commands",
     "handle_knowledge_commands",
     "handle_media_commands",
+    "handle_agent_commands",
     "ChatHandler"
 ]

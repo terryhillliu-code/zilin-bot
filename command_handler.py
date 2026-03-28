@@ -18,6 +18,7 @@ from commands import (
     handle_system_commands,
     handle_knowledge_commands,
     handle_media_commands,
+    handle_agent_commands,
     ChatHandler
 )
 
@@ -76,7 +77,11 @@ def handle_text_async(text, user_id, message_id, user_role="user"):
         if handle_media_commands(text_lower, text_stripped, user_id, message_id, _ctx):
             return
 
-        # 2. 传统对话
+        # 2. Agent 智能路由 (Layer 2/3)
+        if handle_agent_commands(text_lower, text_stripped, user_id, message_id, _ctx):
+            return
+
+        # 3. 传统对话
         handler = ChatHandler(_ctx.reply_message, _ctx.reply_card, _ctx.get_memory, _ctx.add_to_history)
         handler.handle_chat_message(text_stripped, user_id, message_id, session_id)
 
