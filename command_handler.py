@@ -19,6 +19,7 @@ from commands import (
     handle_knowledge_commands,
     handle_media_commands,
     handle_agent_commands,
+    handle_lark_commands,  # ⭐ v57.0
     ChatHandler
 )
 
@@ -75,6 +76,10 @@ def handle_text_async(text, user_id, message_id, user_role="user"):
             return
 
         if handle_media_commands(text_lower, text_stripped, user_id, message_id, _ctx):
+            return
+
+        # ⭐ v57.0 飞书操作命令
+        if handle_lark_commands(text_lower, text_stripped, user_id, message_id, _ctx):
             return
 
         # 2. Agent 智能路由 (Layer 2/3)
