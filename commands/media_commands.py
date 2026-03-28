@@ -3,34 +3,33 @@ import json
 from pathlib import Path
 from zhiwei_common.config import ZHIWEI_BOT
 
+# 直接导入视频历史管理器（避免 ctx 传递问题）
+try:
+    from video_history import get_video_history
+    _video_history = get_video_history()
+except ImportError:
+    _video_history = None
+
 def handle_media_commands(text_lower, text_stripped, user_id, message_id, ctx):
     """处理视频链接、语音任务等媒体指令"""
     reply_message = ctx.reply_message
-    
+
     # 1. 视频链接
     if ctx.is_video_url(text_stripped):
-        video_history = ctx.get_video_history()
         url = ctx.extract_video_url(text_stripped)
-        
-        if video_history and url:
-            dup = video_history.check_duplicate(url)
+
+        # 检查重复视频
+        if _video_history and url:
+            dup = _video_history.check_duplicate(url)
             if dup:
-                if ctx.pending_video_confirm is not None:
-                    ctx.pending_video_confirm[user_id] = {
-                        "url": url,
-                        "history": dup,
-                        "text": text_stripped,
-                        "message_id": message_id
-                    }
-                
                 title = dup.get('title', '未知')[:50]
                 processed_at = dup.get('processed_at', '未知')[:10]
                 output_path = dup.get('output_path', '')
-                output_name = output_path[-50:]
-                
+                output_name = output_path[-50:] if output_path else '未知'
+
                 reply_message(message_id, f"⚠️ 检测到重复视频\n\n📺 标题: {title}\n📅 处理时间: {processed_at}\n📁 输出文件: ...{output_name}\n\n👉 回复「继续」重新处理，或「取消」放弃")
                 return True
-                
+
         reply_message(message_id, "🎬 开始分析视频...\n\n⏳ 预计需要3-5分钟，完成后自动回复")
         ctx.handle_video_async(text_stripped, message_id, user_id)
         return True
