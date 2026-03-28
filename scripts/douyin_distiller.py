@@ -2054,10 +2054,10 @@ class KnowledgeDistiller:
         """初始化统一 LLM 客户端"""
         # 导入统一客户端
         try:
-            from core.llm_client import llm_client
+            from llm_client import llm_client
         except ImportError:
             sys.path.insert(0, str(Path(__file__).parent.parent))
-            from core.llm_client import llm_client
+            from llm_client import llm_client
 
         self.llm_client = llm_client
         logger.info("Using unified LLM client with distill role (qwen3.5-plus)")
