@@ -625,7 +625,15 @@ class MediaExtractor:
         raise RuntimeError("yt-dlp not found. Install with: pip install yt-dlp")
 
     def extract_subtitles(self, video_info: VideoInfo) -> Optional[TranscriptResult]:
-        """提取平台字幕（如果有）"""
+        """提取平台字幕（如果有）
+
+        v2.1: 抖音平台使用 DouyinAPIClient 获取文案作为字幕
+        """
+        # ⭐ 抖音平台：使用本地 API 获取文案作为字幕
+        if video_info.platform == "douyin":
+            return self._extract_douyin_subtitle(video_info)
+
+        # 其他平台：使用 yt-dlp
         import yt_dlp
 
         logger.info(f"Extracting subtitles from {video_info.resolved_url}")
@@ -678,6 +686,57 @@ class MediaExtractor:
 
         except Exception as e:
             logger.error(f"Error extracting subtitles: {e}")
+            return None
+
+    def _extract_douyin_subtitle(self, video_info: VideoInfo) -> Optional[TranscriptResult]:
+        """从抖音 API 获取视频文案作为字幕
+
+        Args:
+            video_info: 视频信息
+
+        Returns:
+            TranscriptResult（文案作为字幕），失败返回 None
+        """
+        try:
+            client = DouyinAPIClient()
+
+            logger.info(f"Fetching douyin video info for subtitle: {video_info.original_url}")
+            video_data = client.get_video_data(video_info.original_url)
+
+            # 抖音视频的 desc 字段通常是字幕/文案内容
+            desc = video_data.get("desc", "")
+            if not desc:
+                logger.info("No description/subtitle from Douyin API")
+                return None
+
+            # 更新视频信息
+            video_info.title = desc[:100] if len(desc) > 100 else desc
+
+            author_info = video_data.get("author", {})
+            video_info.author = author_info.get("nickname", "")
+
+            # 构造 TranscriptResult（抖音文案作为完整文本）
+            # 由于没有时间戳，创建一个整体 segment
+            from dataclasses import dataclass
+
+            segment = TranscriptSegment(
+                start=0.0,
+                end=float(video_data.get("video", {}).get("duration", 0)),
+                text=desc
+            )
+
+            logger.info(f"Douyin subtitle extracted: {len(desc)} characters")
+
+            return TranscriptResult(
+                segments=[segment],
+                full_text=desc,
+                source="douyin_desc",
+                language="zh",
+                confidence=1.0
+            )
+
+        except Exception as e:
+            logger.error(f"Douyin subtitle extraction failed: {e}")
             return None
 
     def _download_and_parse_subtitles(self, url: str) -> TranscriptResult:
