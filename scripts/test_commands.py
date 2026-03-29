@@ -179,7 +179,8 @@ def test_knowledge_collect():
     """测试 /收录 依赖"""
     try:
         script_path = os.path.expanduser("~/zhiwei-bot/scripts/knowledge_collect.py")
-        venv_python = os.path.expanduser("~/zhiwei-bot/venv/bin/python")
+        # 使用共享 venv (v2.0 合并后)
+        venv_python = os.path.expanduser("~/zhiwei-shared-venv/bin/python")
 
         import subprocess
         result = subprocess.run(
