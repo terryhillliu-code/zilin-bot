@@ -5,6 +5,7 @@
 """
 
 import os
+import sys
 import json
 import logging
 from pathlib import Path
@@ -64,12 +65,12 @@ def extract_tasks(text: str) -> List[Dict]:
     try:
         # 导入 llm_client
         try:
-            from core.llm_client import llm_client
+            from llm_client import llm_client
         except ImportError:
             bot_dir = Path(__file__).parent
             if str(bot_dir) not in sys.path:
                 sys.path.insert(0, str(bot_dir))
-            from core.llm_client import llm_client
+            from llm_client import llm_client
 
         # 加载 Prompt
         system_prompt = load_prompt()
