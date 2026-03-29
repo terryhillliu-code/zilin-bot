@@ -352,7 +352,8 @@ def process_video(text: str, message_id: str = None) -> str:
 
         # 调用宿主机 Distiller
         distiller_path = os.path.expanduser("~/zhiwei-bot/scripts/douyin_distiller.py")
-        venv_python = os.path.expanduser("~/zhiwei-bot/venv/bin/python")
+        # 使用共享 venv (v2.0 合并后)
+        venv_python = os.path.expanduser("~/zhiwei-shared-venv/bin/python")
 
         cmd = [
             venv_python, distiller_path,
