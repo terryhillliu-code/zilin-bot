@@ -225,14 +225,68 @@ def get_chat_handler():
 
 def call_openclaw_agent(message: str, session_id: str, agent: str = "main") -> str:
     """
-    调用 OpenClaw Agent
+    调用 OpenClaw Agent（真正的执行层）
 
-    @deprecated V2-203: 已废弃，请使用 get_chat_handler().handle_sync()
-    保留此函数是为了向后兼容，实际调用已切换到 chat_handler
+    v55.6 修复架构断裂：
+    - 真正调用 OpenClaw 容器的 agent 命令
+    - 如果 OpenClaw 不可用，降级到 chat_handler
     """
-    # 降级：使用 chat_handler
-    handler = get_chat_handler()
-    return handler.handle_sync(message, session_id, role=agent)
+    import logging
+    logger = logging.getLogger(__name__)
+
+    try:
+        # 构建命令
+        cmd = [
+            "docker", "exec", "clawdbot",
+            "openclaw", "agent",
+            "--agent", agent,
+            "--message", message,
+            "--session-id", f"zhiwei-{session_id}",
+            "--json"
+        ]
+
+        # 调用 OpenClaw
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120  # 2 分钟超时
+        )
+
+        if result.returncode != 0:
+            logger.warning(f"OpenClaw 返回错误: {result.stderr[:200]}")
+            # 降级到 chat_handler
+            handler = get_chat_handler()
+            return handler.handle_sync(message, session_id, role=agent)
+
+        # 解析 JSON 结果
+        try:
+            data = json.loads(result.stdout)
+            if data.get("status") == "ok" and data.get("result"):
+                payloads = data["result"].get("payloads", [])
+                if payloads and payloads[0].get("text"):
+                    return payloads[0]["text"]
+        except json.JSONDecodeError as e:
+            logger.warning(f"OpenClaw JSON 解析失败: {e}")
+
+        # 降级到 chat_handler
+        handler = get_chat_handler()
+        return handler.handle_sync(message, session_id, role=agent)
+
+    except subprocess.TimeoutExpired:
+        logger.warning("OpenClaw 调用超时，降级到 chat_handler")
+        handler = get_chat_handler()
+        return handler.handle_sync(message, session_id, role=agent)
+
+    except FileNotFoundError:
+        logger.warning("Docker 命令不可用，降级到 chat_handler")
+        handler = get_chat_handler()
+        return handler.handle_sync(message, session_id, role=agent)
+
+    except Exception as e:
+        logger.error(f"OpenClaw 调用异常: {e}")
+        handler = get_chat_handler()
+        return handler.handle_sync(message, session_id, role=agent)
 
 # 初始化命令处理模块（需要 call_openclaw_agent 已定义）
 from command_handler import init_command_handler
