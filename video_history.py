@@ -35,11 +35,11 @@ class VideoErrorType(Enum):
 
 
 # 可重试的错误类型
-RETRYABLE_ERRORS = [VideoErrorType.NETWORK_ERROR, VideoErrorType.ASR_FAILED, VideoErrorType.TIMEOUT]
+RETRYABLE_ERRORS = [VideoErrorType.NETWORK_ERROR, VideoErrorType.ASR_FAILED, VideoErrorType.TIMEOUT, VideoErrorType.API_ERROR]  # ⭐ v64.0 新增 API_ERROR
 MAX_RETRIES = 3
 
 # 需要发送告警的错误类型
-ALERTABLE_ERRORS = [VideoErrorType.COOKIE_EXPIRED]
+ALERTABLE_ERRORS = [VideoErrorType.COOKIE_EXPIRED, VideoErrorType.API_ERROR]  # ⭐ v64.0 新增 API_ERROR（服务不可用）
 
 # 告警接收用户 ID（从环境变量或配置读取）
 ALERT_USER_ID = None  # 在运行时设置
@@ -294,6 +294,7 @@ class VideoHistory:
                 VideoErrorType.COOKIE_EXPIRED: "🍪 Cookie 过期",
                 VideoErrorType.VIDEO_NOT_FOUND: "🗑️ 视频不存在",
                 VideoErrorType.VIDEO_PRIVATE: "🔒 私密视频",
+                VideoErrorType.API_ERROR: "🔌 API 服务不可用",  # ⭐ v64.0 新增
             }.get(error_type, f"❌ {error_type.value}")
 
             alert_msg = f"""⚠️ 抖音视频处理告警
