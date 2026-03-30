@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """
-Obsidian CLI v2.0 - 知微 Vault 智能管理工具
+Obsidian CLI v3.0 - 知微 Vault 智能管理工具
 
-新增功能:
-- summarize: LLM 智能总结
-- related: 知识关联分析
-- share: 分享到飞书
-
-改进功能:
-- search: 多级优先级搜索 + 摘要预览
-- read: 支持 --summarize 选项
+核心改进：
+- 自然语言智能入口：直接说需求，自动理解执行
+- 一站式操作：搜索+总结+分享，一气呵成
 
 用法:
-    obsidian-cli search <query> [--preview] [--tag TAG]
-    obsidian-cli read <note_name> [--summarize]
-    obsidian-cli summarize <note_name>
-    obsidian-cli related <note_name>
-    obsidian-cli share <note_name> --to feishu [--mode summary|full]
-    obsidian-cli create <title> [--category Inbox] [--tags tag1,tag2]
-    obsidian-cli recent [--limit 10]
+    # 自然语言模式（推荐）
+    obsidian-cli "帮我总结 Agent 那篇笔记发到飞书"
+    obsidian-cli "找找 RAG 相关的笔记"
+    obsidian-cli "最近写了什么"
+
+    # 传统命令模式
+    obsidian-cli search <query> [--preview]
+    obsidian-cli summarize <note>
+    obsidian-cli share <note> --to feishu
+    obsidian-cli related <note>
     obsidian-cli stats
 """
 import sys
@@ -120,9 +118,12 @@ def extract_preview(content: str, query: str = None, max_len: int = 200) -> str:
 
 
 def read_note(note_name: str) -> Optional[Dict]:
-    """读取笔记内容"""
+    """读取笔记内容（支持模糊匹配）"""
+    note_name_lower = note_name.lower()
+
+    # 先尝试精确匹配
     for md_file in VAULT_PATH.rglob("*.md"):
-        if note_name.lower() in md_file.stem.lower():
+        if note_name_lower == md_file.stem.lower():
             try:
                 with open(md_file, 'r', encoding='utf-8') as f:
                     content = f.read()
@@ -137,6 +138,45 @@ def read_note(note_name: str) -> Optional[Dict]:
                 }
             except Exception:
                 pass
+
+    # 尝试部分匹配（标题或文件名包含关键词）
+    best_match = None
+    best_score = 0
+
+    for md_file in VAULT_PATH.rglob("*.md"):
+        try:
+            with open(md_file, 'r', encoding='utf-8') as f:
+                content = f.read(1000)
+
+            title = extract_title(content, md_file.stem)
+            title_lower = title.lower()
+            stem_lower = md_file.stem.lower()
+
+            # 计算匹配分数
+            score = 0
+            if note_name_lower in title_lower:
+                score = 100 + len(note_name)  # 标题匹配优先
+            elif note_name_lower in stem_lower:
+                score = 80 + len(note_name)  # 文件名匹配
+
+            if score > best_score:
+                best_score = score
+                best_match = (md_file, content, title)
+        except Exception:
+            pass
+
+    if best_match:
+        md_file, content, title = best_match
+        return {
+            "title": title,
+            "path": str(md_file.relative_to(VAULT_PATH)),
+            "content": content,
+            "size": len(content),
+            "modified": datetime.fromtimestamp(md_file.stat().st_mtime).isoformat(),
+            "tags": extract_tags(content),
+            "wikilinks": extract_wikilinks(content)
+        }
+
     return None
 
 
@@ -464,6 +504,203 @@ def share_to_feishu(note_name: str, mode: str = "summary") -> Dict:
         return {"error": f"推送异常: {str(e)}"}
 
 
+# ============== 自然语言智能入口 ==============
+
+def parse_natural_language(message: str) -> Dict:
+    """解析自然语言，提取意图和实体
+
+    Returns:
+        {
+            "actions": ["search", "summarize", "share"],
+            "entities": {"note": "Agent", "platform": "feishu"},
+            "original": "帮我总结 Agent 那篇笔记发到飞书"
+        }
+    """
+    actions = []
+    entities = {}
+    message_lower = message.lower()
+
+    # 1. 识别动作
+    if any(kw in message for kw in ["总结", "摘要", "summarize", "概括"]):
+        actions.append("summarize")
+
+    if any(kw in message for kw in ["搜索", "查找", "找找", "找", "寻找", "有哪些", "关于"]):
+        actions.append("search")
+
+    if any(kw in message for kw in ["分享", "发送", "发到", "推送到", "share", "飞书", "feishu"]):
+        actions.append("share")
+
+    if any(kw in message for kw in ["关联", "相关", "关系", "related"]):
+        actions.append("related")
+
+    if any(kw in message for kw in ["最近", "最新", "recent"]):
+        actions.append("recent")
+
+    if any(kw in message for kw in ["统计", "多少", "stats"]):
+        actions.append("stats")
+
+    # 2. 提取笔记名/关键词（改进版）
+    # 按优先级匹配
+
+    # 模式1：引号内的内容
+    quote_match = re.search(r"['""](.+?)['""]", message)
+    if quote_match:
+        entities["note"] = quote_match.group(1).strip()
+    else:
+        # 模式2：常见句式
+        patterns = [
+            r"总结\s+(.+?)(?:的|那篇|这篇)?笔记",
+            r"(.+?)那篇笔记",
+            r"关于\s+(.+?)(?:的)?笔记",
+            r"找找?\s*(.+?)(?:相关)?(?:的)?笔记",
+            r"搜索\s+(.+?)(?:相关)?(?:的)?笔记",
+            r"(.+?)笔记",
+            r"关联\s+(.+?)(?:的)?笔记",
+            r"分享\s+(.+?)(?:的)?笔记",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, message)
+            if match:
+                candidate = match.group(1).strip()
+                # 清理常见干扰词
+                for stop_word in ["相关", "的", "这篇", "那篇"]:
+                    candidate = candidate.replace(stop_word, "")
+                if candidate:
+                    entities["note"] = candidate.strip()
+                    break
+
+        # 模式3：提取技术关键词（AI/LLM/RAG/Agent等）
+        if not entities.get("note"):
+            tech_keywords = [
+                "AI", "LLM", "RAG", "Agent", "Transformer", "MoE", "LoRA",
+                "GPT", "BERT", "Claude", "Docker", "Kubernetes", "React",
+                "Vue", "Python", "Go", "Rust", "CUDA", "GPU", "CPU",
+                "向量库", "知识库", "模型", "神经网络", "深度学习",
+            ]
+            for kw in tech_keywords:
+                if kw.lower() in message_lower:
+                    entities["note"] = kw
+                    break
+
+    # 3. 提取平台
+    if "飞书" in message or "feishu" in message_lower:
+        entities["platform"] = "feishu"
+
+    # 4. 如果没有识别到动作，根据内容推断
+    if not actions:
+        if entities.get("note"):
+            actions.append("search")
+        elif "笔记" in message or "写了" in message:
+            actions.append("recent")
+
+    return {
+        "actions": actions,
+        "entities": entities,
+        "original": message
+    }
+
+
+def smart_execute(message: str) -> str:
+    """智能执行自然语言命令
+
+    一次性完成多个操作，返回汇总结果
+    """
+    parsed = parse_natural_language(message)
+    actions = parsed["actions"]
+    entities = parsed["entities"]
+
+    if not actions:
+        # 无法识别，尝试作为搜索关键词
+        return f"🤔 未能理解「{message}」，请尝试更明确的表达。\n示例：\n  - 总结 Agent 那篇笔记\n  - 找 RAG 相关的笔记\n  - 最近写了什么"
+
+    results = []
+    note_name = entities.get("note", "")
+    platform = entities.get("platform", "feishu")
+
+    # 执行动作序列
+    for action in actions:
+        if action == "recent":
+            notes = list_recent(5)
+            results.append(f"📖 最近 {len(notes)} 条笔记：")
+            for n in notes:
+                results.append(f"  - [[{n['title']}]] ({n['modified']})")
+
+        elif action == "stats":
+            stats = show_stats()
+            results.append(f"📊 Vault 统计：{stats['total_notes']} 条笔记，{stats['total_size_mb']} MB")
+
+        elif action == "search":
+            if note_name:
+                notes = search_notes_v2(note_name, limit=5, preview=True)
+                if notes:
+                    results.append(f"🔍 找到 {len(notes)} 条关于「{note_name}」的笔记：")
+                    for n in notes:
+                        results.append(f"  - [[{n['title']}]]")
+                        if n.get("preview"):
+                            results.append(f"    {n['preview'][:80]}...")
+                else:
+                    results.append(f"🔍 未找到关于「{note_name}」的笔记")
+            else:
+                results.append("🔍 请指定要搜索的关键词")
+
+        elif action == "summarize":
+            if note_name:
+                # 先搜索找到最佳匹配
+                notes = search_notes_v2(note_name, limit=1)
+                if notes:
+                    actual_note = notes[0]["title"]
+                    summary = summarize_note(actual_note)
+                    if "error" not in summary:
+                        results.append(f"📝 「{summary['title']}」智能摘要：")
+                        results.append(f"   原文字数: {summary['original_size']}")
+                        results.append("")
+                        results.append(summary["summary"])
+                        # 更新 note_name 为实际笔记名
+                        note_name = actual_note
+                    else:
+                        results.append(f"❌ 总结失败: {summary['error']}")
+                else:
+                    results.append(f"❌ 未找到笔记「{note_name}」")
+            else:
+                results.append("📝 请指定要总结的笔记")
+
+        elif action == "related":
+            if note_name:
+                notes = search_notes_v2(note_name, limit=1)
+                if notes:
+                    actual_note = notes[0]["title"]
+                    related = find_related_notes(actual_note)
+                    if "error" not in related:
+                        results.append(f"🔗 「{related['title']}」知识关联：")
+                        if related.get("wikilinks"):
+                            results.append(f"   引用: {', '.join(['[['+l+']]' for l in related['wikilinks'][:3]])}")
+                        if related.get("same_tag_notes"):
+                            results.append(f"   相关: {', '.join(['[['+n['title']+']]' for n in related['same_tag_notes'][:3]])}")
+                        note_name = actual_note
+                    else:
+                        results.append(f"❌ {related['error']}")
+                else:
+                    results.append(f"❌ 未找到笔记「{note_name}」")
+
+        elif action == "share":
+            if note_name:
+                notes = search_notes_v2(note_name, limit=1)
+                if notes:
+                    actual_note = notes[0]["title"]
+                    share_result = share_to_feishu(actual_note, "summary")
+                    if share_result.get("success"):
+                        results.append(f"✅ 已分享「{actual_note}」到飞书群")
+                    else:
+                        results.append(f"❌ 分享失败: {share_result.get('error')}")
+                else:
+                    results.append(f"❌ 未找到笔记「{note_name}」")
+            else:
+                results.append("📤 请指定要分享的笔记")
+
+    return "\n".join(results)
+
+
 # ============== 其他基础功能 ==============
 
 def create_note(title: str, content: str = "", category: str = "Inbox",
@@ -560,30 +797,32 @@ def show_stats() -> Dict:
 # ============== CLI 入口 ==============
 
 def main():
+    # 检查是否是自然语言模式（第一个参数不是已知命令）
+    known_commands = ["search", "read", "summarize", "related", "share",
+                      "create", "recent", "stats", "--help", "-h"]
+
+    if len(sys.argv) > 1 and sys.argv[1] not in known_commands:
+        # 自然语言模式
+        message = sys.argv[1]
+        result = smart_execute(message)
+        print(result)
+        return
+
     parser = argparse.ArgumentParser(
-        description="Obsidian CLI v2.0 - 知微 Vault 智能管理工具",
+        description="Obsidian CLI v3.0 - 知微 Vault 智能管理工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例:
-  # 搜索（改进版，标题优先）
+自然语言模式（推荐）:
+  obsidian-cli "帮我总结 Agent 那篇笔记发到飞书"
+  obsidian-cli "找找 RAG 相关的笔记"
+  obsidian-cli "最近写了什么"
+  obsidian-cli "笔记统计"
+
+命令模式:
   obsidian-cli search "Agent" --preview
-  obsidian-cli search --tag AI
-
-  # 读取（支持摘要）
-  obsidian-cli read "RAG" --summarize
-
-  # 智能总结（新功能）
   obsidian-cli summarize "Transformer"
-
-  # 知识关联（新功能）
+  obsidian-cli share "RAG" --to feishu
   obsidian-cli related "Agent"
-
-  # 飞书分享（新功能）
-  obsidian-cli share "RAG" --to feishu --mode summary
-
-  # 其他
-  obsidian-cli create "新笔记" --category Personal --tags AI
-  obsidian-cli recent --limit 20
   obsidian-cli stats
         """
     )
