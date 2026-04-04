@@ -83,8 +83,8 @@ def _load() -> dict:
         try:
             with open(QUOTA_FILE) as f:
                 return json.load(f)
-        except:
-            pass
+        except (json.JSONDecodeError, IOError):
+            pass  # 配额文件加载失败，使用默认值
     return {"daily": {}, "monthly": {}, "last_call": None}
 
 

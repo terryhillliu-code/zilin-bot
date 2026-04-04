@@ -10,7 +10,12 @@ from zhiwei_common.secrets import load_secrets
 load_secrets(silent=True)
 
 import lark_oapi as lark
-from lark_oapi.api.im.v1 import *
+from lark_oapi.api.im.v1 import (
+    CreateMessageRequest,
+    CreateMessageRequestBuilder,
+    CreateMessageRequestBody,
+    CreateMessageRequestBodyBuilder,
+)
 import json
 import re
 import subprocess
@@ -63,8 +68,10 @@ pending_image = {}
 chat_history = {}
 MAX_HISTORY = 20
 
-# 记忆管理器缓存（user_id -> MemoryManager）
+# 记忆管理器缓存（user_id -> {manager, last_access_time}）
+# v69.0: 添加时间戳支持过期清理
 memory_cache = {}
+MEMORY_CACHE_EXPIRE_SECONDS = 3600  # 1小时未访问则清理
 
 # 消息去重 (deque 自动淘汰旧消息)
 processed_messages = deque(maxlen=500)
@@ -92,7 +99,7 @@ def write_heartbeat(conn_id: str = "", status: str = "connected"):
                 "status": status
             }, f)
     except Exception:
-        pass
+        pass  # 心跳写入失败不影响主流程
 
 # 审批待确认 (T-056)
 pending_review = {}  # user_id -> task_id
@@ -112,7 +119,7 @@ def save_active_user(user_id: str):
         with open(FEISHU_USER_FILE, "w") as f:
             f.write(user_id)
     except Exception:
-        pass
+        pass  # 用户ID持久化失败不影响主流程
 
 
 def load_active_user() -> str:
@@ -125,32 +132,17 @@ def load_active_user() -> str:
                     last_active_user["user_id"] = uid
                     return uid
     except Exception:
-        pass
+        pass  # 用户ID加载失败不影响主流程
     return None
 
 
 # ========== RAG 知识库功能 (Phase 4 新增) ==========
 
 def query_knowledge_base(query: str, top_k: int = 3) -> str:
-    """通过子进程调用 bridge.py 检索知识库 (V2-204-Fix2: 隔离依赖环境)"""
-    import subprocess
-    try:
-        print(f"📚 RAG 检索 (子进程)：{query}")
-        rag_venv = "/Users/liufang/zhiwei-rag/venv/bin/python3"
-        bridge_script = "/Users/liufang/zhiwei-rag/bridge.py"
-        
-        result = subprocess.run(
-            [rag_venv, bridge_script, "context", query, "--top-k", str(top_k)],
-            capture_output=True, text=True, timeout=40
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-        else:
-            print(f"❌ RAG 子进程失败：{result.stderr}")
-            return None
-    except Exception as e:
-        print(f"❌ RAG 调用异常：{e}")
-        return None
+    """检索知识库 - 委托给 rag_bridge 模块"""
+    from rag_bridge import get_context
+    print(f"📚 RAG 检索：{query}")
+    return get_context(query, top_k=top_k) or None
 
 
 
@@ -179,10 +171,29 @@ init_media_handler(client, reply_message, TaskLogger, pending_image, pending_voi
 
 
 def get_memory(user_id: str) -> MemoryManager:
-    """获取或创建用户的记忆管理器"""
+    """获取或创建用户的记忆管理器（v69.0: 添加时间戳）"""
+    current_time = time.time()
     if user_id not in memory_cache:
-        memory_cache[user_id] = MemoryManager(user_id)
-    return memory_cache[user_id]
+        memory_cache[user_id] = {
+            "manager": MemoryManager(user_id),
+            "last_access": current_time
+        }
+    else:
+        memory_cache[user_id]["last_access"] = current_time
+    return memory_cache[user_id]["manager"]
+
+
+def cleanup_memory_cache():
+    """清理过期的记忆管理器缓存（v69.0 新增）"""
+    current_time = time.time()
+    expired = []
+    for user_id, data in memory_cache.items():
+        if current_time - data.get("last_access", 0) > MEMORY_CACHE_EXPIRE_SECONDS:
+            expired.append(user_id)
+    for user_id in expired:
+        del memory_cache[user_id]
+    if expired:
+        print(f"[Cleanup] 清理 {len(expired)} 个过期记忆缓存")
 
 
 def cleanup_pending_images():
@@ -197,6 +208,8 @@ def cleanup_pending_images():
             expired.append(user_id)
     for user_id in expired:
         del pending_image[user_id]
+    # 同时清理 memory_cache
+    cleanup_memory_cache()
 
 
 def add_to_history(user_id: str, role: str, text: str):
@@ -344,8 +357,8 @@ def do_p2_im_message_receive_v1(data) -> None:
                     log_content = f"file_key: {content_dict.get('file_key', '')}"
                 else:
                     log_content = str(content_dict)[:500]
-        except:
-            pass
+        except (json.JSONDecodeError, AttributeError, KeyError):
+            pass  # 消息内容解析失败，使用 None
 
         message_log.log(message_id, log_user_id, msg_type, log_content)
     except Exception as e:
@@ -588,8 +601,8 @@ def main():
             if os.path.exists(ALERT_STATE_FILE):
                 with open(ALERT_STATE_FILE) as f:
                     return json.load(f)
-        except:
-            pass
+        except (json.JSONDecodeError, IOError):
+            pass  # 告警状态加载失败，使用默认值
         return {"last_alert_time": 0, "alert_type": None}
 
     def save_alert_state(state: dict):
@@ -597,8 +610,8 @@ def main():
         try:
             with open(ALERT_STATE_FILE, "w") as f:
                 json.dump(state, f)
-        except:
-            pass
+        except IOError:
+            pass  # 告警状态保存失败不影响主流程
 
     def send_ws_alert(msg: str, alert_type: str = "disconnect") -> bool:
         """发送 WebSocket 告警（通过钉钉，避免消耗飞书额度）"""

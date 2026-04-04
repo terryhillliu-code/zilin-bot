@@ -128,8 +128,8 @@ class MemoryManager:
             try:
                 with open(self.persistent_file, 'r') as f:
                     return json.load(f)
-            except:
-                return {}
+            except (json.JSONDecodeError, IOError):
+                return {}  # 持久化记忆加载失败，返回空字典
         return {}
 
     def _save_state(self):
@@ -148,8 +148,8 @@ class MemoryManager:
                 self.working_memory = state.get("working_memory", [])
                 self.summary = state.get("summary", "")
                 print(f"🧠 恢复记忆: {len(self.working_memory)} 轮对话")
-            except:
-                self.working_memory = []
+            except (json.JSONDecodeError, IOError):
+                self.working_memory = []  # 状态加载失败，重置为空
                 self.summary = ""
 
     def _get_api_key(self) -> str:
