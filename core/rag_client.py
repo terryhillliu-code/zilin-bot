@@ -20,7 +20,7 @@ class RAGClient:
         self.rag_dir = Path.home() / "zhiwei-rag"
         self.bridge_script = self.rag_dir / "bridge.py"
         self.venv_python = self.rag_dir / "venv/bin/python"
-        self.api_url = "http://127.0.0.1:8766"
+        self.api_url = "http://127.0.0.1:8765"
         self._use_api = None  # 延迟检测
 
     def _detect_api(self) -> bool:
