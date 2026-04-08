@@ -359,8 +359,15 @@ def process_video(text: str, message_id: str = None) -> str:
             venv_python, distiller_path,
             "--from-text", text,
             "--output-dir", os.path.expanduser("~/Documents/ZhiweiVault/70-79_个人笔记_Personal/72_视频笔记_Video-Distill"),
-            "--cookies", os.path.expanduser("~/zhiwei-bot/secrets/douyin_cookies.txt")  # 使用 cookies 文件获取抖音字幕
         ]
+
+        # 根据平台选择 cookies 策略
+        if "bilibili.com" in url or "b23.tv" in url:
+            # B站需要从浏览器读取 cookies（绕过412反爬）
+            cmd.extend(["--cookies-from-browser", "chrome"])
+        else:
+            # 抖音使用 cookies 文件
+            cmd.extend(["--cookies", os.path.expanduser("~/zhiwei-bot/secrets/douyin_cookies.txt")])
 
         logger.info(f"🎬 调用 Distiller: {' '.join(cmd[:3])}...")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)

@@ -913,6 +913,7 @@ class MediaExtractor:
         """提取音频文件
 
         抖音平台：使用本地 douyin-api 服务获取下载链接
+        B站：使用 B站 API + Referer 头下载音频流
         其他平台：使用 yt-dlp 下载
 
         Raises:
@@ -920,8 +921,11 @@ class MediaExtractor:
         """
         # 抖音平台：使用本地 API
         if video_info.platform == "douyin":
-            # 不捕获异常，让 API 错误正确传播
             return self._extract_douyin_audio(video_info, output_path)
+
+        # B站：使用 API 直接下载音频流（绕过 yt-dlp 412 错误）
+        if video_info.platform == "bilibili":
+            return self._extract_bilibili_audio(video_info, output_path)
 
         # 其他平台：使用 yt-dlp
         import yt_dlp
@@ -960,6 +964,130 @@ class MediaExtractor:
         except Exception as e:
             logger.error(f"Error extracting audio: {e}")
             return False
+
+    def _extract_bilibili_audio(self, video_info: VideoInfo, output_path: Path) -> bool:
+        """通过 B站 API 直接下载音频流（绕过 yt-dlp 412 错误）
+
+        B站反爬机制导致 yt-dlp 无法直接下载，需要：
+        1. 通过 API 获取视频 cid
+        2. 通过 playurl API 获取音频流地址
+        3. 带 Referer 头下载音频
+
+        Args:
+            video_info: 视频信息（从 resolved_url 提取 bvid）
+            output_path: 音频输出路径
+
+        Returns:
+            是否成功
+        """
+        m4s_path = None
+
+        try:
+            # 从 resolved_url 提取 bvid
+            bvid_match = re.search(r'BV(\w+)', video_info.resolved_url)
+            if bvid_match:
+                bvid = f"BV{bvid_match.group(1)}"
+            else:
+                logger.error(f"Cannot extract bvid from URL: {video_info.resolved_url}")
+                return False
+
+            logger.info(f"Fetching B站 video info: {bvid}")
+
+            # B站 API 需要带 User-Agent 和 Referer 头
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://www.bilibili.com"
+            }
+
+            # 1. 获取 cid
+            info_url = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
+            info_resp = requests.get(info_url, headers=headers, timeout=10)
+
+            logger.debug(f"B站 API response status: {info_resp.status_code}")
+
+            if info_resp.status_code != 200:
+                logger.error(f"B站 API HTTP error: {info_resp.status_code}")
+                return False
+
+            try:
+                info_data = info_resp.json()
+            except Exception as json_err:
+                logger.error(f"B站 API JSON parse error: {json_err}, response: {info_resp.text[:200]}")
+                return False
+
+            if info_data.get("code") != 0:
+                logger.error(f"B站 API error: {info_data.get('message')}")
+                return False
+
+            video_data = info_data.get("data", {})
+            cid = video_data.get("cid")
+            title = video_data.get("title", "")
+
+            if not video_info.title:
+                video_info.title = title
+
+            logger.info(f"B站 cid: {cid}, title: {title}")
+
+            # 2. 获取音频流地址
+            playurl = f"https://api.bilibili.com/x/player/playurl?bvid={bvid}&cid={cid}&qn=16&fnver=0&fnval=16&fourk=0"
+            play_resp = requests.get(playurl, headers=headers, timeout=10)
+            play_data = play_resp.json()
+
+            if play_data.get("code") != 0:
+                logger.error(f"B站 playurl API error: {play_data.get('message')}")
+                return False
+
+            dash = play_data.get("data", {}).get("dash", {})
+            audio_streams = dash.get("audio", [])
+
+            if not audio_streams:
+                logger.error("No audio streams found")
+                return False
+
+            # 选择最高质量的音频流
+            audio_streams.sort(key=lambda x: x.get("id", 0), reverse=True)
+            audio_url = audio_streams[0].get("baseUrl") or audio_streams[0].get("base_url")
+
+            if not audio_url:
+                logger.error("No audio URL found")
+                return False
+
+            logger.info(f"B站 audio URL: {audio_url[:80]}...")
+
+            # 3. 下载音频流（需要 Referer 头）
+            m4s_path = output_path.with_suffix(".m4s")
+            mp3_path = output_path.with_suffix(".mp3")
+
+            logger.info(f"Downloading B站 audio to {m4s_path}")
+            audio_resp = requests.get(audio_url, headers=headers, stream=True, timeout=300)
+
+            with open(m4s_path, "wb") as f:
+                for chunk in audio_resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            logger.info(f"Audio downloaded: {m4s_path.stat().st_size / 1024 / 1024:.1f} MB")
+
+            # 4. 转换为 MP3
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(m4s_path), "-vn", "-acodec", "libmp3lame", "-q:a", "2", str(mp3_path)],
+                capture_output=True, text=True, timeout=120
+            )
+
+            if result.returncode != 0:
+                logger.error(f"FFmpeg error: {result.stderr}")
+                return False
+
+            logger.info(f"B站 audio extracted: {mp3_path}")
+            return True
+
+        except Exception as e:
+            logger.error(f"B站 audio extraction error: {e}")
+            return False
+
+        finally:
+            # 清理临时文件（无论成功还是失败）
+            if m4s_path and m4s_path.exists():
+                m4s_path.unlink(missing_ok=True)
 
     def _extract_douyin_audio(self, video_info: VideoInfo, output_path: Path) -> bool:
         """通过本地 API 下载抖音视频并提取音频
