@@ -9,6 +9,7 @@
 - RAG 增强（通过 zhiwei-rag，可选降级）
 - 问题分解（复杂问题自动拆分）⭐ v46.0 新增
 - 意图识别（NLU 驱动研究触发）⭐ v47.0 新增
+- 内存自动清理（TTL 过期机制）⭐ v48.0 新增
 
 使用：
     from chat_handler import chat_handler
@@ -21,6 +22,8 @@
 """
 import os
 import sys
+import time
+import threading
 import asyncio
 import logging
 from pathlib import Path
@@ -91,8 +94,11 @@ class ChatHandler:
                 logger.warning("⚠️ 记忆管理器不可用")
                 self.enable_memory = False
 
-        # 记忆管理器缓存
+        # 记忆管理器缓存（带 TTL 清理）
         self._memory_managers = {}
+        self._memory_ttl = {}  # session_id -> last_access_time
+        self._ttl_seconds = 3600  # 1小时过期
+        self._start_cleanup_thread()
 
         # RAG 桥接
         self._rag_available = False
@@ -120,6 +126,30 @@ class ChatHandler:
         # 加载 system prompt
         self._system_prompt_cache = {}
 
+    def _start_cleanup_thread(self):
+        """启动后台清理线程（v48.0）"""
+        def cleanup_loop():
+            while True:
+                time.sleep(600)  # 每10分钟检查一次
+                try:
+                    now = time.time()
+                    expired = [
+                        sid for sid, t in self._memory_ttl.items()
+                        if now - t > self._ttl_seconds
+                    ]
+                    for sid in expired:
+                        if sid in self._memory_managers:
+                            del self._memory_managers[sid]
+                        del self._memory_ttl[sid]
+                    if expired:
+                        logger.info(f"[Cleanup] 清理 {len(expired)} 个过期记忆缓存")
+                except Exception as e:
+                    logger.warning(f"记忆缓存清理异常: {e}")
+
+        thread = threading.Thread(target=cleanup_loop, daemon=True)
+        thread.start()
+        logger.info("✅ 记忆缓存清理线程已启动")
+
     def _load_prompt(self, name: str) -> str:
         """加载 prompt 文件"""
         if name in self._system_prompt_cache:
@@ -136,9 +166,12 @@ class ChatHandler:
         return ""
 
     def _get_memory_manager(self, session_id: str):
-        """获取或创建记忆管理器"""
+        """获取或创建记忆管理器（v48.0: 更新访问时间）"""
         if not self.enable_memory or not self._memory_manager_class:
             return None
+
+        # 更新访问时间
+        self._memory_ttl[session_id] = time.time()
 
         if session_id not in self._memory_managers:
             self._memory_managers[session_id] = self._memory_manager_class(

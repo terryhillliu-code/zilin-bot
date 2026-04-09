@@ -76,8 +76,9 @@ MEMORY_CACHE_EXPIRE_SECONDS = 3600  # 1小时未访问则清理
 # 消息去重 (deque 自动淘汰旧消息)
 processed_messages = deque(maxlen=500)
 
-# 线程池（最大 10 个并发任务）
-executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="msg_handler")
+# 线程池（根据 CPU 核心数动态设置，建议 3-5）
+_max_workers = min(5, (os.cpu_count() or 2))
+executor = ThreadPoolExecutor(max_workers=_max_workers, thread_name_prefix="msg_handler")
 
 # 连接状态监控 (ISSUE-003 / ISSUE-027 修复)
 # 简化版：仅监控业务事件，避免误判
@@ -658,12 +659,14 @@ def main():
         1. 每分钟写入心跳文件（供 watchdog 检测）
         2. 业务消息空闲时记录日志（不发送钉钉告警，避免误报）
         3. ⭐ 离线恢复检测：长时间空闲后恢复时尝试恢复离线消息
+        4. ⭐ v48.0: 定期清理 memory_cache（每10分钟）
         """
         # 启动时立即写入心跳
         write_heartbeat(status="starting")
 
         # 离线检测状态
         was_idle_long = False  # 上一次检查时是否长时间空闲
+        cleanup_counter = 0  # 清理计数器
 
         while True:
             time.sleep(60)  # 每分钟检查一次
@@ -672,6 +675,15 @@ def main():
 
             # 写入心跳（即使空闲也写入，表示服务存活）
             write_heartbeat(status="connected")
+
+            # ⭐ v48.0: 每10分钟清理 memory_cache
+            cleanup_counter += 1
+            if cleanup_counter >= 10:
+                cleanup_counter = 0
+                try:
+                    cleanup_memory_cache()
+                except Exception as e:
+                    print(f"⚠️ memory_cache 清理异常: {e}")
 
             # 检测长时间空闲（超过 5 分钟）
             is_idle_long = event_idle > 300  # 5 分钟
