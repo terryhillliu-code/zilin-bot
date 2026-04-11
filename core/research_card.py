@@ -185,7 +185,7 @@ class ResearchConfigCard:
         return card
 
     @staticmethod
-    def build_simple_confirm(topic: str, include_videos: bool = True) -> Dict[str, Any]:
+    def build_simple_confirm(topic: str, include_videos: bool = True, reasoning: str = "", confidence: float = 0.95) -> Dict[str, Any]:
         """
         构建简单确认卡片（无输入框版本）
 
@@ -207,7 +207,14 @@ class ResearchConfigCard:
                     "tag": "div",
                     "text": {
                         "tag": "lark_md",
-                        "content": f"{'✅ 包含视频笔记' if include_videos else '📄 仅论文'} | 🌐 自动补充 ArXiv"
+                        "content": f"🎯 **对齐置信度**: {int(confidence * 100)}% | {'✅ 包含视频' if include_videos else '📄 仅论文'}"
+                    }
+                },
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"🧠 **AI 决策理由**:\n{reasoning if reasoning else '基于您的历史对话，为您提供深度研究支持。'}"
                     }
                 },
                 {
@@ -304,10 +311,10 @@ class ResearchResultCard:
 
 
 # 便捷函数
-def send_research_config_card(reply_card_func, message_id: str, topic: str, include_videos: bool = True):
-    """发送研究配置卡片"""
-    card = ResearchConfigCard.build_simple_confirm(topic, include_videos)
-    reply_card_func(message_id, "📊 研究配置", json.dumps(card, ensure_ascii=False))
+def send_research_config_card(reply_card_func, message_id: str, topic: str, include_videos: bool = True, reasoning: str = "", confidence: float = 0.95):
+    """发送研究配置卡片 (v8.0: 包含置信度与理由)"""
+    card = ResearchConfigCard.build_simple_confirm(topic, include_videos, reasoning, confidence)
+    reply_card_func(message_id, "📊 研究配置确认", json.dumps(card, ensure_ascii=False))
 
 
 def send_research_result_card(reply_card_func, message_id: str, topic: str,

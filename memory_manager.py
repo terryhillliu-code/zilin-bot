@@ -7,7 +7,6 @@
 import json
 import os
 import time
-import httpx
 from datetime import datetime
 
 
@@ -75,9 +74,12 @@ class MemoryManager:
 
     def _call_compress_llm(self, old_text) -> str:
         try:
-            api_key = self._get_api_key()
-            if not api_key:
+            # 使用统一 LLM 出口
+            try:
+                from llm_client import llm_client
+            except ImportError:
                 return self._simple_compress(old_text)
+
             prompt = f"""请将以下对话历史压缩为简洁摘要，保留关键信息：
 
 之前的摘要：{self.summary or '无'}
@@ -87,18 +89,15 @@ class MemoryManager:
 
 要求：只保留关键事实决策结论，控制在150字以内"""
 
-            response = httpx.post(
-                "https://coding.dashscope.aliyuncs.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": "qwen3.5-plus", "messages": [{"role": "user", "content": prompt}], "max_tokens": 300},
-                timeout=15
+            success, result = llm_client.call(
+                role="format",
+                message=prompt,
+                timeout=15,
             )
-            if response.status_code == 200:
-                result = response.json()["choices"][0]["message"]["content"]
+            if success and result:
                 print(f"🧠 摘要压缩完成: {len(result)} 字符")
                 return result[:300]
-            else:
-                return self._simple_compress(old_text)
+            return self._simple_compress(old_text)
         except Exception as e:
             print(f"⚠️ 摘要压缩异常: {e}")
             return self._simple_compress(old_text)
@@ -128,8 +127,8 @@ class MemoryManager:
             try:
                 with open(self.persistent_file, 'r') as f:
                     return json.load(f)
-            except:
-                return {}
+            except (json.JSONDecodeError, IOError):
+                return {}  # 持久化记忆加载失败，返回空字典
         return {}
 
     def _save_state(self):
@@ -148,28 +147,9 @@ class MemoryManager:
                 self.working_memory = state.get("working_memory", [])
                 self.summary = state.get("summary", "")
                 print(f"🧠 恢复记忆: {len(self.working_memory)} 轮对话")
-            except:
-                self.working_memory = []
+            except (json.JSONDecodeError, IOError):
+                self.working_memory = []  # 状态加载失败，重置为空
                 self.summary = ""
-
-    def _get_api_key(self) -> str:
-        """获取 API Key - 支持多路径和多变量名查找"""
-        env_paths = [
-            os.path.expanduser("~/clawdbot-docker/workspace/secrets/.env"),
-            os.path.expanduser("~/zhiwei-bot/.env"),
-            os.path.expanduser("~/tanwei-bot/.env"),
-        ]
-        key_names = ["CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY", "BAILIAN_API_KEY"]
-
-        for env_path in env_paths:
-            if os.path.exists(env_path):
-                with open(env_path) as f:
-                    lines = f.readlines()
-                for key_name in key_names:
-                    for line in lines:
-                        if line.startswith(f"{key_name}="):
-                            return line.split("=", 1)[1].strip().strip('"\'')
-        return None
 
     def get_stats(self) -> str:
         persistent_count = len(self._load_persistent())

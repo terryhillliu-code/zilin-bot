@@ -161,25 +161,12 @@ def test_rag_bridge():
         return False
 
 
-def test_intent_router():
-    """测试 /route 依赖"""
-    try:
-        from intent_router import IntentRouter
-        result = IntentRouter.route("写个Python脚本")
-        print(f"路由结果: {result}")
-        explain = IntentRouter.explain("写个Python脚本")
-        print(f"路由解释: {explain[:100]}...")
-        return True
-    except Exception as e:
-        print(f"❌ 意图路由测试失败: {e}")
-        return False
-
-
 def test_knowledge_collect():
     """测试 /收录 依赖"""
     try:
         script_path = os.path.expanduser("~/zhiwei-bot/scripts/knowledge_collect.py")
-        venv_python = os.path.expanduser("~/zhiwei-bot/venv/bin/python")
+        # 使用共享 venv (v2.0 合并后)
+        venv_python = os.path.expanduser("~/zhiwei-shared-venv/bin/python")
 
         import subprocess
         result = subprocess.run(
@@ -274,7 +261,6 @@ def main():
     run_test("VoiceTaskStore", test_voice_task_store)
     run_test("TaskStore", test_task_store)
     run_test("RAG Bridge", test_rag_bridge)
-    run_test("IntentRouter", test_intent_router)
     run_test("Knowledge Collect", test_knowledge_collect)
 
     # 3. 模型相关测试

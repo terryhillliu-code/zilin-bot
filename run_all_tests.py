@@ -83,13 +83,16 @@ def run_all_tests():
         print(f"\n失败详情 ({len(result.failures)}):")
         for i, (test, traceback) in enumerate(result.failures, 1):
             print(f"\n{i}. {test}")
-            print(f"   {traceback}")
+            # 截断太长的输出
+            truncated_tb = traceback[:500] + "\n...[由于输出过长已截断]" if len(traceback) > 500 else traceback
+            print(f"   {truncated_tb}")
 
     if result.errors:
         print(f"\n错误详情 ({len(result.errors)}):")
         for i, (test, traceback) in enumerate(result.errors, 1):
             print(f"\n{i}. {test}")
-            print(f"   {traceback}")
+            truncated_tb = traceback[:500] + "\n...[由于输出过长已截断]" if len(traceback) > 500 else traceback
+            print(f"   {truncated_tb}")
 
     return len(result.failures) == 0 and len(result.errors) == 0
 

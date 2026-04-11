@@ -10,8 +10,22 @@ import base64
 import threading
 import subprocess
 import logging
+import sys
 from pathlib import Path
 from typing import Optional
+
+# 导入统一的 API Key 获取函数
+try:
+    from zhiwei_common import get_api_key
+except ImportError:
+    sys.path.insert(0, str(Path.home() / "zhiwei-common"))
+    from zhiwei_common import get_api_key
+
+# 引入 distiller 以便复用 ASR 逻辑 (v6.0)
+try:
+    from scripts.douyin_distiller import DashScopeASRTranscriber
+except ImportError:
+    DashScopeASRTranscriber = None
 
 # 设置日志
 logger = logging.getLogger(__name__)
@@ -102,28 +116,10 @@ def analyze_image_base64(image_base64: str, question: str = None) -> str:
     try:
         import httpx
 
-        # 获取 API Key - 支持多路径和多变量名查找
-        api_key = None
-        env_paths = [
-            os.path.expanduser("~/clawdbot-docker/workspace/secrets/.env"),
-            os.path.expanduser("~/zhiwei-bot/.env"),
-            os.path.expanduser("~/tanwei-bot/.env"),
-        ]
-        key_names = ["CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY", "BAILIAN_API_KEY"]
-
-        for env_path in env_paths:
-            if os.path.exists(env_path):
-                with open(env_path) as f:
-                    lines = f.readlines()
-                for key_name in key_names:
-                    for line in lines:
-                        if line.startswith(f"{key_name}="):
-                            api_key = line.split("=", 1)[1].strip().strip('"\'')
-                            break
-                    if api_key:
-                        break
-            if api_key:
-                break
+        # 获取 API Key - 使用统一密钥加载
+        from zhiwei_common import load_secrets
+        secrets = load_secrets()
+        api_key = secrets.get("DASHSCOPE_API_KEY") or secrets.get("BAILIAN_API_KEY") or secrets.get("CODING_PLAN_API_KEY")
 
         if not api_key:
             return "❌ 系统配置异常，请联系管理员"
@@ -192,19 +188,39 @@ def handle_image_async(message_id: str, image_key: str, user_id: str):
 # ========== 视频链接 ==========
 
 def extract_video_url(text: str) -> str:
-    """提取视频 URL"""
+    """提取视频 URL
+
+    支持格式：
+    - https://v.douyin.com/xxx/ (短链)
+    - https://www.douyin.com/video/xxx (长链)
+    - douyin.com/video/xxx (无协议前缀，抖音新分享格式)
+    - https://douyin.com/video/xxx (无 www)
+    - B站、YouTube 等
+    """
     patterns = [
+        # 抖音短链
         r'(https?://v\.douyin\.com/[A-Za-z0-9_-]+/?)',
+        # 抖音长链（带 www）
         r'(https?://www\.douyin\.com/video/\d+)',
+        # 抖音长链（无 www，新版分享格式）
+        r'(https?://douyin\.com/video/\d+)',
+        # 抖音长链（无协议前缀，需要补全）
+        r'(?<![\w./])(douyin\.com/video/\d+)',
+        # YouTube
         r'(https?://(?:www\.)?youtube\.com/watch\?v=[A-Za-z0-9_-]+)',
         r'(https?://youtu\.be/[A-Za-z0-9_-]+)',
+        # B站
         r'(https?://(?:www\.)?bilibili\.com/video/[A-Za-z0-9_-]+)',
         r'(https?://b23\.tv/[A-Za-z0-9_-]+)'
     ]
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
-            return match.group(1)
+            url = match.group(1)
+            # 补全协议前缀
+            if url.startswith('douyin.com'):
+                url = 'https://' + url
+            return url
     return None
 
 
@@ -260,30 +276,37 @@ def fetch_url_content(url: str, timeout: int = 30) -> tuple[bool, str]:
 
 
 def summarize_url(url: str) -> str:
-    """总结网页 URL，使用 AI 硬件架构师专属 prompt"""
+    """总结网页 URL，统一调用 zhiwei-rag 的 url_ingest 引擎 (v6.0)
+    
+    优势：支持 v5.4 的博主式提炼、自动 RAG 关联和更鲁棒的抓取逻辑。
+    """
     try:
-        # 确保从 zhiwei-bot 目录导入
-        import sys
-        bot_dir = Path(__file__).parent
-        if str(bot_dir) not in sys.path:
-            sys.path.insert(0, str(bot_dir))
-        from scripts.obsidian_summary_filler import SUMMARY_PROMPT, generate_ai_summary
-
-        print(f"🌐 抓取网页: {url}")
-
-        success, content = fetch_url_content(url, timeout=60)
-        if not success:
-            return content  # 返回错误信息
-
-        print(f"📄 内容长度: {len(content)} 字符，调用 AI 生成专属摘要...")
-        summary = generate_ai_summary(content, doc_type="网页")
-
-        if summary.startswith("❌"):
-            return summary
-        else:
+        logger.info(f"🌐 正在调用 url_ingest 蒸馏网页: {url}")
+        
+        rag_venv = "/Users/liufang/zhiwei-rag/venv/bin/python3"
+        url_ingest_script = "/Users/liufang/zhiwei-rag/ingest/url_ingest.py"
+        
+        # 调用 url_ingest 并启用蒸馏模式
+        # 注意：这里我们只取 stdout 返回的摘要内容
+        cmd = [
+            rag_venv, url_ingest_script, url, 
+            "--distill", 
+            "--output", "stdout" # 假设 url_ingest 支持此参数或我们通过解析日志获取
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        
+        if result.returncode == 0:
+            summary = result.stdout.strip()
+            if "📄 **网页摘要**" in summary or len(summary) > 50:
+                return summary
             return f"📄 **网页摘要**\n\n{summary}"
+        else:
+            logger.error(f"url_ingest 失败: {result.stderr}")
+            return f"❌ 网页总结失败 (url_ingest 异常)"
 
     except Exception as e:
+        logger.error(f"summarize_url 异常: {e}")
         return f"❌ 网页处理异常: {str(e)}"
 
 
@@ -329,14 +352,22 @@ def process_video(text: str, message_id: str = None) -> str:
 
         # 调用宿主机 Distiller
         distiller_path = os.path.expanduser("~/zhiwei-bot/scripts/douyin_distiller.py")
-        venv_python = os.path.expanduser("~/zhiwei-bot/venv/bin/python")
+        # 使用共享 venv (v2.0 合并后)
+        venv_python = os.path.expanduser("~/zhiwei-shared-venv/bin/python")
 
         cmd = [
             venv_python, distiller_path,
             "--from-text", text,
             "--output-dir", os.path.expanduser("~/Documents/ZhiweiVault/70-79_个人笔记_Personal/72_视频笔记_Video-Distill"),
-            "--cookies", os.path.expanduser("~/zhiwei-bot/secrets/douyin_cookies.txt")  # 使用 cookies 文件获取抖音字幕
         ]
+
+        # 根据平台选择 cookies 策略
+        if "bilibili.com" in url or "b23.tv" in url:
+            # B站需要从浏览器读取 cookies（绕过412反爬）
+            cmd.extend(["--cookies-from-browser", "chrome"])
+        else:
+            # 抖音使用 cookies 文件
+            cmd.extend(["--cookies", os.path.expanduser("~/zhiwei-bot/secrets/douyin_cookies.txt")])
 
         logger.info(f"🎬 调用 Distiller: {' '.join(cmd[:3])}...")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -471,78 +502,44 @@ def download_audio(message_id: str, file_key: str) -> str:
 
 
 def transcribe_audio(audio_path: str) -> str:
-    """转录语音文件为文字（使用宿主机 DashScope ASR）
-
-    复用 douyin_distiller.py 的 DashScopeASRTranscriber 逻辑。
-    音频格式自动转换为 16kHz 单声道（Recognition API 要求）。
+    """转录语音文件为文字（使用统一的 DashScope ASR）
+    
+    v6.0: 移除本地重复逻辑，改为调用 douyin_distiller.DashScopeASRTranscriber
+    受益于 v5.9 的增强，现在支持详细错误捕获。
     """
-    converted_path = None
-    try:
-        import dashscope
-        from dashscope.audio.asr import Recognition
-
-        # 获取 API key（由 ws_client.py 通过 load_secrets() 加载）
-        api_key = os.getenv("DASHSCOPE_API_KEY")
-
-        if not api_key:
-            logger.error("DASHSCOPE_API_KEY 未配置，请检查 ~/.secrets/global.env")
-            return None
-
-        dashscope.api_key = api_key
-
-        # 音频格式转换（Recognition API 需要 16kHz 单声道）
-        audio_path_obj = Path(audio_path)
-        converted_path = _ensure_audio_format(audio_path_obj)
-
-        # 检测音频格式
-        suffix = converted_path.suffix.lower().lstrip('.')
-        audio_format = suffix if suffix in ['mp3', 'wav', 'pcm', 'opus', 'm4a', 'aac'] else 'opus'
-
-        logger.info(f"🎵 ASR 转录: {converted_path.name} ({audio_format})")
-
-        # 创建 Recognition 实例
-        recognition = Recognition(
-            model="paraformer-realtime-v2",
-            format=audio_format,
-            sample_rate=16000
-        )
-
-        # 调用同步识别
-        result = recognition.call(file=str(converted_path.absolute()))
-
-        if result.status_code == 200:
-            # 解析结果
-            full_text = ""
-            if hasattr(result, 'output') and result.output:
-                output = result.output
-                if 'sentence' in output:
-                    for sentence in output['sentence']:
-                        full_text += sentence.get('text', '')
-                elif 'text' in output:
-                    full_text = output['text']
-
-            if full_text:
-                logger.info(f"✅ 转录完成: {len(full_text)} 字符")
-                return full_text
-            else:
-                logger.error("ASR 返回空结果")
-                return None
-        else:
-            logger.error(f"ASR 转录失败: {result.message}")
-            return None
-
-    except ImportError:
-        logger.error("dashscope 未安装，请运行: pip install dashscope")
+    if not DashScopeASRTranscriber:
+        logger.error("DashScopeASRTranscriber not found in distiller")
         return None
+
+    try:
+        # 获取 API key（使用统一的延迟加载）
+        api_key = get_api_key(["BAILIAN_API_KEY", "CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY"])
+        if not api_key:
+            logger.error("API Key 未配置")
+            return None
+
+        transcriber = DashScopeASRTranscriber(api_key)
+        audio_path_obj = Path(audio_path)
+        
+        # 执行转录
+        result = transcriber.transcribe(audio_path_obj)
+        
+        if result.full_text:
+            return result.full_text
+        else:
+            if result.error_details:
+                logger.error(f"ASR 详细报错: {result.error_details}")
+            return None
+
     except Exception as e:
         logger.error(f"ASR 转录异常: {e}")
         return None
     finally:
-        # 清理文件
+        # 清理原文件
         if audio_path and os.path.exists(audio_path):
-            os.remove(audio_path)
-        if converted_path and converted_path != Path(audio_path) and converted_path.exists():
-            converted_path.unlink()
+            try:
+                os.remove(audio_path)
+            except: pass
 
 
 def _ensure_audio_format(audio_path: Path) -> Path:

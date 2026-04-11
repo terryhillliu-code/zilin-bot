@@ -6,18 +6,21 @@
 """
 
 # 加载全局密钥 (必须在最前面，在导入其他模块之前)
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path.home() / "scripts"))
-from load_secrets import load_secrets
+from zhiwei_common.secrets import load_secrets
 load_secrets(silent=True)
 
 import lark_oapi as lark
-from lark_oapi.api.im.v1 import *
+from lark_oapi.api.im.v1 import (
+    CreateMessageRequest,
+    CreateMessageRequestBuilder,
+    CreateMessageRequestBody,
+    CreateMessageRequestBodyBuilder,
+)
 import json
 import re
 import subprocess
 import os
+import sys
 import tempfile
 import base64
 import threading
@@ -29,7 +32,6 @@ import signal
 # 导入新模块
 from memory_manager import MemoryManager
 from task_logger import TaskLogger
-from intent_router import IntentRouter
 from message_log import message_log  # 入站消息日志
 from offline_recovery import init_offline_recovery, get_offline_recovery  # 离线消息恢复
 
@@ -46,10 +48,8 @@ from media_handler import (
 
 from command_handler import handle_text_async, show_help, get_session_id, get_quick_status, check_rate_limit
 
-import sys
-import os
-sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
-from message_bus import MessageBus
+# 使用统一共享包 (v57.0)
+from zhiwei_common.message_client import MessageBus
 
 # ========== 全局状态 ==========
 
@@ -67,14 +67,17 @@ pending_image = {}
 chat_history = {}
 MAX_HISTORY = 20
 
-# 记忆管理器缓存（user_id -> MemoryManager）
+# 记忆管理器缓存（user_id -> {manager, last_access_time}）
+# v69.0: 添加时间戳支持过期清理
 memory_cache = {}
+MEMORY_CACHE_EXPIRE_SECONDS = 3600  # 1小时未访问则清理
 
 # 消息去重 (deque 自动淘汰旧消息)
 processed_messages = deque(maxlen=500)
 
-# 线程池（最大 10 个并发任务）
-executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="msg_handler")
+# 线程池（根据 CPU 核心数动态设置，建议 3-5）
+_max_workers = min(5, (os.cpu_count() or 2))
+executor = ThreadPoolExecutor(max_workers=_max_workers, thread_name_prefix="msg_handler")
 
 # 连接状态监控 (ISSUE-003 / ISSUE-027 修复)
 # 简化版：仅监控业务事件，避免误判
@@ -96,7 +99,7 @@ def write_heartbeat(conn_id: str = "", status: str = "connected"):
                 "status": status
             }, f)
     except Exception:
-        pass
+        pass  # 心跳写入失败不影响主流程
 
 # 审批待确认 (T-056)
 pending_review = {}  # user_id -> task_id
@@ -116,7 +119,7 @@ def save_active_user(user_id: str):
         with open(FEISHU_USER_FILE, "w") as f:
             f.write(user_id)
     except Exception:
-        pass
+        pass  # 用户ID持久化失败不影响主流程
 
 
 def load_active_user() -> str:
@@ -129,32 +132,17 @@ def load_active_user() -> str:
                     last_active_user["user_id"] = uid
                     return uid
     except Exception:
-        pass
+        pass  # 用户ID加载失败不影响主流程
     return None
 
 
 # ========== RAG 知识库功能 (Phase 4 新增) ==========
 
 def query_knowledge_base(query: str, top_k: int = 3) -> str:
-    """通过子进程调用 bridge.py 检索知识库 (V2-204-Fix2: 隔离依赖环境)"""
-    import subprocess
-    try:
-        print(f"📚 RAG 检索 (子进程)：{query}")
-        rag_venv = "/Users/liufang/zhiwei-rag/venv/bin/python3"
-        bridge_script = "/Users/liufang/zhiwei-rag/bridge.py"
-        
-        result = subprocess.run(
-            [rag_venv, bridge_script, "context", query, "--top-k", str(top_k)],
-            capture_output=True, text=True, timeout=40
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-        else:
-            print(f"❌ RAG 子进程失败：{result.stderr}")
-            return None
-    except Exception as e:
-        print(f"❌ RAG 调用异常：{e}")
-        return None
+    """检索知识库 - 委托给 rag_bridge 模块"""
+    from rag_bridge import get_context
+    print(f"📚 RAG 检索：{query}")
+    return get_context(query, top_k=top_k) or None
 
 
 
@@ -183,10 +171,29 @@ init_media_handler(client, reply_message, TaskLogger, pending_image, pending_voi
 
 
 def get_memory(user_id: str) -> MemoryManager:
-    """获取或创建用户的记忆管理器"""
+    """获取或创建用户的记忆管理器（v69.0: 添加时间戳）"""
+    current_time = time.time()
     if user_id not in memory_cache:
-        memory_cache[user_id] = MemoryManager(user_id)
-    return memory_cache[user_id]
+        memory_cache[user_id] = {
+            "manager": MemoryManager(user_id),
+            "last_access": current_time
+        }
+    else:
+        memory_cache[user_id]["last_access"] = current_time
+    return memory_cache[user_id]["manager"]
+
+
+def cleanup_memory_cache():
+    """清理过期的记忆管理器缓存（v69.0 新增）"""
+    current_time = time.time()
+    expired = []
+    for user_id, data in memory_cache.items():
+        if current_time - data.get("last_access", 0) > MEMORY_CACHE_EXPIRE_SECONDS:
+            expired.append(user_id)
+    for user_id in expired:
+        del memory_cache[user_id]
+    if expired:
+        print(f"[Cleanup] 清理 {len(expired)} 个过期记忆缓存")
 
 
 def cleanup_pending_images():
@@ -201,6 +208,8 @@ def cleanup_pending_images():
             expired.append(user_id)
     for user_id in expired:
         del pending_image[user_id]
+    # 同时清理 memory_cache
+    cleanup_memory_cache()
 
 
 def add_to_history(user_id: str, role: str, text: str):
@@ -229,14 +238,68 @@ def get_chat_handler():
 
 def call_openclaw_agent(message: str, session_id: str, agent: str = "main") -> str:
     """
-    调用 OpenClaw Agent
+    调用 OpenClaw Agent（真正的执行层）
 
-    @deprecated V2-203: 已废弃，请使用 get_chat_handler().handle_sync()
-    保留此函数是为了向后兼容，实际调用已切换到 chat_handler
+    v55.6 修复架构断裂：
+    - 真正调用 OpenClaw 容器的 agent 命令
+    - 如果 OpenClaw 不可用，降级到 chat_handler
     """
-    # 降级：使用 chat_handler
-    handler = get_chat_handler()
-    return handler.handle_sync(message, session_id, role=agent)
+    import logging
+    logger = logging.getLogger(__name__)
+
+    try:
+        # 构建命令
+        cmd = [
+            "docker", "exec", "clawdbot",
+            "openclaw", "agent",
+            "--agent", agent,
+            "--message", message,
+            "--session-id", f"zhiwei-{session_id}",
+            "--json"
+        ]
+
+        # 调用 OpenClaw
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120  # 2 分钟超时
+        )
+
+        if result.returncode != 0:
+            logger.warning(f"OpenClaw 返回错误: {result.stderr[:200]}")
+            # 降级到 chat_handler
+            handler = get_chat_handler()
+            return handler.handle_sync(message, session_id, role=agent)
+
+        # 解析 JSON 结果
+        try:
+            data = json.loads(result.stdout)
+            if data.get("status") == "ok" and data.get("result"):
+                payloads = data["result"].get("payloads", [])
+                if payloads and payloads[0].get("text"):
+                    return payloads[0]["text"]
+        except json.JSONDecodeError as e:
+            logger.warning(f"OpenClaw JSON 解析失败: {e}")
+
+        # 降级到 chat_handler
+        handler = get_chat_handler()
+        return handler.handle_sync(message, session_id, role=agent)
+
+    except subprocess.TimeoutExpired:
+        logger.warning("OpenClaw 调用超时，降级到 chat_handler")
+        handler = get_chat_handler()
+        return handler.handle_sync(message, session_id, role=agent)
+
+    except FileNotFoundError:
+        logger.warning("Docker 命令不可用，降级到 chat_handler")
+        handler = get_chat_handler()
+        return handler.handle_sync(message, session_id, role=agent)
+
+    except Exception as e:
+        logger.error(f"OpenClaw 调用异常: {e}")
+        handler = get_chat_handler()
+        return handler.handle_sync(message, session_id, role=agent)
 
 # 初始化命令处理模块（需要 call_openclaw_agent 已定义）
 from command_handler import init_command_handler
@@ -245,7 +308,7 @@ init_command_handler(
     get_memory, add_to_history, get_history,
     is_article_url, is_video_url, summarize_url, handle_video_async,
     extract_video_url, extract_article_url, TaskLogger,
-    IntentRouter, save_active_user, load_active_user,
+    save_active_user, load_active_user,
     chat_history, pending_voice, pending_image, pending_review,
     MAX_HISTORY, RATE_LIMIT_SECONDS, user_last_request, memory_cache,
     get_chat_handler,  # V2-203: 新增 chat_handler
@@ -294,8 +357,8 @@ def do_p2_im_message_receive_v1(data) -> None:
                     log_content = f"file_key: {content_dict.get('file_key', '')}"
                 else:
                     log_content = str(content_dict)[:500]
-        except:
-            pass
+        except (json.JSONDecodeError, AttributeError, KeyError):
+            pass  # 消息内容解析失败，使用 None
 
         message_log.log(message_id, log_user_id, msg_type, log_content)
     except Exception as e:
@@ -404,19 +467,24 @@ def do_p2_card_action_trigger_v1(data) -> None:
 
             print(f"[WSClient] 研究卡片确认: topic={topic}, videos={include_videos}")
 
-            reply_message(message_id, f"🚀 正在为您准备「{topic}」的研究素材...")
+            reply_message(message_id, f"🚀 确认收到调研请求：「{topic}」\n已提交至巡检中心 (zhiwei-dev)，正在排队执行。")
 
-            # 触发研究执行器
-            from core.research_report_executor import research_executor
+            # 统一入队 zhiwei-dev (backend='research')
+            from zhiwei_common import TaskStore
+            store = TaskStore()
+            
             research_topic = topic
             if include_videos:
                 research_topic += " --include-videos"
 
-            threading.Thread(
-                target=research_executor.execute,
-                args=(research_topic, user_id, message_id, reply_message, reply_card),
-                daemon=True
-            ).start()
+            task_id = store.enqueue(research_topic, message_id=message_id, backend="research")
+            
+            # 记录用户映射
+            user_mappings_dir = os.path.expanduser("~/zhiwei-dev/user_mappings")
+            os.makedirs(user_mappings_dir, exist_ok=True)
+            with open(os.path.join(user_mappings_dir, f"task_{task_id}_user.json"), "w") as f:
+                json.dump({"user_id": user_id, "message_id": message_id, "source": "feishu"}, f)
+            
             return
 
         elif action_type == "cancel_research":
@@ -508,6 +576,18 @@ def main():
     except Exception as e:
         print(f"⚠️ 离线恢复模块初始化失败: {e}")
 
+    # ⭐ 初始化视频处理告警用户
+    try:
+        from video_history import set_alert_user
+        alert_user_id = os.getenv("ALERT_USER_ID")
+        if alert_user_id:
+            set_alert_user(alert_user_id)
+            print(f"✅ 视频处理告警用户已设置: {alert_user_id[:8]}...")
+        else:
+            print("ℹ️ ALERT_USER_ID 未配置，视频处理告警未启用")
+    except Exception as e:
+        print(f"⚠️ 告警用户设置失败: {e}")
+
     # ISSUE-003: 断连监控和告警线程
     from datetime import datetime
 
@@ -521,8 +601,8 @@ def main():
             if os.path.exists(ALERT_STATE_FILE):
                 with open(ALERT_STATE_FILE) as f:
                     return json.load(f)
-        except:
-            pass
+        except (json.JSONDecodeError, IOError):
+            pass  # 告警状态加载失败，使用默认值
         return {"last_alert_time": 0, "alert_type": None}
 
     def save_alert_state(state: dict):
@@ -530,8 +610,8 @@ def main():
         try:
             with open(ALERT_STATE_FILE, "w") as f:
                 json.dump(state, f)
-        except:
-            pass
+        except IOError:
+            pass  # 告警状态保存失败不影响主流程
 
     def send_ws_alert(msg: str, alert_type: str = "disconnect") -> bool:
         """发送 WebSocket 告警（通过钉钉，避免消耗飞书额度）"""
@@ -546,8 +626,7 @@ def main():
 
         # 尝试通过钉钉发送
         try:
-            sys.path.insert(0, os.path.expanduser("~/zhiwei-scheduler"))
-            from pusher import DingTalkPusher
+            from zhiwei_common import DingTalkPusher
             import yaml
 
             config_path = os.path.expanduser("~/zhiwei-scheduler/config/settings.yaml")
@@ -579,12 +658,14 @@ def main():
         1. 每分钟写入心跳文件（供 watchdog 检测）
         2. 业务消息空闲时记录日志（不发送钉钉告警，避免误报）
         3. ⭐ 离线恢复检测：长时间空闲后恢复时尝试恢复离线消息
+        4. ⭐ v48.0: 定期清理 memory_cache（每10分钟）
         """
         # 启动时立即写入心跳
         write_heartbeat(status="starting")
 
         # 离线检测状态
         was_idle_long = False  # 上一次检查时是否长时间空闲
+        cleanup_counter = 0  # 清理计数器
 
         while True:
             time.sleep(60)  # 每分钟检查一次
@@ -593,6 +674,15 @@ def main():
 
             # 写入心跳（即使空闲也写入，表示服务存活）
             write_heartbeat(status="connected")
+
+            # ⭐ v48.0: 每10分钟清理 memory_cache
+            cleanup_counter += 1
+            if cleanup_counter >= 10:
+                cleanup_counter = 0
+                try:
+                    cleanup_memory_cache()
+                except Exception as e:
+                    print(f"⚠️ memory_cache 清理异常: {e}")
 
             # 检测长时间空闲（超过 5 分钟）
             is_idle_long = event_idle > 300  # 5 分钟
@@ -670,8 +760,8 @@ def main():
 
         while True:
             try:
-                # 消费飞书通知和审批主题
-                topics = ["feishu_notification", "feishu_card_notification"]
+                # 消费飞书通知和审批主题 (v55.0: 包含 legacy notification)
+                topics = ["feishu_notification", "feishu_card_notification", "notification"]
                 for topic in topics:
                     try:
                         messages = mb.consume_pending(topic=topic, limit=5)
@@ -688,7 +778,7 @@ def main():
                                     mb.mark_failed(msg["id"], "No target user found")
                                     continue
 
-                                if topic == "feishu_notification":
+                                if topic in ["feishu_notification", "notification"]:
                                     success = _feishu_api_mod.send_direct_message(target_user, msg["content"])
                                 else:
                                     # 卡片消息 - 自动识别 ID 类型

@@ -39,8 +39,8 @@ class OfflineRecovery:
                 with open(OFFLINE_STATE_FILE) as f:
                     loaded = json.load(f)
                     self.state.update(loaded)
-        except Exception:
-            pass
+        except (json.JSONDecodeError, IOError):
+            pass  # 离线状态加载失败，使用默认状态
 
     def _save_state(self):
         """保存离线状态"""

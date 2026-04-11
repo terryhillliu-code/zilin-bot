@@ -8,6 +8,12 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime
+import shutil
+
+# Docker 路径 (针对 Cron/Launchd 环境)
+DOCKER_BIN = "/usr/local/bin/docker"
+if not Path(DOCKER_BIN).exists():
+    DOCKER_BIN = shutil.which("docker") or "docker"
 
 def get_system_health_dict() -> dict:
     """获取系统健康状态字典"""
@@ -55,7 +61,7 @@ def get_system_health_dict() -> dict:
                                     }
                                 else:
                                     status["services"][name] = {"status": "degraded", "pid": pid}
-                            except:
+                            except Exception:
                                 status["services"][name] = {"status": "running", "pid": pid}
                         else:
                             status["services"][name] = {
@@ -103,7 +109,7 @@ def get_system_health_dict() -> dict:
         try:
             # 只有在缓存失效时才尝试直接查询，且严格限制 2s 超时
             result = subprocess.run(
-                ["docker", "ps", "--format", "{{.Names}}\t{{.Status}}"],
+                [DOCKER_BIN, "ps", "--format", "{{.Names}}\t{{.Status}}"],
                 capture_output=True, text=True, timeout=2,
                 env={**os.environ, "DOCKER_API_VERSION": "1.41"}
             )

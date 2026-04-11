@@ -7,3 +7,4 @@ data/*.db
 
 # Cookies 文件
 secrets/
+mem0_data/
