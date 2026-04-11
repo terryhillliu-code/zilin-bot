@@ -32,7 +32,6 @@ import signal
 # 导入新模块
 from memory_manager import MemoryManager
 from task_logger import TaskLogger
-from intent_router import IntentRouter
 from message_log import message_log  # 入站消息日志
 from offline_recovery import init_offline_recovery, get_offline_recovery  # 离线消息恢复
 
@@ -309,7 +308,7 @@ init_command_handler(
     get_memory, add_to_history, get_history,
     is_article_url, is_video_url, summarize_url, handle_video_async,
     extract_video_url, extract_article_url, TaskLogger,
-    IntentRouter, save_active_user, load_active_user,
+    save_active_user, load_active_user,
     chat_history, pending_voice, pending_image, pending_review,
     MAX_HISTORY, RATE_LIMIT_SECONDS, user_last_request, memory_cache,
     get_chat_handler,  # V2-203: 新增 chat_handler

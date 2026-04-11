@@ -49,9 +49,6 @@ class CommandContext:
     # ========== 任务日志 ==========
     TaskLogger: Any = None
 
-    # ========== 意图路由 ==========
-    IntentRouter: Any = None
-
     # ========== 用户状态 ==========
     save_active_user: Callable[[str], None] = None
     load_active_user: Callable[[], str] = None
@@ -141,7 +138,6 @@ def init_context_from_globals(
     extract_video_url=None,
     extract_article_url=None,
     TaskLogger=None,
-    IntentRouter=None,
     save_active_user=None,
     load_active_user=None,
     chat_history=None,
@@ -174,7 +170,6 @@ def init_context_from_globals(
         extract_video_url=extract_video_url,
         extract_article_url=extract_article_url,
         TaskLogger=TaskLogger,
-        IntentRouter=IntentRouter,
         save_active_user=save_active_user,
         load_active_user=load_active_user,
         detect_chain_intent=detect_chain_intent,

@@ -38,7 +38,7 @@ def init_command_handler(*args, **kwargs):
         "get_memory", "add_to_history", "get_history",
         "is_article_url", "is_video_url", "summarize_url", "handle_video_async",
         "extract_video_url", "extract_article_url", "TaskLogger",
-        "IntentRouter", "save_active_user", "load_active_user",
+        "save_active_user", "load_active_user",
         "chat_history", "pending_voice", "pending_image", "pending_review",
         "MAX_HISTORY", "RATE_LIMIT_SECONDS", "user_last_request", "memory_cache",
         "pending_video_confirm", "get_video_history", "get_chat_handler"
