@@ -24,7 +24,7 @@ def handle_knowledge_commands(text_lower, text_stripped, user_id, message_id, ct
 
 > 时间: {time.strftime("%Y-%m-%d %H:%M:%S")}
 > 来源: 飞书 /insight
-> 用户: {user_id}
+> 用户: {user_id[:8] if len(user_id) > 8 else user_id}
 
 {content}
 """
