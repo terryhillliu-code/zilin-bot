@@ -61,7 +61,7 @@ def get_system_health_dict() -> dict:
                                     }
                                 else:
                                     status["services"][name] = {"status": "degraded", "pid": pid}
-                            except:
+                            except Exception:
                                 status["services"][name] = {"status": "running", "pid": pid}
                         else:
                             status["services"][name] = {

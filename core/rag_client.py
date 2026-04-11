@@ -29,7 +29,7 @@ class RAGClient:
         try:
             resp = requests.get(f"{self.api_url}/health", timeout=2)
             return resp.status_code == 200
-        except:
+        except Exception:
             return False
 
     def search(
@@ -155,7 +155,7 @@ class RAGClient:
                 result["api_available"] = True
                 data = resp.json()
                 result["doc_count"] = data.get("doc_count", 0)
-        except:
+        except Exception:
             pass
 
         # 检查 bridge + LanceDB
@@ -175,7 +175,7 @@ class RAGClient:
                 result["bridge_available"] = True
                 if result["doc_count"] == 0:
                     result["doc_count"] = int(check_result.stdout.strip())
-        except:
+        except Exception:
             pass
 
         return result
