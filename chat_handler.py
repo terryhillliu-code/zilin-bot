@@ -49,6 +49,12 @@ class ChatHandler:
     - 意图识别（NLU 驱动研究触发）
     """
 
+    # 类级别共享：所有 ChatHandler 实例共用同一个记忆缓存
+    _memory_managers = {}
+    _memory_ttl = {}
+    _ttl_seconds = 3600
+    _cleanup_thread_started = False
+
     def __init__(
         self,
         prompts_dir: Optional[str] = None,
@@ -95,10 +101,8 @@ class ChatHandler:
                 self.enable_memory = False
 
         # 记忆管理器缓存（带 TTL 清理）
-        self._memory_managers = {}
-        self._memory_ttl = {}  # session_id -> last_access_time
-        self._ttl_seconds = 3600  # 1小时过期
-        self._start_cleanup_thread()
+        # 类级别属性，由 _start_cleanup_thread_once 统一管理
+        ChatHandler._start_cleanup_thread_once()
 
         # RAG 桥接
         self._rag_available = False
@@ -126,21 +130,27 @@ class ChatHandler:
         # 加载 system prompt
         self._system_prompt_cache = {}
 
-    def _start_cleanup_thread(self):
-        """启动后台清理线程（v48.0）"""
+    _cleanup_thread_started = False
+
+    @classmethod
+    def _start_cleanup_thread_once(cls):
+        """启动后台清理线程（仅执行一次，v48.0）"""
+        if cls._cleanup_thread_started:
+            return
+        cls._cleanup_thread_started = True
+
         def cleanup_loop():
             while True:
                 time.sleep(600)  # 每10分钟检查一次
                 try:
                     now = time.time()
                     expired = [
-                        sid for sid, t in self._memory_ttl.items()
-                        if now - t > self._ttl_seconds
+                        sid for sid, t in list(cls._memory_ttl.items())
+                        if now - t > cls._ttl_seconds
                     ]
                     for sid in expired:
-                        if sid in self._memory_managers:
-                            del self._memory_managers[sid]
-                        del self._memory_ttl[sid]
+                        cls._memory_managers.pop(sid, None)
+                        cls._memory_ttl.pop(sid, None)
                     if expired:
                         logger.info(f"[Cleanup] 清理 {len(expired)} 个过期记忆缓存")
                 except Exception as e:
@@ -171,15 +181,15 @@ class ChatHandler:
             return None
 
         # 更新访问时间
-        self._memory_ttl[session_id] = time.time()
+        ChatHandler._memory_ttl[session_id] = time.time()
 
-        if session_id not in self._memory_managers:
-            self._memory_managers[session_id] = self._memory_manager_class(
+        if session_id not in ChatHandler._memory_managers:
+            ChatHandler._memory_managers[session_id] = self._memory_manager_class(
                 user_id=session_id,
                 max_working_rounds=6
             )
 
-        return self._memory_managers[session_id]
+        return ChatHandler._memory_managers[session_id]
 
     def _retrieve_context(self, query: str, top_k: int = 5) -> str:
         """

@@ -4,6 +4,7 @@ zhiwei-rag 桥接（zhiwei-bot 版本）
 通过 HTTP API 调用 RAG 服务，替代子进程隔离方案
 """
 import json
+import sys
 import urllib.request
 import urllib.error
 from typing import Optional
@@ -25,7 +26,7 @@ def _post_json(url: str, data: dict, timeout: int = TIMEOUT) -> Optional[dict]:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as e:
-        print(f"[RAG] HTTP 请求失败: {e}", file=__import__("sys").stderr)
+        print(f"[RAG] HTTP 请求失败: {e}", file=sys.stderr)
         return None
 
 
@@ -51,7 +52,7 @@ def get_context(query: str, top_k: int = 5, timeout: int = 10) -> str:
         return ""
 
     parts = []
-    for r in result["results"][:3]:
+    for r in result["results"][:top_k]:
         text = r.get("text", r.get("raw_text", ""))[:300]
         source = r.get("source", "")
         if source:

@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 # 添加 zhiwei_agent 路径
-sys.path.insert(0, str(Path.home()))
+sys.path.insert(0, str(Path.home() / "zhiwei_agent"))
 
 try:
     from zhiwei_agent.executor import AgentExecutor

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 # 添加 zhiwei_agent 路径
-sys.path.insert(0, str(Path.home()))
+sys.path.insert(0, str(Path.home() / "zhiwei_agent"))
 
 try:
     from zhiwei_agent.tools.lark_tool import LarkTool
@@ -56,13 +56,13 @@ def handle_lark_commands(text_lower, text_stripped, user_id, message_id, ctx):
     # 分发处理
     if subcommand == "send":
         return _handle_send(args, user_id, message_id, ctx)
-    elif subcommand in ["create-group", "create-group", "建群"]:
+    elif subcommand in ["create-group", "建群"]:
         return _handle_create_group(args, message_id, ctx)
-    elif subcommand in ["create-doc", "create-doc", "文档"]:
+    elif subcommand in ["create-doc", "文档"]:
         return _handle_create_doc(args, message_id, ctx)
-    elif subcommand in ["create-sheet", "create-sheet", "表格"]:
+    elif subcommand in ["create-sheet", "表格"]:
         return _handle_create_sheet(args, message_id, ctx)
-    elif subcommand in ["create-task", "create-task", "任务"]:
+    elif subcommand in ["create-task", "任务"]:
         return _handle_create_task(args, message_id, ctx)
     elif subcommand == "search":
         return _handle_search(args, message_id, ctx)
