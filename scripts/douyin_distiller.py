@@ -1918,11 +1918,15 @@ class TranscriptProvider:
         self.image_video_processor = ImageVideoProcessor(config)
 
     def get_transcript(self, video_info: VideoInfo, save_audio_path: Optional[Path] = None) -> TranscriptResult:
-        """获取转录文本，按策略选择方法"""
+        """获取转录文本，按策略选择方法
+
+        v2.2: 抖音平台跳过字幕提取，因为视频描述（hashtags）不是真正的语音内容
+        """
         policy = self.config.asr_policy
 
-        # 策略：auto - 优先尝试字幕
-        if policy == "auto":
+        # 策略：auto - 优先尝试字幕（但抖音平台跳过）
+        # 抖音的"字幕"只是视频描述，通常只有 hashtags，没有实际语音内容
+        if policy == "auto" and video_info.platform != "douyin":
             # 尝试提取平台字幕
             subtitle_result = self.media_extractor.extract_subtitles(video_info)
             if subtitle_result and subtitle_result.full_text:
@@ -1930,6 +1934,10 @@ class TranscriptProvider:
                 return subtitle_result
 
             logger.info("No subtitles found, checking video type...")
+
+        # 抖音平台：直接使用 ASR
+        if video_info.platform == "douyin":
+            logger.info("Douyin platform: skipping subtitle extraction (hashtags only), using ASR directly")
 
         # 检测并处理图片视频
         image_result = self._try_image_video(video_info)
