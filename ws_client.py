@@ -48,7 +48,6 @@ from media_handler import (
 
 from command_handler import handle_text_async, show_help, get_session_id, get_quick_status, check_rate_limit
 
-# 导入模型路由模块
 from utils.model_routing import route_model_for_task
 
 # 使用统一共享包 (v57.0)
