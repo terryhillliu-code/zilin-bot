@@ -48,6 +48,9 @@ from media_handler import (
 
 from command_handler import handle_text_async, show_help, get_session_id, get_quick_status, check_rate_limit
 
+# 导入模型路由模块
+from utils.model_routing import route_model_for_task
+
 # 使用统一共享包 (v57.0)
 from zhiwei_common.message_client import MessageBus
 
@@ -478,10 +481,7 @@ def do_p2_card_action_trigger_v1(data) -> None:
                 research_topic += " --include-videos"
 
             # v33.0: 根据研究主题自动路由模型
-            import sys
-            sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
-            from model_router import get_best_model
-            task_model = get_best_model(research_topic)
+            task_model = route_model_for_task(research_topic)
             task_id = store.enqueue(research_topic, message_id=message_id, backend="research", model=task_model)
             
             # 记录用户映射

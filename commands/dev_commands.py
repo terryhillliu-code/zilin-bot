@@ -4,6 +4,7 @@ import subprocess
 import traceback
 from zhiwei_common.task_client import TaskStore
 from zhiwei_common.config import ZHIWEI_SCHEDULER, ZHIWEI_DEV
+from utils.model_routing import route_model_for_task
 
 def handle_dev_commands(text_lower, text_stripped, user_id, message_id, ctx):
     """处理 /dev, /accept, /reject 等开发工作流命令"""
@@ -55,10 +56,7 @@ def handle_dev_commands(text_lower, text_stripped, user_id, message_id, ctx):
             
             initial_status = "pending" if risk_level == "auto" else "review"
             # v33.0: 根据需求文本自动路由模型
-            import sys
-            sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
-            from model_router import get_best_model
-            task_model = get_best_model(requirement)
+            task_model = route_model_for_task(requirement)
             task_id = store.enqueue(requirement, message_id=message_id, initial_status=initial_status, model=task_model)
             daily_seq = store.get_daily_seq(task_id)
 
