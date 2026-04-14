@@ -54,7 +54,12 @@ def handle_dev_commands(text_lower, text_stripped, user_id, message_id, ctx):
                 risk_level = "auto"
             
             initial_status = "pending" if risk_level == "auto" else "review"
-            task_id = store.enqueue(requirement, message_id=message_id, initial_status=initial_status)
+            # v33.0: 根据需求文本自动路由模型
+            import sys
+            sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
+            from model_router import get_best_model
+            task_model = get_best_model(requirement)
+            task_id = store.enqueue(requirement, message_id=message_id, initial_status=initial_status, model=task_model)
             daily_seq = store.get_daily_seq(task_id)
 
             # 记录用户映射

@@ -477,7 +477,12 @@ def do_p2_card_action_trigger_v1(data) -> None:
             if include_videos:
                 research_topic += " --include-videos"
 
-            task_id = store.enqueue(research_topic, message_id=message_id, backend="research")
+            # v33.0: 根据研究主题自动路由模型
+            import sys
+            sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
+            from model_router import get_best_model
+            task_model = get_best_model(research_topic)
+            task_id = store.enqueue(research_topic, message_id=message_id, backend="research", model=task_model)
             
             # 记录用户映射
             user_mappings_dir = os.path.expanduser("~/zhiwei-dev/user_mappings")
