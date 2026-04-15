@@ -398,12 +398,12 @@ class ChatHandler:
                     message
                 )
 
-            # 3. 获取对话记忆
+            # 3. 获取对话记忆（v49.0: 传入当前 query 支持语义搜索）
             memory_context = ""
             if self.enable_memory:
                 mm = self._get_memory_manager(session_id)
                 if mm:
-                    memory_context = mm.build_context_prompt()
+                    memory_context = mm.build_context_prompt(current_query=message)
 
             # 4. 构建完整消息
             full_message = self._build_message(message, context, memory_context)
