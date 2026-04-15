@@ -7,6 +7,7 @@
 """
 import json
 import os
+import re
 import time
 import uuid
 from datetime import datetime
@@ -421,7 +422,6 @@ class MemoryManager:
         # 偏好类
         for kw in PREFERENCE_KEYWORDS:
             if kw in combined:
-                import re
                 match = re.search(rf"{kw}(.{{2,50}})", old_text)
                 if match:
                     anchors.append({
@@ -504,8 +504,6 @@ def extract_important_info(user_msg: str, assistant_msg: str) -> dict:
     从对话中提取重要信息（简单规则匹配）
     返回: {"key": "...", "value": "..."} 或 None
     """
-    import re
-
     combined = f"{user_msg} {assistant_msg}".lower()
 
     # 偏好类
@@ -532,8 +530,6 @@ def extract_important_info_enhanced(user_msg: str, assistant_msg: str) -> dict:
     增强版记忆提取（规则优先，LLM 降级）
     返回: {"key": "...", "value": "..."} 或 None
     """
-    import re
-
     combined = f"{user_msg} {assistant_msg}"
     combined_lower = combined.lower()
     assistant_lower = assistant_msg.lower()
