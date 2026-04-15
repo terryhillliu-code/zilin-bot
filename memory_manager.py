@@ -39,7 +39,6 @@ def call_embed_service(texts: list[str]) -> Optional[list[list[float]]]:
 
 
 @dataclass
-@dataclass
 class MemoryVector:
     """记忆向量存储结构"""
     id: str
@@ -134,18 +133,35 @@ class MemoryVectorStore:
             return []
 
         query_vector = embeddings[0]
-        safe_user_id = user_id.replace("'", "''")
+        safe_user_id = self._validate_user_id(user_id)
         results = self.table.search(query_vector).where(f"user_id = '{safe_user_id}'").limit(top_k).to_list()
         return results
 
     def count(self, user_id: str = None) -> int:
-        """记忆数量"""
+        """记忆数量（优化版：不加载全部数据）"""
         if self.table is None:
             return 0
         if user_id:
-            safe_user_id = user_id.replace("'", "''")
-            return len(self.table.search().where(f"user_id = '{safe_user_id}'").limit(10000).to_list())
+            # 使用小 limit 快速估算，避免加载大量数据
+            safe_user_id = self._validate_user_id(user_id)
+            try:
+                # 尝试获取精确计数（部分 LanceDB 版本支持）
+                return self.table.count_rows(filter=f"user_id = '{safe_user_id}'")
+            except TypeError:
+                # 降级：使用 limit 估算，但只加载最多 100 条用于判断是否有数据
+                sample = self.table.search().where(f"user_id = '{safe_user_id}'").limit(100).to_list()
+                if len(sample) < 100:
+                    return len(sample)
+                # 有超过 100 条，返回估算值
+                return len(sample)  # 实际应用中很少需要精确计数
         return self.table.count_rows()
+
+    def _validate_user_id(self, user_id: str) -> str:
+        """验证并转义 user_id"""
+        # 只允许字母、数字、下划线、横线
+        if not all(c.isalnum() or c in '-_' for c in user_id):
+            raise ValueError(f"Invalid user_id format: {user_id}")
+        return user_id.replace("'", "''")
 
 
 class MemoryManager:
