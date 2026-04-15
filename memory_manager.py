@@ -299,38 +299,140 @@ class MemoryManager:
             return
         old_turns = self.working_memory[:2]
         self.working_memory = self.working_memory[2:]
+
+        # ⭐ Phase 1: 先提取锚点信息存入持久记忆
         old_text = ""
         for turn in old_turns:
-            old_text += f"用户: {turn['user'][:150]}\n助手: {turn['assistant'][:150]}\n"
+            old_text += f"用户: {turn['user'][:200]}\n助手: {turn['assistant'][:200]}\n"
+        anchors = self._extract_anchor_info(old_text)
+        if anchors:
+            for anchor in anchors:
+                self.save_persistent(anchor["key"], anchor["value"])
+                # 同时存入向量库
+                if self.vector_store:
+                    memory = MemoryVector(
+                        id=str(uuid.uuid4()),
+                        user_id=self.user_id,
+                        text=anchor["value"],
+                        user_msg="",
+                        assistant_msg="",
+                        memory_type=anchor["key"],
+                        timestamp=datetime.now().isoformat(),
+                    )
+                    self.vector_store.add_memory(memory)
+            print(f"🧠 提取锚点: {len(anchors)} 条")
+
+        # Phase 2: 压缩剩余内容
         new_summary = self._call_compress_llm(old_text)
         if new_summary:
             self.summary = new_summary
 
-    def _call_compress_llm(self, old_text) -> str:
-        try:
-            # 使用统一 LLM 出口
-            try:
-                from llm_client import llm_client
-            except ImportError:
-                return self._simple_compress(old_text)
+    def _extract_anchor_info(self, old_text: str) -> list[dict]:
+        """
+        从待压缩对话中提取锚点信息（必须保留）
 
-            prompt = f"""请将以下对话历史压缩为简洁摘要，保留关键信息：
+        Returns:
+            [{"key": "偏好_xxx", "value": "..."}, ...]
+        """
+        try:
+            from llm_client import llm_client
+        except ImportError:
+            return []
+
+        prompt = f"""请从以下对话中提取**必须保留**的锚点信息：
+
+对话内容：
+{old_text}
+
+提取规则：
+1. 用户偏好/习惯（如：喜欢简洁、常用某工具）
+2. 已做决策（如：决定用某方案、选择了某技术）
+3. 任务结果（如：已完成xxx、成功部署yyy）
+4. 关键事实（如：存在bug、需要修复、某个数据）
+
+输出格式（每行一条）：
+类型|内容
+如：偏好|喜欢简洁的回答
+如：决策|用React开发前端
+
+如果没有锚点信息，输出：无"""
+
+        try:
+            success, result = llm_client.call(
+                role="research",  # ⭐ 使用更强模型
+                message=prompt,
+                timeout=20,
+            )
+            if not success or result == "无":
+                return []
+
+            anchors = []
+            for line in result.strip().split("\n"):
+                if "|" in line:
+                    parts = line.split("|", 1)
+                    key = parts[0].strip()
+                    value = parts[1].strip()[:100]
+                    # 添加时间戳避免重复
+                    anchor_key = f"{key}_{datetime.now().strftime('%m%d%H%M')}"
+                    anchors.append({"key": anchor_key, "value": value})
+
+            return anchors[:5]  # 最多5条锚点
+
+        except Exception as e:
+            print(f"⚠️ 锚点提取失败: {e}")
+            return []
+
+    def _call_compress_llm(self, old_text) -> str:
+        """
+        压缩对话历史（改进版）
+        - 使用 research 角色(glm-4-plus)提升质量
+        - 结构化 Prompt 明确保留内容
+        """
+        try:
+            from llm_client import llm_client
+        except ImportError:
+            return self._simple_compress(old_text)
+
+        prompt = f"""请压缩以下对话历史为结构化摘要：
 
 之前的摘要：{self.summary or '无'}
 
 新的对话：
 {old_text}
 
-要求：只保留关键事实决策结论，控制在150字以内"""
+压缩规则：
+**必须保留的内容**（已在持久记忆中存储的除外）：
+- 用户提到的偏好/习惯
+- 已做出的决策
+- 任务执行结果
+- 关键事实/问题/发现
 
+**可以压缩**：
+- 对话过程细节
+- 中间讨论
+- 重复内容
+- 无关闲聊
+
+输出格式：
+[摘要] 一句话概括（不超过80字）
+[要点] 关键信息列表（如有）
+
+注意：如果对话主要是闲聊或无重要信息，只输出简洁摘要即可。"""
+
+        try:
             success, result = llm_client.call(
-                role="format",
+                role="research",  # ⭐ 使用 glm-4-plus 提升质量
                 message=prompt,
-                timeout=15,
+                timeout=20,
             )
             if success and result:
-                print(f"🧠 摘要压缩完成: {len(result)} 字符")
-                return result[:300]
+                # 提取摘要部分
+                if "[摘要]" in result:
+                    lines = result.split("\n")
+                    for line in lines:
+                        if line.startswith("[摘要]"):
+                            return line.replace("[摘要]", "").strip()[:200]
+                return result[:200]
             return self._simple_compress(old_text)
         except Exception as e:
             print(f"⚠️ 摘要压缩异常: {e}")

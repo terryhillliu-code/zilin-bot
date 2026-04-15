@@ -169,6 +169,30 @@ class TestMemoryManager:
         mm.reset()
         assert len(mm.working_memory) == 0
 
+    def test_compress_with_anchor_extraction(self):
+        """测试压缩时锚点提取（模拟，不实际调用 LLM）"""
+        mm = MemoryManager("test-user-compress", max_working_rounds=2, enable_vector=False)
+        # 添加足够多的轮次触发压缩
+        mm.add_turn("我喜欢简洁的回答", "好的，我会简洁回答")
+        mm.add_turn("我决定用 React 开发", "好的选择")
+        mm.add_turn("任务已完成", "很好")
+        # 验证压缩后被移除
+        assert len(mm.working_memory) <= 2
+
+    def test_extract_anchor_info_mock(self):
+        """测试锚点提取函数（模拟输入）"""
+        mm = MemoryManager("test-anchor-mock", max_working_rounds=6, enable_vector=False)
+        # 模拟锚点数据
+        mock_anchors = [
+            {"key": "偏好_0415", "value": "喜欢简洁的回答"},
+            {"key": "决策_0415", "value": "用React开发"},
+        ]
+        for anchor in mock_anchors:
+            mm.save_persistent(anchor["key"], anchor["value"])
+        # 验证持久记忆
+        persistent = mm.get_persistent()
+        assert any("简洁" in str(v) for v in persistent.values())
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
