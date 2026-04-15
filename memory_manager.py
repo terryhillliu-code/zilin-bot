@@ -20,22 +20,43 @@ try:
     HAS_LANCEDB = True
 except ImportError:
     HAS_LANCEDB = False
-    print("⚠️ LanceDB 未安装，向量检索功能不可用")
 
-# Embedding 服务
-_EMBED_SERVICE_URL = "http://127.0.0.1:8765/embed"
+# Embedding 服务 - 尝试复用 zhiwei-rag 的实现
+try:
+    from zhiwei_rag.ingest.lance_store import call_embed_service
+    HAS_EMBED_SERVICE = True
+except ImportError:
+    # 降级：本地定义
+    _EMBED_SERVICE_URL = "http://127.0.0.1:8765/embed"
 
+    def call_embed_service(texts: list[str]) -> Optional[list[list[float]]]:
+        """调用常驻 Embedding 服务获取向量"""
+        try:
+            import requests
+            resp = requests.post(_EMBED_SERVICE_URL, json={"texts": texts}, timeout=30)
+            if resp.status_code == 200:
+                return resp.json().get("embeddings", [])
+        except Exception as e:
+            print(f"⚠️ Embedding 服务调用失败: {e}")
+        return None
+    HAS_EMBED_SERVICE = True
 
-def call_embed_service(texts: list[str]) -> Optional[list[list[float]]]:
-    """调用常驻 Embedding 服务获取向量"""
-    try:
-        import requests
-        resp = requests.post(_EMBED_SERVICE_URL, json={"texts": texts}, timeout=30)
-        if resp.status_code == 200:
-            return resp.json().get("embeddings", [])
-    except Exception as e:
-        print(f"⚠️ Embedding 服务调用失败: {e}")
-    return None
+# 记忆提取关键词常量（模块级）
+PREFERENCE_KEYWORDS = (
+    "我喜欢", "我偏好", "我习惯", "我常用", "我一般",
+    "我不喜欢", "我讨厌", "我希望", "我的习惯", "我倾向于"
+)
+TASK_KEYWORDS = (
+    "已完成", "已创建", "已部署", "已修复", "任务完成",
+    "执行完成", "成功", "已实现"
+)
+DECISION_KEYWORDS = (
+    "决定", "选择", "采用", "方案", "策略", "配置", "设置", "规划"
+)
+TECH_KEYWORDS = (
+    "python", "javascript", "java", "go", "rust", "react", "vue",
+    "django", "flask", "mysql", "redis", "docker", "git", "api"
+)
 
 
 @dataclass
@@ -399,68 +420,44 @@ def extract_important_info(user_msg: str, assistant_msg: str) -> dict:
 
 def extract_important_info_enhanced(user_msg: str, assistant_msg: str) -> dict:
     """
-    增强版记忆提取（规则 + LLM 智能提取）
+    增强版记忆提取（规则优先，LLM 降级）
     返回: {"key": "...", "value": "..."} 或 None
     """
     import re
 
     combined = f"{user_msg} {assistant_msg}"
     combined_lower = combined.lower()
+    assistant_lower = assistant_msg.lower()
 
-    # Phase 1: 规则提取（快速匹配）
+    # 偏好类
+    for kw in PREFERENCE_KEYWORDS:
+        if kw in combined_lower:
+            match = re.search(rf"{kw}(.{{2,50}})", combined)
+            if match:
+                return {"key": "用户偏好", "value": match.group(1).strip()[:80]}
 
-    # 偏好类（扩展关键词）
-    preference_keywords = [
-        "我喜欢", "我偏好", "我习惯", "我常用", "我一般",
-        "我不喜欢", "我讨厌", "我希望", "我的习惯", "我倾向于"
-    ]
-    if any(kw in combined_lower for kw in preference_keywords):
-        for kw in preference_keywords:
-            if kw in combined_lower:
-                match = re.search(rf"{kw}(.{{2,50}})", combined)
-                if match:
-                    return {"key": "用户偏好", "value": match.group(1).strip()[:80]}
+    # 任务完成类
+    for kw in TASK_KEYWORDS:
+        if kw in assistant_lower:
+            match = re.search(rf"(.{{0,30}}){kw}", assistant_msg)
+            task_desc = match.group(1).strip() if match and match.group(1) else ""
+            return {"key": "完成任务", "value": f"{task_desc}: {kw}" if task_desc else kw}
 
-    # 任务完成类（扩展关键词）
-    task_keywords = [
-        "已完成", "已创建", "已部署", "已修复", "已完成",
-        "任务完成", "执行完成", "成功", "已实现"
-    ]
-    if any(kw in assistant_msg.lower() for kw in task_keywords):
-        # 提取任务描述
-        for kw in task_keywords:
-            if kw in assistant_msg.lower():
-                match = re.search(rf"(.{{0,30}}){kw}", assistant_msg)
-                if match:
-                    task_desc = match.group(1).strip() if match.group(1) else kw
-                    return {"key": "完成任务", "value": f"{task_desc}: {kw}"}
-        return {"key": "完成任务", "value": assistant_msg[:100]}
+    # 决策类
+    for kw in DECISION_KEYWORDS:
+        if kw in combined_lower:
+            match = re.search(rf"{kw}(.{{2,80}})", combined)
+            if match:
+                return {"key": "决策记录", "value": match.group(1).strip()[:80]}
 
-    # 决策类（扩展关键词）
-    decision_keywords = [
-        "决定", "选择", "采用", "使用", "方案", "策略",
-        "配置", "设置", "参数", "规划"
-    ]
-    if any(kw in combined_lower for kw in decision_keywords):
-        for kw in decision_keywords:
-            if kw in combined_lower:
-                match = re.search(rf"{kw}(.{{2,80}})", combined)
-                if match:
-                    return {"key": "决策记录", "value": match.group(1).strip()[:80]}
+    # 技术栈类
+    for kw in TECH_KEYWORDS:
+        if kw in combined_lower:
+            match = re.search(r"(使用|采用|基于|框架是|用的是)(.{2,50})", combined)
+            if match:
+                return {"key": "技术栈", "value": match.group(2).strip()[:80]}
 
-    # 技术栈/工具类
-    tech_keywords = [
-        "python", "javascript", "java", "go", "rust", "react",
-        "vue", "django", "flask", "mysql", "redis", "docker",
-        "git", "api", "数据库", "框架", "工具", "系统"
-    ]
-    if any(kw in combined_lower for kw in tech_keywords):
-        # 查找技术栈相关描述
-        match = re.search(r"(使用|采用|基于|框架是|用的是)(.{2,50})", combined)
-        if match:
-            return {"key": "技术栈", "value": match.group(2).strip()[:80]}
-
-    # Phase 2: LLM 智能提取（如果规则未匹配，且对话较长）
+    # LLM 智能提取（规则未匹配且对话较长）
     if len(combined) > 100:
         return _extract_with_llm(user_msg, assistant_msg)
 
