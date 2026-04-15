@@ -184,14 +184,43 @@ class TestMemoryManager:
         mm = MemoryManager("test-anchor-mock", max_working_rounds=6, enable_vector=False)
         # 模拟锚点数据
         mock_anchors = [
-            {"key": "偏好_0415", "value": "喜欢简洁的回答"},
-            {"key": "决策_0415", "value": "用React开发"},
+            {"key": "偏好_0415223701", "value": "喜欢简洁的回答"},
+            {"key": "决策_0415223702", "value": "用React开发"},
         ]
         for anchor in mock_anchors:
             mm.save_persistent(anchor["key"], anchor["value"])
         # 验证持久记忆
         persistent = mm.get_persistent()
         assert any("简洁" in str(v) for v in persistent.values())
+
+    def test_extract_anchors_by_rule(self):
+        """测试规则降级锚点提取"""
+        mm = MemoryManager("test-rule-anchor", max_working_rounds=6, enable_vector=False)
+        old_text = "用户: 我喜欢简洁的回答\n助手: 好的\n"
+        anchors = mm._extract_anchors_by_rule(old_text)
+        assert len(anchors) > 0
+        assert "偏好" in anchors[0]["key"]
+        assert "简洁" in anchors[0]["value"]
+
+    def test_extract_anchors_by_rule_task(self):
+        """测试规则降级任务提取"""
+        mm = MemoryManager("test-rule-task", max_working_rounds=6, enable_vector=False)
+        old_text = "用户: 请帮我完成\n助手: 任务已完成\n"
+        anchors = mm._extract_anchors_by_rule(old_text)
+        assert len(anchors) > 0
+        assert "任务" in anchors[0]["key"]
+
+    def test_anchor_key_unique_timestamp(self):
+        """测试锚点 key 使用秒级时间戳避免冲突"""
+        mm = MemoryManager("test-key-unique", max_working_rounds=6, enable_vector=False)
+        anchors = mm._extract_anchors_by_rule("用户: 我喜欢简洁\n助手: 好的")
+        # 验证 key 格式包含秒级时间戳
+        for anchor in anchors:
+            # 格式：偏好_0416001401（月日时分秒，10位数字）
+            parts = anchor["key"].split("_")
+            assert len(parts) == 2
+            assert parts[1].isdigit()
+            assert len(parts[1]) == 10  # %m%d%H%M%S = 10位
 
 
 if __name__ == "__main__":

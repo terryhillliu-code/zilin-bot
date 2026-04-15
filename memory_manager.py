@@ -295,148 +295,155 @@ class MemoryManager:
         self._save_state()
 
     def _compress_oldest(self):
+        """压缩最旧的对话轮次（单次 LLM 调用）"""
         if len(self.working_memory) <= self.max_working_rounds:
             return
         old_turns = self.working_memory[:2]
         self.working_memory = self.working_memory[2:]
 
-        # ⭐ Phase 1: 先提取锚点信息存入持久记忆
+        # 构建待压缩文本
         old_text = ""
         for turn in old_turns:
             old_text += f"用户: {turn['user'][:200]}\n助手: {turn['assistant'][:200]}\n"
-        anchors = self._extract_anchor_info(old_text)
+
+        # ⭐ 单次 LLM 调用：同时提取锚点和压缩摘要
+        anchors, summary = self._compress_and_extract(old_text)
+
+        # 存储锚点
         if anchors:
             for anchor in anchors:
                 self.save_persistent(anchor["key"], anchor["value"])
-                # 同时存入向量库
+                # 存入向量库（保留原始对话片段）
                 if self.vector_store:
+                    # 从 old_text 中提取相关片段
                     memory = MemoryVector(
                         id=str(uuid.uuid4()),
                         user_id=self.user_id,
-                        text=anchor["value"],
-                        user_msg="",
-                        assistant_msg="",
-                        memory_type=anchor["key"],
+                        text=f"{anchor['key']}: {anchor['value']}",
+                        user_msg=anchor.get("user_msg", ""),
+                        assistant_msg=anchor.get("assistant_msg", ""),
+                        memory_type=anchor["key"].split("_")[0],  # 提取类型
                         timestamp=datetime.now().isoformat(),
                     )
                     self.vector_store.add_memory(memory)
             print(f"🧠 提取锚点: {len(anchors)} 条")
 
-        # Phase 2: 压缩剩余内容
-        new_summary = self._call_compress_llm(old_text)
-        if new_summary:
-            self.summary = new_summary
+        if summary:
+            self.summary = summary
 
-    def _extract_anchor_info(self, old_text: str) -> list[dict]:
+    def _compress_and_extract(self, old_text: str) -> tuple[list[dict], str]:
         """
-        从待压缩对话中提取锚点信息（必须保留）
+        单次 LLM 调用：同时提取锚点和压缩摘要
 
         Returns:
-            [{"key": "偏好_xxx", "value": "..."}, ...]
+            (anchors, summary) - 锚点列表和摘要文本
         """
         try:
             from llm_client import llm_client
         except ImportError:
-            return []
+            # 规则降级
+            anchors = self._extract_anchors_by_rule(old_text)
+            return anchors, self._simple_compress(old_text)
 
-        prompt = f"""请从以下对话中提取**必须保留**的锚点信息：
-
-对话内容：
-{old_text}
-
-提取规则：
-1. 用户偏好/习惯（如：喜欢简洁、常用某工具）
-2. 已做决策（如：决定用某方案、选择了某技术）
-3. 任务结果（如：已完成xxx、成功部署yyy）
-4. 关键事实（如：存在bug、需要修复、某个数据）
-
-输出格式（每行一条）：
-类型|内容
-如：偏好|喜欢简洁的回答
-如：决策|用React开发前端
-
-如果没有锚点信息，输出：无"""
-
-        try:
-            success, result = llm_client.call(
-                role="research",  # ⭐ 使用更强模型
-                message=prompt,
-                timeout=20,
-            )
-            if not success or result == "无":
-                return []
-
-            anchors = []
-            for line in result.strip().split("\n"):
-                if "|" in line:
-                    parts = line.split("|", 1)
-                    key = parts[0].strip()
-                    value = parts[1].strip()[:100]
-                    # 添加时间戳避免重复
-                    anchor_key = f"{key}_{datetime.now().strftime('%m%d%H%M')}"
-                    anchors.append({"key": anchor_key, "value": value})
-
-            return anchors[:5]  # 最多5条锚点
-
-        except Exception as e:
-            print(f"⚠️ 锚点提取失败: {e}")
-            return []
-
-    def _call_compress_llm(self, old_text) -> str:
-        """
-        压缩对话历史（改进版）
-        - 使用 research 角色(glm-4-plus)提升质量
-        - 结构化 Prompt 明确保留内容
-        """
-        try:
-            from llm_client import llm_client
-        except ImportError:
-            return self._simple_compress(old_text)
-
-        prompt = f"""请压缩以下对话历史为结构化摘要：
+        prompt = f"""请处理以下对话历史，同时完成两个任务：
 
 之前的摘要：{self.summary or '无'}
 
-新的对话：
+待处理对话：
 {old_text}
 
-压缩规则：
-**必须保留的内容**（已在持久记忆中存储的除外）：
-- 用户提到的偏好/习惯
-- 已做出的决策
-- 任务执行结果
-- 关键事实/问题/发现
+任务一：提取锚点信息（必须长期保留）
+- 用户偏好/习惯（如：喜欢简洁、常用某工具）
+- 已做决策（如：决定用某方案、选择了某技术）
+- 任务结果（如：已完成xxx、成功部署yyy）
+- 关键事实（如：存在bug、需要修复、某个数据）
 
-**可以压缩**：
-- 对话过程细节
-- 中间讨论
-- 重复内容
-- 无关闲聊
+任务二：压缩为简洁摘要
+- 保留上述锚点信息
+- 压缩对话过程、中间讨论、无关闲聊
 
-输出格式：
+输出格式（严格按此格式）：
+[锚点] 类型|内容（如有，每行一条，最多5条）
 [摘要] 一句话概括（不超过80字）
-[要点] 关键信息列表（如有）
 
-注意：如果对话主要是闲聊或无重要信息，只输出简洁摘要即可。"""
+如果无锚点信息，只输出：
+[摘要] xxx
+
+示例：
+[锚点] 偏好|喜欢简洁的回答
+[锚点] 决策|用React开发前端
+[摘要] 用户偏好简洁，决定用React开发"""
 
         try:
             success, result = llm_client.call(
-                role="research",  # ⭐ 使用 glm-4-plus 提升质量
+                role="research",  # glm-4-plus
                 message=prompt,
-                timeout=20,
+                timeout=25,
             )
-            if success and result:
-                # 提取摘要部分
-                if "[摘要]" in result:
-                    lines = result.split("\n")
-                    for line in lines:
-                        if line.startswith("[摘要]"):
-                            return line.replace("[摘要]", "").strip()[:200]
-                return result[:200]
-            return self._simple_compress(old_text)
+            if not success:
+                return [], self._simple_compress(old_text)
+
+            # 解析结果
+            anchors = []
+            summary = ""
+
+            for line in result.split("\n"):
+                line = line.strip()
+                if line.startswith("[锚点]"):
+                    # 解析锚点：[锚点] 偏好|喜欢简洁的回答
+                    content = line.replace("[锚点]", "").strip()
+                    if "|" in content:
+                        parts = content.split("|", 1)
+                        key = parts[0].strip()
+                        value = parts[1].strip()[:100]
+                        # ⭐ 使用秒级时间戳避免冲突
+                        anchor_key = f"{key}_{datetime.now().strftime('%m%d%H%M%S')}"
+                        anchors.append({
+                            "key": anchor_key,
+                            "value": value,
+                            "user_msg": old_text[:100],  # 保留原始对话片段
+                            "assistant_msg": "",
+                        })
+                elif line.startswith("[摘要]"):
+                    summary = line.replace("[摘要]", "").strip()[:150]
+
+            return anchors[:5], summary or self._simple_compress(old_text)
+
         except Exception as e:
-            print(f"⚠️ 摘要压缩异常: {e}")
-            return self._simple_compress(old_text)
+            print(f"⚠️ 压缩提取失败: {e}")
+            return [], self._simple_compress(old_text)
+
+    def _extract_anchors_by_rule(self, old_text: str) -> list[dict]:
+        """规则降级：无 LLM 时用关键词提取锚点"""
+        anchors = []
+        combined = old_text.lower()
+
+        # 偏好类
+        for kw in PREFERENCE_KEYWORDS:
+            if kw in combined:
+                import re
+                match = re.search(rf"{kw}(.{{2,50}})", old_text)
+                if match:
+                    anchors.append({
+                        "key": f"偏好_{datetime.now().strftime('%m%d%H%M%S')}",
+                        "value": match.group(1).strip()[:80],
+                        "user_msg": old_text[:100],
+                        "assistant_msg": "",
+                    })
+                    break
+
+        # 任务完成类
+        for kw in TASK_KEYWORDS:
+            if kw in combined:
+                anchors.append({
+                    "key": f"任务_{datetime.now().strftime('%m%d%H%M%S')}",
+                    "value": kw,
+                    "user_msg": old_text[:100],
+                    "assistant_msg": "",
+                })
+                break
+
+        return anchors[:3]
 
     def _simple_compress(self, old_text) -> str:
         existing = self.summary or ""
