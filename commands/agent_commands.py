@@ -5,8 +5,8 @@ Agent 命令处理器
 import sys
 from pathlib import Path
 
-# 添加 zhiwei_agent 路径
-sys.path.insert(0, str(Path.home() / "zhiwei_agent"))
+# 添加 zhiwei_agent 的父目录到 sys.path，使 `from zhiwei_agent.*` 可导入
+sys.path.insert(0, str(Path.home()))
 
 try:
     from zhiwei_agent.executor import AgentExecutor

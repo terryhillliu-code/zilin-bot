@@ -1,18 +1,18 @@
 import os
 import json
-from zhiwei_common.task_client import TaskStore
+from zhiwei_agent.integrations.command_adapter import create_task_and_enqueue
+
 
 def handle_research_commands(text_lower, text_stripped, user_id, message_id, ctx):
-    """处理研究任务命令 - 已移交探微"""
+    """处理研究任务命令：映射为 ResearchTask 并入队到 TaskStore"""
 
     if text_lower.startswith("/notebooklm ") or text_lower.startswith("/report ") or text_lower.startswith("/research "):
-        ctx.reply_message(message_id,
-            "📌 研究任务已移交「探微」机器人\n\n"
-            "请 @探微 或私聊探微发送：\n"
-            "`/research <主题>` - 深度研究\n"
-            "`/notebooklm <主题>` - 研究笔记\n\n"
-            "💡 知微专注实时交互：对话、视频、图片、知识库"
-        )
+        # create and enqueue task
+        try:
+            task_id, task = create_task_and_enqueue(text_stripped, user_id=user_id, message_id=message_id)
+            ctx.reply_message(message_id, f"✅ 已创建研究任务，任务ID: {task_id}\n主题: {task.topic}\n状态: pending")
+        except Exception as e:
+            ctx.reply_message(message_id, f"⚠️ 创建研究任务失败: {e}")
         return True
 
     return False

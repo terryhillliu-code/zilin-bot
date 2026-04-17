@@ -104,14 +104,14 @@ class ChatHandler:
         # 类级别属性，由 _start_cleanup_thread_once 统一管理
         ChatHandler._start_cleanup_thread_once()
 
-        # RAG 桥接
+        # RAG 桥接 (v71.0: 使用 HTTP RAGClient 替代本地导入)
         self._rag_available = False
         if self.enable_rag:
             try:
-                from api import retrieve
-                self._rag_retrieve = retrieve
+                from core.rag_client import rag_search
+                self._rag_retrieve = lambda query, top_k=5: rag_search(query, top_k=top_k)
                 self._rag_available = True
-                logger.info("✅ RAG 桥接加载成功")
+                logger.info("✅ RAG 桥接加载成功 (HTTP)")
             except ImportError:
                 logger.warning("⚠️ RAG 桥接不可用")
                 self.enable_rag = False
@@ -208,9 +208,15 @@ class ChatHandler:
 
             context_parts = []
             for r in results[:3]:
-                source = r.get('source', '')
-                text = r.get('raw_text', r.get('text', ''))[:300]
-                metadata = r.get('metadata', {})
+                # v71.0: 兼容对象和字典两种返回格式
+                if isinstance(r, dict):
+                    source = r.get('source', '')
+                    text = r.get('raw_text', r.get('text', r.get('content', '')))[:300]
+                    metadata = r.get('metadata', {})
+                else:
+                    source = getattr(r, 'source', '')
+                    text = getattr(r, 'raw_text', getattr(r, 'text', ''))[:300]
+                    metadata = getattr(r, 'metadata', {})
 
                 # v47.8: 构建来源标注
                 citation = self._build_citation(source, metadata)
