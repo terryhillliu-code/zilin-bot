@@ -23,9 +23,11 @@
 import os
 import sys
 import time
+import json
 import threading
 import asyncio
 import logging
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -321,6 +323,19 @@ class ChatHandler:
                 # 提取当前问题部分
                 original_message = message.split("---\n当前问题: ")[-1].split("\n")[0]
 
+            # ⭐ v48.0 新增：灵机一动想法捕捉
+            # 检测到"想法/我觉得/我在想"等关键词 → 快速捕捉
+            idea_keywords = ["想法：", "想法:", "我觉得", "我在想", "突然想到", "灵机一动"]
+            if any(original_message.startswith(k) for k in idea_keywords):
+                idea_text = original_message
+                for k in idea_keywords:
+                    if original_message.startswith(k):
+                        idea_text = original_message[len(k):].strip()
+                        break
+                if idea_text:
+                    logger.info(f"[ChatHandler] 捕捉到想法: {idea_text[:50]}...")
+                    return await self._handle_idea_capture(idea_text)
+
             # ⭐ v47.0 新增：意图识别
             if self.enable_intent and self._intent_recognizer:
                 intent_result = self._intent_recognizer.recognize(original_message)
@@ -375,6 +390,26 @@ class ChatHandler:
             params.append(f"source={source}")
 
         return f"[INTENT:RESEARCH]|{'|'.join(params)}"
+
+    async def _handle_idea_capture(self, idea_text: str) -> str:
+        """处理灵机一动想法捕捉 (v48.0 新增)"""
+        try:
+            script_path = os.path.expanduser("~/arxiv-paper-analyzer/backend/scripts/idea_capture.py")
+            result = subprocess.run(
+                ["python3", script_path, idea_text, "--short"],
+                capture_output=True, text=True, timeout=45,
+            )
+
+            if result.returncode == 0:
+                return result.stdout
+            else:
+                return f"⚠️ 想法记录失败: {result.stderr[:200]}"
+
+        except subprocess.TimeoutExpired:
+            return "⏱️ 想法处理超时，请稍后查看数据库确认是否已记录"
+        except Exception as e:
+            logger.error(f"[ChatHandler] 想法捕捉异常: {e}")
+            return f"⚠️ 想法记录失败: {str(e)[:100]}"
 
     async def _answer_single(
         self,

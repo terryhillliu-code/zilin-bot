@@ -20,6 +20,7 @@ from commands import (
     handle_media_commands,
     handle_agent_commands,
     handle_lark_commands,  # ⭐ v57.0
+    handle_podcast_commands,  # ⭐ 播客管理命令
     ChatHandler
 )
 
@@ -76,6 +77,10 @@ def handle_text_async(text, user_id, message_id, user_role="user"):
             return
 
         if handle_media_commands(text_lower, text_stripped, user_id, message_id, _ctx):
+            return
+
+        # ⭐ 播客管理命令
+        if handle_podcast_commands(text_lower, text_stripped, user_id, message_id, _ctx):
             return
 
         # ⭐ v57.0 飞书操作命令

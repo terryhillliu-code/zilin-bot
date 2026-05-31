@@ -319,6 +319,28 @@ init_command_handler(
 
 # ========== 消息分发 ==========
 
+def _trigger_self_heal(cmd: str, message_id: str, chat_id_hint: str = None):
+    """收到 /heal 或 /checkup 时异步触发个人 Mac 自检。"""
+    import subprocess
+    flag = "--full" if cmd == "/checkup" else "--quick"
+    push_flag = ["--push"]
+    if chat_id_hint:
+        push_flag += [f"--target={chat_id_hint}"]
+    try:
+        reply_message(message_id, f"🩺 已触发 Mac 自检 ({cmd})，结果稍后推送")
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            ["/opt/homebrew/bin/python3.14", "/Users/liufang/mac-self-heal/cli.py",
+             "daemon-tick", flag] + push_flag,
+            capture_output=True, text=True, timeout=240,
+        )
+        print(f"[self_heal] {cmd} rc={r.returncode}\n{(r.stdout or '')[-400:]}")
+    except Exception as e:
+        print(f"[self_heal] {cmd} 调用失败: {e!r}")
+
+
 def do_p2_im_message_receive_v1(data) -> None:
     global processed_messages, connection_status
     
@@ -418,6 +440,10 @@ def do_p2_im_message_receive_v1(data) -> None:
             text = content_dict.get("text", "")
             text = re.sub(r'@_user_\d+\s*', '', text).strip()
             print(f"   文本：{text[:50]}...")
+            if text in ("/heal", "/checkup"):
+                _chat_id = getattr(message, "chat_id", None)
+                executor.submit(_trigger_self_heal, text, message_id, _chat_id)
+                return
             if text:
                 executor.submit(handle_text_async, text, user_id, message_id)
 
@@ -752,15 +778,34 @@ def main():
         mb = MessageBus()
         print("💡 MessageBus 消费线程已启动")
         
-        # 启动时发布一条自检消息
+        # 启动时发布自检消息（带冷却期检查）
         try:
-            mb.publish(
-                sender="bot/startup",
-                topic="feishu_notification",
-                content=f"🤖知微机器人已重启\n时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nAppID: {APP_ID[:8]}...",
-                metadata={"user_id": load_active_user()}
-            )
-        except: pass
+            COOLDOWN_MINUTES = 30  # 30 分钟内不重复发送
+            with mb._connect() as conn:
+                cursor = conn.execute(
+                    """SELECT created_at FROM messages
+                       WHERE sender = 'bot/startup' AND topic = 'feishu_notification'
+                       ORDER BY created_at DESC LIMIT 1"""
+                )
+                row = cursor.fetchone()
+                if row:
+                    from datetime import timedelta
+                    last_startup = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+                    if datetime.now() - last_startup < timedelta(minutes=COOLDOWN_MINUTES):
+                        print(f"⏸️ 跳过启动通知（{COOLDOWN_MINUTES}分钟冷却期内，上次: {row[0]}）")
+                    else:
+                        raise Exception("cooldown expired")  # 跳转到 publish
+                else:
+                    raise Exception("no previous startup")
+        except:
+            try:
+                mb.publish(
+                    sender="bot/startup",
+                    topic="feishu_notification",
+                    content=f"🤖知微机器人已重启\n时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nAppID: {APP_ID[:8]}...",
+                    metadata={"user_id": load_active_user()}
+                )
+            except: pass
 
         while True:
             try:
@@ -824,7 +869,14 @@ def main():
     msg_bus_thread = threading.Thread(target=poll_message_bus, daemon=True)
     msg_bus_thread.start()
 
-    cli.start()
+    try:
+        cli.start()
+    except KeyboardInterrupt:
+        print("👋 收到中断信号，正常退出")
+    except Exception as e:
+        print(f"❌ 主程序异常退出: {e}")
+        time.sleep(10)  # 退出前等待 10 秒，防止快速重启循环
+        raise
 
 
 if __name__ == "__main__":

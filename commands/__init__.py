@@ -5,6 +5,7 @@ from .knowledge_commands import handle_knowledge_commands
 from .media_commands import handle_media_commands
 from .agent_commands import handle_agent_commands
 from .lark_commands import handle_lark_commands  # ⭐ v57.0
+from .podcast_commands import handle_podcast_commands  # ⭐ 播客管理命令
 from .chat_handler import ChatHandler
 
 __all__ = [
@@ -15,5 +16,6 @@ __all__ = [
     "handle_media_commands",
     "handle_agent_commands",
     "handle_lark_commands",  # ⭐ v57.0
+    "handle_podcast_commands",  # ⭐ 播客管理命令
     "ChatHandler"
 ]

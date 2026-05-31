@@ -13,6 +13,7 @@ import yaml
 from pathlib import Path
 from .persona_service import persona_service
 from .llm_client import llm_client
+from .claude_preprocessor import ClaudePreprocessor
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -44,9 +45,92 @@ class ResearchReportExecutor:
                 return "hardware_report"
         return "default"
 
+    def _count_local_sources(self, topic: str) -> int:
+        """计算本地相关数据量"""
+        counts = {"obsidian": 0, "papers": 0}
+        topic_lower = topic.lower()
+
+        # 1. 计数 Obsidian 笔记
+        obsidian_dir = Path("/Users/liufang/Documents/ZhiweiVault/70-79_个人笔记/播客笔记")
+        if obsidian_dir.exists():
+            for md_file in obsidian_dir.glob("*.md"):
+                try:
+                    content = md_file.read_text(encoding="utf-8")
+                    if any(kw.lower() in content.lower() for kw in topic_lower.split()):
+                        counts["obsidian"] += 1
+                except Exception:
+                    pass
+
+        # 2. 计数论文
+        try:
+            paper_db = Path("/Users/liufang/arxiv-paper-analyzer/backend/data/papers.db")
+            if paper_db.exists():
+                import sqlite3
+                conn = sqlite3.connect(str(paper_db))
+                c = conn.cursor()
+                for kw in topic_lower.split():
+                    c.execute(
+                        "SELECT COUNT(*) FROM papers WHERE LOWER(title) LIKE ? OR LOWER(abstract) LIKE ?",
+                        (f"%{kw}%", f"%{kw}%")
+                    )
+                    count = c.fetchone()[0]
+                    counts["papers"] = max(counts["papers"], count)
+                conn.close()
+        except Exception:
+            pass
+
+        return counts["obsidian"] + counts["papers"]
+
+    def _route_claude_search(self, topic: str, reply_func, message_id):
+        """Route C: 无本地数据 → Claude + WebSearch 直接回答"""
+        reply_func(message_id, f"🔍 本地暂无关于「{topic}」的数据，正在使用 Claude + 网络搜索为您分析，请稍候...")
+
+        prompt = f"""你是知微系统的首席技术分析师。请回答以下技术问题：
+
+【主题】{topic}
+
+要求：
+1. 基于你的专业知识直接回答
+2. 如果涉及最新趋势（2025-2026），标注【基于训练数据，可能已过时】
+3. 给出具体数字和案例
+4. 中文输出，1500-2500 字"""
+
+        success, result = llm_client.call(
+            role="research",
+            message=prompt,
+            system_prompt="你是知微系统的首席技术分析师，请直接回答用户的技术问题。",
+            timeout=180
+        )
+
+        if success:
+            reply_func(message_id, f"📋 **关于「{topic}」的分析报告**\n\n（注：本地暂无相关数据，以下基于 AI 内置知识）\n\n{result}")
+        else:
+            reply_func(message_id, f"❌ 分析失败：{result}")
+
     def execute(self, topic: str, user_id: str, message_id: str, reply_func, reply_card_func):
         """执行研究报告生成流程"""
         try:
+            # [新增] Phase 0: 路由判断
+            local_count = self._count_local_sources(topic)
+            logger.info(f"本地相关数据量: {local_count}")
+
+            if local_count == 0:
+                # 无本地数据 → Route C
+                return self._route_claude_search(topic, reply_func, message_id)
+
+            if local_count < 3:
+                # 数据不足 → Route A (Claude 预处理)
+                reply_func(message_id, f"📊 本地关于「{topic}」的数据较少（{local_count} 份），正在调用 Claude 汇总补充信息，请稍候...")
+
+                preprocessor = ClaudePreprocessor(self.export_root)
+                try:
+                    summary_path = preprocessor.preprocess(topic)
+                    logger.info(f"预处理摘要已保存: {summary_path}")
+                    reply_func(message_id, f"✅ Claude 预处理完成，摘要已保存到 {summary_path}\n\n⏳ 正在上传到 NotebookLM 并执行深度分析...")
+                except Exception as e:
+                    logger.error(f"预处理失败: {e}")
+                    reply_func(message_id, f"⚠️ Claude 预处理失败（{e}），继续执行原有流程...")
+                    # 继续执行原有流程
             # 1. 整理文件 (清理上一次的导出，防止混淆)
             if self.export_root.exists():
                 logger.info(f"清理导出分区... {self.export_root}")
