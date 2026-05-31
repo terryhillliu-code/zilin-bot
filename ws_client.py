@@ -549,6 +549,9 @@ def do_p2_card_action_trigger_v1(data) -> None:
         print(f"❌ 处理卡片回调失败：{e}")
 
 def main():
+    import time  # 模块级 time 在嵌套函数闭包中可能不可用 (Python 3.14)
+    from datetime import datetime  # 供 connection_monitor 使用
+
     event_handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(do_p2_im_message_receive_v1) \
         .register_p2_card_action_trigger(do_p2_card_action_trigger_v1) \
@@ -619,7 +622,6 @@ def main():
         print(f"⚠️ 告警用户设置失败: {e}")
 
     # ISSUE-003: 断连监控和告警线程
-    from datetime import datetime
 
     # 全局变量用于监控连接状态
     # 告警状态文件路径
