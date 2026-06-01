@@ -579,17 +579,18 @@ def main():
     signal.signal(signal.SIGINT, handle_exit)
     signal.signal(signal.SIGTERM, handle_exit)
 
-    # P5 优化：monkey-patch _configure，防止服务端覆盖 ping 间隔
+    # WebSocket 配置优化（VPN 环境容错）
+    # 原配置 (ISSUE-003): ping=10s, reconnect=8s → 对 VPN 太激进，频繁断连
+    # 优化后: ping=60s, reconnect=30s → 容忍 VPN 30s 内的网络抖动
     _original_configure = cli._configure
-    
+
     def _patched_configure(conf):
         _original_configure(conf)
-        # ISSUE-003 优化：缩短 ping 间隔以避免超时断连
-        cli._ping_interval = 10 
-        cli._reconnect_interval = 8
-        cli._reconnect_nonce = 10
-        print(f"🔄 WebSocket 配置更新：ping 间隔={cli._ping_interval}s, 重连间隔={cli._reconnect_interval}s")
-    
+        cli._ping_interval = 60      # 60s ping 一次（容忍 30s 网络抖动）
+        cli._reconnect_interval = 30 # 30s 重试一次（给 VPN 恢复时间）
+        cli._reconnect_nonce = 15    # 首次重连 0-15s 随机抖动
+        print(f"🔄 WebSocket 配置更新：ping={cli._ping_interval}s, 重连={cli._reconnect_interval}s")
+
     cli._configure = _patched_configure
 
     print("🤖 知微 v2.1 启动 (RAG 增强版)")
