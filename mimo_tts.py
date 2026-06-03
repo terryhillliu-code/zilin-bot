@@ -1,60 +1,47 @@
 #!/usr/bin/env python3
 """
 Mimo TTS 客户端
-调用小米 Mimo v2.5-tts 系列模型实现文字转语音。
+调用小米 Mimo v2.5-tts 模型实现文字转语音。
 
-使用模式：
-  python mimo_tts.py "你好世界" -o output.mp3
+API: OpenAI 兼容格式
+Endpoint: https://token-plan-cn.xiaomimimo.com/v1/chat/completions
+Model: mimo-v2.5-tts
 
-环境变量：
+Usage:
+  python mimo_tts.py "你好世界" -o output.wav
+
+Env:
   MIMO_API_KEY - API 密钥
-  MIMO_API_BASE - API 基础地址（默认 https://api.mimo.com/v1）
-  MIMO_TTS_MODEL - TTS 模型名（默认 mimo-v2.5-tts）
+  MIMO_API_BASE - API 基础地址（默认 https://token-plan-cn.xiaomimimo.com）
 """
 
 import os
 import sys
 import json
 import time
+import base64
 import logging
 from pathlib import Path
 from typing import Optional
-from dataclasses import dataclass
 
 import requests
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class TTSConfig:
-    """TTS 配置"""
-    model: str = "mimo-v2.5-tts"
-    voice_id: str = "default"
-    speed: float = 1.0
-    volume: float = 1.0
-    sample_rate: int = 24000
-    format: str = "mp3"
-    channel: int = 1
-    bitrate: int = 128000
-    timeout: int = 120
-
-
 class MimoTTSClient:
     """Mimo TTS 客户端"""
 
-    def __init__(self, api_key: Optional[str] = None, config: Optional[TTSConfig] = None):
+    def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.getenv("MIMO_API_KEY", "")
-        self.config = config or TTSConfig()
 
-        # API 基础地址，支持自定义
+        # API 基础地址
         api_base = os.getenv("MIMO_API_BASE")
         if not api_base:
-            api_base = "https://api.mimo.com/v1"
+            api_base = "https://token-plan-cn.xiaomimimo.com"
         self.api_base = api_base
 
-        # 模型名，支持环境变量覆盖
-        self.model = os.getenv("MIMO_TTS_MODEL", self.config.model)
+        self.model = os.getenv("MIMO_TTS_MODEL", "mimo-v2.5-tts")
 
     def is_available(self) -> bool:
         """检查 TTS 服务是否可用"""
@@ -63,20 +50,16 @@ class MimoTTSClient:
     def synthesize(
         self,
         text: str,
-        voice_id: Optional[str] = None,
-        speed: Optional[float] = None,
         output_path: Optional[str] = None,
     ) -> Optional[str]:
         """将文字转换为语音
 
         Args:
             text: 要转换的文本
-            voice_id: 音色 ID（可选，使用默认音色）
-            speed: 语速（0.5-2.0，可选）
             output_path: 输出文件路径（可选，自动生成临时文件）
 
         Returns:
-            生成的音频文件路径，失败返回 None
+            生成的音频文件路径（WAV 格式），失败返回 None
         """
         if not text.strip():
             logger.warning("TTS 输入文本为空")
@@ -90,28 +73,18 @@ class MimoTTSClient:
         if not output_path:
             tmp_dir = Path.home() / "zhiwei-bot" / "tmp"
             tmp_dir.mkdir(exist_ok=True)
-            output_path = str(tmp_dir / f"tts_{int(time.time())}.mp3")
-
-        # 构建请求
-        voice_setting = {"voice_id": voice_id or self.config.voice_id}
-        if speed is not None:
-            voice_setting["speed"] = speed
+            output_path = str(tmp_dir / f"tts_{int(time.time())}.wav")
 
         payload = {
             "model": self.model,
-            "text": text.strip(),
-            "stream": False,
-            "voice_setting": voice_setting,
-            "audio_setting": {
-                "sample_rate": self.config.sample_rate,
-                "bitrate": self.config.bitrate,
-                "format": self.config.format,
-                "channel": self.config.channel,
-            },
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "assistant", "content": text.strip()}
+            ],
         }
 
         try:
-            url = f"{self.api_base.rstrip('/')}/audio/speech"
+            url = f"{self.api_base}/v1/chat/completions"
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -119,60 +92,36 @@ class MimoTTSClient:
 
             logger.info(f"🔊 调用 Mimo TTS: model={self.model}, text={text[:30]}...")
 
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=self.config.timeout,
-            )
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
 
             if response.status_code != 200:
                 logger.error(f"❌ Mimo TTS 请求失败: {response.status_code} - {response.text[:500]}")
                 return None
 
-            # 检查响应类型
-            content_type = response.headers.get("Content-Type", "")
-
-            if "audio" in content_type or "octet-stream" in content_type:
-                # 直接返回音频数据
-                audio_data = response.content
-                if not audio_data:
-                    logger.error("❌ Mimo TTS 返回空音频数据")
-                    return None
-
-                with open(output_path, "wb") as f:
-                    f.write(audio_data)
-
-                file_size = os.path.getsize(output_path)
-                logger.info(f"✅ TTS 生成成功: {output_path} ({file_size} bytes)")
-                return output_path
-
-            elif "json" in content_type:
-                # JSON 响应，可能是 URL 或错误信息
-                result = response.json()
-
-                if "audio_url" in result:
-                    # 下载音频
-                    audio_response = requests.get(result["audio_url"], timeout=30)
-                    if audio_response.status_code == 200:
-                        with open(output_path, "wb") as f:
-                            f.write(audio_response.content)
-                        logger.info(f"✅ TTS 生成成功 (URL): {output_path}")
-                        return output_path
-                    else:
-                        logger.error(f"❌ 音频下载失败: {audio_response.status_code}")
-                        return None
-
-                if "error" in result:
-                    logger.error(f"❌ Mimo TTS 错误: {result['error']}")
-                    return None
-
-                logger.error(f"❌ 未知的 Mimo TTS 响应格式: {result}")
+            result = response.json()
+            choices = result.get("choices", [])
+            if not choices:
+                logger.error("❌ Mimo TTS 响应中无 choices")
                 return None
 
-            else:
-                logger.error(f"❌ 未知的 Mimo TTS 响应类型: {content_type}")
+            audio = choices[0].get("message", {}).get("audio")
+            if not audio:
+                logger.error("❌ Mimo TTS 响应中无 audio 字段")
                 return None
+
+            audio_data = audio.get("data")
+            if not audio_data:
+                logger.error("❌ Mimo TTS audio.data 为空")
+                return None
+
+            # 解码 base64 音频并保存
+            raw_audio = base64.b64decode(audio_data)
+            with open(output_path, "wb") as f:
+                f.write(raw_audio)
+
+            file_size = os.path.getsize(output_path)
+            logger.info(f"✅ TTS 生成成功: {output_path} ({file_size} bytes)")
+            return output_path
 
         except requests.exceptions.Timeout:
             logger.error("❌ Mimo TTS 请求超时")
@@ -188,26 +137,23 @@ class MimoTTSClient:
 def synthesize_and_cleanup(
     text: str,
     api_key: Optional[str] = None,
-    voice_id: Optional[str] = None,
-    speed: Optional[float] = None,
     cleanup_after_seconds: int = 300,
 ) -> Optional[str]:
     """TTS 合成并设置自动清理
 
     Args:
         text: 文本
-        voice_id: 音色
-        speed: 语速
         cleanup_after_seconds: 多少秒后自动删除临时文件（默认 5 分钟）
 
     Returns:
         音频文件路径
     """
     client = MimoTTSClient(api_key=api_key)
-    output_path = client.synthesize(text, voice_id=voice_id, speed=speed)
+    output_path = client.synthesize(text)
 
     if output_path:
-        # 设置自动清理
+        import threading
+
         def _cleanup(path):
             try:
                 time.sleep(cleanup_after_seconds)
@@ -217,7 +163,6 @@ def synthesize_and_cleanup(
             except Exception:
                 pass
 
-        import threading
         t = threading.Thread(target=_cleanup, args=(output_path,), daemon=True)
         t.start()
 
@@ -231,25 +176,14 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Mimo TTS 客户端")
     parser.add_argument("text", help="要转换的文本")
-    parser.add_argument("-o", "--output", default="output.mp3", help="输出文件路径")
-    parser.add_argument("-v", "--voice-id", default=None, help="音色 ID")
-    parser.add_argument("-s", "--speed", type=float, default=None, help="语速 (0.5-2.0)")
-    parser.add_argument("--model", default="mimo-v2.5-tts", help="TTS 模型名")
+    parser.add_argument("-o", "--output", default=None, help="输出文件路径（默认自动生成）")
 
     args = parser.parse_args()
 
-    if args.model:
-        os.environ["MIMO_TTS_MODEL"] = args.model
-
-    result = synthesize_and_cleanup(
-        text=args.text,
-        voice_id=args.voice_id,
-        speed=args.speed,
-    )
+    result = synthesize_and_cleanup(text=args.text, cleanup_after_seconds=0)
 
     if result:
         print(f"✅ 音频已保存: {result}")
-        # 不自动清理，因为是用户指定的输出路径
     else:
         print("❌ TTS 失败，请查看日志")
         sys.exit(1)
