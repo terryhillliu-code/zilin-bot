@@ -148,4 +148,20 @@ class ChatHandler:
         # 记录历史并回复
         self.add_to_history(user_id, "bot", response)
         self.reply_message(message_id, response)
+
+        # ⭐ TTS 语音回复（用户开启时额外发送语音）
+        try:
+            from media_handler import tts_enabled_users, text_to_speech_reply
+            if user_id in tts_enabled_users and text_to_speech_reply:
+                # 异步发送，不阻塞主流程
+                import threading
+                t = threading.Thread(
+                    target=text_to_speech_reply,
+                    args=(response, message_id),
+                    daemon=True
+                )
+                t.start()
+        except Exception as e:
+            logger.warning(f"TTS 回复集成异常: {e}")
+
         return True

@@ -3,6 +3,12 @@ import json
 from pathlib import Path
 from zhiwei_common.config import ZHIWEI_BOT
 
+# 引入 TTS 状态管理
+try:
+    from media_handler import tts_enabled_users
+except ImportError:
+    tts_enabled_users = set()
+
 # 直接导入视频历史管理器（避免 ctx 传递问题）
 try:
     from video_history import get_video_history
@@ -13,6 +19,30 @@ except ImportError:
 def handle_media_commands(text_lower, text_stripped, user_id, message_id, ctx):
     """处理视频链接、语音任务等媒体指令"""
     reply_message = ctx.reply_message
+
+    # 0. TTS 语音回复开关
+    if text_lower.startswith("/voice"):
+        from media_handler import tts_enabled_users
+
+        parts = text_stripped.split()
+        if len(parts) < 2 or parts[1].lower() not in ("on", "off"):
+            status = "开启" if user_id in tts_enabled_users else "关闭"
+            reply_message(message_id,
+                f"🔊 TTS 语音回复状态：{status}\n\n"
+                f"发送 `/voice on` 开启语音回复\n"
+                f"发送 `/voice off` 关闭语音回复\n\n"
+                f"💡 开启后，机器人将用语音回复你的消息"
+            )
+            return True
+
+        action = parts[1].lower()
+        if action == "on":
+            tts_enabled_users.add(user_id)
+            reply_message(message_id, "✅ 已开启语音回复\n\n🔊 后续消息将使用 Mimo TTS 生成语音")
+        else:
+            tts_enabled_users.discard(user_id)
+            reply_message(message_id, "✅ 已关闭语音回复\n\n后续消息将仅使用文字回复")
+        return True
 
     # 1. 视频链接
     if ctx.is_video_url(text_stripped):

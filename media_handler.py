@@ -27,6 +27,12 @@ try:
 except ImportError:
     DashScopeASRTranscriber = None
 
+# 引入 Mimo TTS 客户端
+try:
+    from mimo_tts import MimoTTSClient
+except ImportError:
+    MimoTTSClient = None
+
 # 设置日志
 logger = logging.getLogger(__name__)
 
@@ -358,7 +364,7 @@ def process_video(text: str, message_id: str = None) -> str:
         cmd = [
             venv_python, distiller_path,
             "--from-text", text,
-            "--output-dir", os.path.expanduser("~/Documents/ZhiweiVault/70-79_个人笔记_Personal/72_视频笔记_Video-Distill"),
+            "--output-dir", os.path.expanduser("~/Documents/ZhiweiVault/70-79_个人笔记/75_视频笔记_Video-Distill"),
         ]
 
         # 根据平台选择 cookies 策略
@@ -370,6 +376,19 @@ def process_video(text: str, message_id: str = None) -> str:
             cmd.extend(["--cookies", os.path.expanduser("~/zhiwei-bot/secrets/douyin_cookies.txt")])
 
         logger.info(f"🎬 调用 Distiller: {' '.join(cmd[:3])}...")
+
+        # ⭐ 2026-06-02: 子进程依赖预检查
+        try:
+            check = subprocess.run(
+                [venv_python, "-c", "import dotenv; import requests; import yaml"],
+                capture_output=True, text=True, timeout=5
+            )
+            if check.returncode != 0:
+                logger.error(f"Distiller 依赖检查失败: {check.stderr.strip()[:200]}")
+                return "❌ 视频分析依赖不完整，请联系管理员修复"
+        except Exception as _e:
+            return f"❌ 视频分析环境检查失败: {_e}"
+
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
         if result.returncode != 0:
@@ -395,8 +414,15 @@ def process_video(text: str, message_id: str = None) -> str:
                 logger.info(f"将自动重试 (第 {retry_count} 次)")
                 # TODO: 可以在这里添加自动重试逻辑
 
-            logger.error(f"Distiller 失败: {error_message[:200]}")
-            return f"❌ 视频处理失败\n\n错误类型: {error_type}\n详情: {error_message[:300]}"
+            # ⭐ 2026-06-02: 错误脱敏，不向用户暴露堆栈
+            friendly_msg = {
+                "timeout": "❌ 视频分析超时（超过 10 分钟），请检查链接是否有效",
+                "network_error": "❌ 视频下载失败（网络错误），请检查链接是否有效后重试",
+                "module_error": "❌ 视频分析模块异常，请联系管理员",
+                "unknown": "❌ 视频处理失败（内部错误），已记录日志",
+            }.get(error_type, "❌ 视频处理失败，请稍后重试")
+            logger.error(f"Distiller 失败 (type={error_type}): {str(error_message)[:200]}")
+            return friendly_msg
 
         # 解析输出
         output = result.stdout
@@ -597,6 +623,76 @@ def _ensure_audio_format(audio_path: Path) -> Path:
     except Exception as e:
         logger.warning(f"Audio format check failed: {e}")
         return audio_path
+
+
+# TTS 语音回复状态管理
+tts_enabled_users = set()  # 已开启 TTS 回复的用户集合
+
+# 全局依赖（由 init_media_handler 注入）
+send_audio_reply = None  # 飞书语音发送函数
+
+
+def init_media_handler_with_audio(global_send_audio_reply):
+    """初始化媒体处理模块的语音发送依赖"""
+    global send_audio_reply
+    send_audio_reply = global_send_audio_reply
+
+
+def text_to_speech_reply(text: str, message_id: str) -> bool:
+    """将文字通过 TTS 转为语音并发送
+
+    Args:
+        text: 要转换的文本
+        message_id: 原始消息 ID
+
+    Returns:
+        是否成功发送
+    """
+    if not MimoTTSClient:
+        logger.warning("MimoTTSClient 不可用，跳过 TTS 回复")
+        return False
+
+    try:
+        # 获取 API key
+        api_key = get_api_key(["MIMO_API_KEY", "BAILIAN_API_KEY", "CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY"])
+        if not api_key:
+            logger.warning("MIMO_API_KEY 未配置，跳过 TTS 回复")
+            return False
+
+        # 清理文本中的 markdown 格式
+        clean_text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)  # 去掉 ** 加粗
+        clean_text = re.sub(r'[*_`~]', '', clean_text)          # 去掉其他格式符
+        clean_text = clean_text.strip()
+
+        if not clean_text or len(clean_text) < 2:
+            return False
+
+        # 调用 TTS
+        tts_client = MimoTTSClient(api_key=api_key)
+        audio_path = tts_client.synthesize(clean_text)
+
+        if not audio_path or not os.path.exists(audio_path):
+            logger.warning("TTS 合成失败，跳过语音回复")
+            return False
+
+        # 发送语音消息
+        if send_audio_reply:
+            result = send_audio_reply(message_id, audio_path)
+        else:
+            logger.warning("send_audio_reply 未初始化，跳过发送")
+            result = False
+
+        # 清理临时文件
+        try:
+            os.remove(audio_path)
+        except OSError:
+            pass
+
+        return result
+
+    except Exception as e:
+        logger.error(f"TTS 回复异常: {e}")
+        return False
 
 
 # ========== 语音任务收集 ==========

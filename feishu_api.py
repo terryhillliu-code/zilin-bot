@@ -151,3 +151,75 @@ def reply_card(message_id: str, title: str, content_text: str):
     except Exception as e:
         print(f"❌ 卡片异常: {e}")
         reply_message(message_id, f"{title}\n\n{content_text}")
+
+
+def send_audio_reply(message_id: str, audio_file_path: str) -> bool:
+    """发送语音消息回复
+
+    流程：
+    1. 上传音频文件到飞书，获取 file_key
+    2. 发送 msg_type="audio" 的回复消息
+
+    Args:
+        message_id: 原始消息 ID
+        audio_file_path: 音频文件路径（mp3 或 opus 格式）
+
+    Returns:
+        是否发送成功
+    """
+    try:
+        # 1. 上传文件到飞书
+        from lark_oapi.api.im.v1 import UploadAllFileRequest, UploadAllFileRequestBody
+
+        with open(audio_file_path, "rb") as f:
+            file_content = f.read()
+
+        request = UploadAllFileRequest.builder() \
+            .request_body(UploadAllFileRequestBody.builder()
+                .file_type("opus")  # 飞书语音消息使用 opus 格式
+                .file_name("tts_reply.opus")
+                .content(file_content)
+                .parent_type("message")
+                .parent_id(message_id)
+                .build()) \
+            .build()
+
+        response = client.im.v1.file.upload_all(request)
+
+        if not response.success():
+            print(f"❌ 音频上传失败: {response.code} - {response.msg}")
+            return False
+
+        file_key = response.file_key
+        if not file_key:
+            print("❌ 音频上传成功但未返回 file_key")
+            return False
+
+        print(f"✅ 音频上传成功: file_key={file_key}")
+        record_call("upload_audio")
+
+        # 2. 发送语音消息
+        content = json.dumps({"file_key": file_key})
+        reply_request = ReplyMessageRequest.builder() \
+            .message_id(message_id) \
+            .request_body(ReplyMessageRequestBody.builder()
+                .content(content)
+                .msg_type("audio")
+                .build()) \
+            .build()
+
+        reply_response = client.im.v1.message.reply(reply_request)
+
+        if reply_response.success():
+            print("✅ 语音消息发送成功")
+            record_call("reply_audio")
+            return True
+        else:
+            print(f"❌ 语音消息发送失败: {reply_response.code} - {reply_response.msg}")
+            return False
+
+    except Exception as e:
+        print(f"❌ 发送语音消息异常: {e}")
+        import traceback
+        traceback.print_exc()
+        return False

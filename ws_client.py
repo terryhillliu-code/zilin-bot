@@ -88,17 +88,26 @@ connection_status = {
     "last_event": time.time(),       # 业务事件（收到消息）
 }
 
+# 消息事件计数器 (2026-06-02 加固)
+# 用于 watchdog 区分"连接活着"和"真正在接收消息"
+message_event_count = 0
+
 # ========== WebSocket 心跳监控 (v44.4) ==========
 HEARTBEAT_FILE = os.path.expanduser("~/logs/ws_heartbeat.json")
 
 def write_heartbeat(conn_id: str = "", status: str = "connected"):
-    """写入心跳状态文件，供 watchdog 检测"""
+    """写入心跳状态文件，供 watchdog 检测
+
+    2026-06-02 增强：加入消息事件计数，让 watchdog 能区分
+    "连接活着但 message loop 已死" 和 "连接正常工作" 的状态。
+    """
     try:
         with open(HEARTBEAT_FILE, "w") as f:
             json.dump({
                 "timestamp": time.time(),
                 "conn_id": conn_id,
-                "status": status
+                "status": status,
+                "message_events": message_event_count  # ⭐ 新增
             }, f)
     except Exception:
         pass  # 心跳写入失败不影响主流程
@@ -168,8 +177,12 @@ from feishu_api import init_feishu_api
 init_feishu_api(client)
 
 # 初始化媒体处理模块
-from media_handler import init_media_handler
+from media_handler import init_media_handler, init_media_handler_with_audio
 init_media_handler(client, reply_message, TaskLogger, pending_image, pending_voice, time)
+
+# 初始化 TTS 语音回复依赖
+from feishu_api import send_audio_reply as _send_audio_reply
+init_media_handler_with_audio(_send_audio_reply)
 
 
 def get_memory(user_id: str) -> MemoryManager:
@@ -342,8 +355,11 @@ def _trigger_self_heal(cmd: str, message_id: str, chat_id_hint: str = None):
 
 
 def do_p2_im_message_receive_v1(data) -> None:
-    global processed_messages, connection_status
-    
+    global processed_messages, connection_status, message_event_count
+
+    # 递增消息事件计数器（2026-06-02 加固）
+    message_event_count += 1
+
     # 获取消息 ID 和类型
     message_id = "N/A"
     msg_type = "unknown"
@@ -548,9 +564,52 @@ def do_p2_card_action_trigger_v1(data) -> None:
     except Exception as e:
         print(f"❌ 处理卡片回调失败：{e}")
 
+import socket
+import struct
+
+# ========== DNS 容错机制 (2026-06-02 加固) ==========
+
+def dns_resolve_with_retry(host: str, max_retries: int = 5, timeout: int = 3) -> str | None:
+    """DNS 解析容错：指数退避重试，IPv4 优先。
+
+    解决 macOS 在网络切换/VPN 环境下 DNS 解析不稳定导致的
+    WebSocket 无法连接问题。
+    """
+    for attempt in range(max_retries):
+        try:
+            # AF_INET = IPv4 优先，避免 IPv6 解析超时
+            result = socket.getaddrinfo(host, 443, socket.AF_INET)
+            ip = result[0][4][0]
+            if attempt > 0:
+                print(f"✅ DNS 解析成功：{host} -> {ip} (重试 {attempt+1} 次)")
+            else:
+                print(f"✅ DNS 解析成功：{host} -> {ip}")
+            return ip
+        except socket.gaierror as e:
+            delay = min(2 ** attempt, 16)  # 1s, 2s, 4s, 8s, 16s
+            print(f"⚠️ DNS 解析失败 ({attempt+1}/{max_retries})：{host} - {e}，{delay}s 后重试")
+            time.sleep(delay)
+    print(f"❌ DNS 解析最终失败：{host}，将在 WebSocket 重连时继续尝试")
+    return None
+
+
+def check_dns_available(host: str = "open.feishu.cn") -> bool:
+    """快速检查 DNS 是否可用，不阻塞"""
+    try:
+        socket.getaddrinfo(host, 443, socket.AF_INET)
+        return True
+    except socket.gaierror:
+        return False
+
+
 def main():
     import time  # 模块级 time 在嵌套函数闭包中可能不可用 (Python 3.14)
     from datetime import datetime  # 供 connection_monitor 使用
+
+    # ⭐ DNS 预热：启动前尝试解析飞书域名，加速首次连接
+    print("🔍 DNS 预热检查...")
+    dns_resolve_with_retry("open.feishu.cn")
+    dns_resolve_with_retry("msg-frontier.feishu.cn")
 
     event_handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(do_p2_im_message_receive_v1) \
@@ -685,13 +744,14 @@ def main():
         return False
 
     def connection_monitor():
-        """连接监控线程 - 优化版 (v44.5)
+        """连接监控线程 - 优化版 (v44.5, 2026-06-02 加固)
 
         功能：
         1. 每分钟写入心跳文件（供 watchdog 检测）
         2. 业务消息空闲时记录日志（不发送钉钉告警，避免误报）
         3. ⭐ 离线恢复检测：长时间空闲后恢复时尝试恢复离线消息
         4. ⭐ v48.0: 定期清理 memory_cache（每10分钟）
+        5. ⭐ 2026-06-02: 僵尸连接检测（心跳正常但不收消息时主动重连）
         """
         # 启动时立即写入心跳
         write_heartbeat(status="starting")
@@ -699,11 +759,41 @@ def main():
         # 离线检测状态
         was_idle_long = False  # 上一次检查时是否长时间空闲
         cleanup_counter = 0  # 清理计数器
+        last_event_count = message_event_count  # 上次检查时的事件计数
+        zombie_idle_start = None  # 僵尸连接开始时间
 
         while True:
             time.sleep(60)  # 每分钟检查一次
             now = time.time()
             event_idle = now - connection_status.get("last_event", now)
+
+            # ⭐ 僵尸连接检测：如果事件计数不增长
+            current_count = message_event_count
+            if current_count == last_event_count:
+                if zombie_idle_start is None:
+                    zombie_idle_start = now  # 开始计时
+            else:
+                zombie_idle_start = None  # 有消息来了，重置
+                last_event_count = current_count
+
+            # 如果连续 2 小时没收到消息，主动断开重连
+            ZOMBIE_THRESHOLD = 7200  # 2 小时
+            if zombie_idle_start and (now - zombie_idle_start) > ZOMBIE_THRESHOLD:
+                zombie_minutes = int((now - zombie_idle_start) / 60)
+                print(f"🚨 僵尸连接检测：{zombie_minutes} 分钟未收到任何消息，主动断开重连...")
+                zombie_idle_start = None  # 避免重复触发
+
+                # 记录到日志
+                with open(os.path.expanduser("~/logs/connection_monitor.log"), "a") as f:
+                    f.write(f"{datetime.now().isoformat()}: ZOMBIE detected, forcing reconnect after {zombie_minutes}min\n")
+
+                # 尝试通过 stop 触发重连（不会退出进程）
+                try:
+                    if cli and cli._running:
+                        cli.stop()
+                        print("🔄 已触发 WebSocket 重连")
+                except Exception as e:
+                    print(f"⚠️ 强制重连失败: {e}")
 
             # 写入心跳（即使空闲也写入，表示服务存活）
             write_heartbeat(status="connected")
