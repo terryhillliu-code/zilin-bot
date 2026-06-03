@@ -184,6 +184,18 @@ init_media_handler(client, reply_message, TaskLogger, pending_image, pending_voi
 from feishu_api import send_audio_reply as _send_audio_reply
 init_media_handler_with_audio(_send_audio_reply)
 
+# 初始化 Mimo 健康监控
+try:
+    from mimo_monitor import MimoMonitor
+    mimo_monitor = MimoMonitor(
+        api_key=os.getenv("MIMO_API_KEY"),
+        alert_user_id=os.getenv("ALERT_USER_ID")
+    )
+    logger.info("✅ MimoMonitor 已初始化")
+except Exception as e:
+    logger.warning(f"⚠️ MimoMonitor 初始化失败: {e}")
+    mimo_monitor = None
+
 
 def get_memory(user_id: str) -> MemoryManager:
     """获取或创建用户的记忆管理器（v69.0: 添加时间戳）"""

@@ -528,44 +528,105 @@ def download_audio(message_id: str, file_key: str) -> str:
 
 
 def transcribe_audio(audio_path: str) -> str:
-    """转录语音文件为文字（使用统一的 DashScope ASR）
-    
-    v6.0: 移除本地重复逻辑，改为调用 douyin_distiller.DashScopeASRTranscriber
-    受益于 v5.9 的增强，现在支持详细错误捕获。
+    """转录语音文件为文字（三级降级链）
+
+    降级链: DashScope paraformer → MLX Whisper local → Mimo v2.5-asr
     """
-    if not DashScopeASRTranscriber:
-        logger.error("DashScopeASRTranscriber not found in distiller")
-        return None
+    audio_path_obj = Path(audio_path)
 
+    # 第一级: DashScope ASR
+    if DashScopeASRTranscriber:
+        try:
+            api_key = get_api_key(["BAILIAN_API_KEY", "CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY"])
+            if api_key:
+                transcriber = DashScopeASRTranscriber(api_key)
+                result = transcriber.transcribe(audio_path_obj)
+                if result and result.full_text:
+                    logger.info("✅ ASR 转录成功 (DashScope)")
+                    return result.full_text
+                elif result and result.error_details:
+                    logger.warning(f"DashScope ASR 失败: {result.error_details[:150]}")
+        except Exception as e:
+            logger.warning(f"DashScope ASR 异常，降级: {e}")
+
+    # 第二级: 本地 MLX Whisper
     try:
-        # 获取 API key（使用统一的延迟加载）
-        api_key = get_api_key(["BAILIAN_API_KEY", "CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY"])
-        if not api_key:
-            logger.error("API Key 未配置")
-            return None
-
-        transcriber = DashScopeASRTranscriber(api_key)
-        audio_path_obj = Path(audio_path)
-        
-        # 执行转录
-        result = transcriber.transcribe(audio_path_obj)
-        
-        if result.full_text:
-            return result.full_text
-        else:
-            if result.error_details:
-                logger.error(f"ASR 详细报错: {result.error_details}")
-            return None
-
+        from scripts.douyin_distiller import LocalMLXWhisperTranscriber
+        transcriber = LocalMLXWhisperTranscriber("small")
+        if transcriber.is_available():
+            # 需要先格式化转换
+            converted = _ensure_audio_format(audio_path_obj)
+            result = transcriber.transcribe(converted)
+            if result and result.full_text:
+                logger.info("✅ ASR 转录成功 (MLX Whisper)")
+                return result.full_text
+    except ImportError:
+        pass
     except Exception as e:
-        logger.error(f"ASR 转录异常: {e}")
-        return None
+        logger.warning(f"MLX Whisper 异常，降级到 Mimo ASR: {e}")
+
+    # 第三级: Mimo v2.5-asr
+    try:
+        mimo_text = _transcribe_with_mimo_asr(audio_path_obj)
+        if mimo_text:
+            logger.info("✅ ASR 转录成功 (Mimo v2.5-asr)")
+            return mimo_text
+    except Exception as e:
+        logger.error(f"Mimo ASR 也失败了: {e}")
+
     finally:
         # 清理原文件
         if audio_path and os.path.exists(audio_path):
             try:
                 os.remove(audio_path)
             except: pass
+
+    return None
+
+
+def _transcribe_with_mimo_asr(audio_path: Path) -> Optional[str]:
+    """使用 Mimo v2.5-asr 转录音频（降级方案）"""
+    api_key = get_api_key(["MIMO_API_KEY", "BAILIAN_API_KEY", "CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY"])
+    if not api_key:
+        return None
+
+    import base64
+
+    # 确保格式为 wav
+    converted = _ensure_audio_format(audio_path)
+
+    # 读取并编码为 data URL
+    with open(converted, "rb") as f:
+        audio_data = f.read()
+    b64 = base64.b64encode(audio_data).decode()
+    data_url = f"data:audio/wav;base64,{b64}"
+
+    api_base = os.getenv("MIMO_API_BASE", "https://token-plan-cn.xiaomimimo.com")
+    url = f"{api_base}/v1/chat/completions"
+
+    payload = {
+        "model": "mimo-v2.5-asr",
+        "max_tokens": 200,
+        "messages": [{"role": "user", "content": [
+            {"type": "input_audio", "input_audio": {"data": data_url}}
+        ]}]
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    import requests
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
+
+    if r.status_code != 200:
+        logger.warning(f"Mimo ASR 请求失败: {r.status_code} - {r.text[:200]}")
+        return None
+
+    d = r.json()
+    text = d.get("choices", [{}])[0].get("message", {}).get("content", "")
+    return text if text else None
 
 
 def _ensure_audio_format(audio_path: Path) -> Path:
