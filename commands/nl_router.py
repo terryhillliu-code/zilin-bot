@@ -151,10 +151,11 @@ def route_natural_language(text, user_id, message_id, ctx) -> bool:
             ctx.reply_message(message_id, f"要对「{query}」做深度研究吗？回复「确认」开始。")
             return True
 
-        # 5) 系统状态：复用 /status
+        # 5) 系统状态：直接本地取（/status 的探微重定向已失效）
         if kind == "status":
-            from commands.system_commands import handle_system_commands
-            return handle_system_commands("/status", "/status", user_id, message_id, ctx)
+            from command_handler import get_quick_status
+            ctx.reply_message(message_id, get_quick_status())
+            return True
 
         # 6) chat 等 → 交回 ChatHandler
         return False
