@@ -40,7 +40,11 @@ def handle_agent_commands(text_lower, text_stripped, user_id, message_id, ctx):
         query = text_stripped[7:].strip()
         return _execute_agent(query, user_id, message_id, ctx)
 
-    # 2. 获取意图
+    # 2. 获取意图（如果 AgentExecutor 支持）
+    if not hasattr(_agent_executor, 'get_intent'):
+        # AgentExecutor 不支持意图识别，返回 False 让 chat_handler 处理
+        return False
+
     intent = _agent_executor.get_intent(text_stripped)
 
     # 3. Layer 2 任务：执行工作流

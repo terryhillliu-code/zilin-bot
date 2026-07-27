@@ -26,7 +26,12 @@ from urllib.parse import urlparse
 from enum import Enum
 
 import requests
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        """dotenv 不可用时的空操作兜底"""
+        pass
 
 # 导入统一的 API Key 获取函数
 try:
@@ -81,8 +86,10 @@ def classify_error(exception: Exception, stderr: str = "") -> tuple[VideoErrorTy
     # 合并错误信息用于判断
     combined = error_str + " " + stderr_str
 
-    # Cookie 过期
-    if any(kw in combined for kw in ["cookie", "fresh cookies", "cookies expired", "登录过期", "请先登录"]):
+    # Cookie 过期（注意：不能用单纯 "cookie" 子串匹配——yt-dlp 加载 cookiefile
+    # 时的正常日志也含 "cookie"，会把网络超时等真实错误误判为 cookie_expired。
+    # 只匹配明确的过期/登录失效特征词。）
+    if any(kw in combined for kw in ["fresh cookies", "cookies expired", "cookie expired", "登录过期", "请先登录", "login expired"]):
         return VideoErrorType.COOKIE_EXPIRED, str(exception) or stderr[:500]
 
     # 网络错误
@@ -144,6 +151,9 @@ class VideoInfo:
     author: str = ""
     duration: int = 0  # 秒
     description: str = ""
+    _cached_video_data: dict = field(default=None, repr=False)
+    _cached_video_url: str = field(default=None, repr=False)
+    _cached_video_path: str = field(default=None, repr=False)
 
 
 @dataclass
@@ -242,13 +252,13 @@ class AppConfig:
         # API 配置 - 使用分离的 key 管理器
         # ASR 专用 key（仅 DASHSCOPE_API_KEY 有效）
         self.dashscope_api_key = get_asr_key() or ""
-        self.qwen_model = os.getenv("QWEN_MODEL", "qwen3.5-plus")
-        self.asr_model = os.getenv("ASR_MODEL", "paraformer-realtime-v2")
+        self.qwen_model = os.getenv("QWEN_MODEL", "qwen3.7-plus")
+        self.asr_model = os.getenv("ASR_MODEL", "paraformer-v2")  # v2:高质量版(原realtime-v2)
         self.asr_policy = os.getenv("ASR_POLICY", "auto")
         self.local_asr_model = os.getenv("LOCAL_ASR_MODEL", "small")
 
         # 输出配置（视频笔记专属目录）
-        base_output_dir = os.getenv("OUTPUT_DIR", "~/Documents/ZhiweiVault/70-79_个人笔记_Personal/72_视频笔记_Video-Distill")
+        base_output_dir = os.getenv("OUTPUT_DIR", "~/Documents/ZhiweiVault/70-79_个人笔记/75_视频笔记_Video-Distill")
         self.output_dir = Path(base_output_dir).expanduser()
         self.assets_dir = self.output_dir / "Assets"
 
@@ -318,8 +328,7 @@ class ShareTextExtractor:
                 url = match.group(0)
                 # 清理尾部中文标点和口令垃圾
                 url = url.rstrip('，。！？、；：""''）】》')
-                # 清理尾部可能的口令格式 (如 "qeO:/", "abc@123")
-                url = re.sub(r'[A-Za-z0-9@._:/]+$', '', url) is False and url or url
+                # 注：口令垃圾清理已由上游 rstrip 中文标点覆盖
                 # 再次清理尾部标点
                 url = url.rstrip('，。！？、；：""''）】》./')
                 if url and url not in seen:
@@ -578,10 +587,15 @@ class DouyinAPIClient:
         """
         v = video_data.get("video", {})
 
-        # 优先级：无水印下载链接 > 无水印播放链接 > 有水印下载链接 > 有水印播放链接
-        for key in ["download_addr", "play_addr"]:
+        # 优先使用 play_addr 的 CDN 签名链接（无需 Cookie），
+        # download_addr 的 aweme/v1/play 链接需要 Cookie 会 403
+        for key in ["play_addr", "download_addr"]:
             addr = v.get(key, {})
             url_list = addr.get("url_list", [])
+            # 优先选 CDN 签名链接（douyinvod.com），跳过需要 Cookie 的 play API
+            for u in url_list:
+                if "douyinvod.com" in u:
+                    return u
             if url_list:
                 return url_list[0]
 
@@ -623,6 +637,21 @@ class MediaExtractor:
         if result.returncode == 0:
             return result.stdout.strip()
         raise RuntimeError("yt-dlp not found. Install with: pip install yt-dlp")
+
+    def _get_douyin_video_info(self, video_info: VideoInfo) -> tuple:
+        """获取抖音视频数据和下载 URL，带缓存"""
+        if video_info._cached_video_data is not None:
+            return video_info._cached_video_data, video_info._cached_video_url
+        client = DouyinAPIClient()
+        video_data, video_url = client.get_video_info(video_info.original_url)
+        video_info._cached_video_data = video_data
+        video_info._cached_video_url = video_url
+        if not video_info.title:
+            video_info.title = video_data.get("desc", "")[:100]
+        if not video_info.author:
+            author_info = video_data.get("author", {})
+            video_info.author = author_info.get("nickname", "")
+        return video_data, video_url
 
     def extract_subtitles(self, video_info: VideoInfo) -> Optional[TranscriptResult]:
         """提取平台字幕（如果有）
@@ -698,10 +727,11 @@ class MediaExtractor:
             TranscriptResult（文案作为字幕），失败返回 None
         """
         try:
-            client = DouyinAPIClient()
-
             logger.info(f"Fetching douyin video info for subtitle: {video_info.original_url}")
-            video_data = client.get_video_data(video_info.original_url)
+            if video_info._cached_video_data is not None:
+                video_data = video_info._cached_video_data
+            else:
+                video_data, _ = self._get_douyin_video_info(video_info)
 
             # 抖音视频的 desc 字段通常是字幕/文案内容
             desc = video_data.get("desc", "")
@@ -716,9 +746,6 @@ class MediaExtractor:
             video_info.author = author_info.get("nickname", "")
 
             # 构造 TranscriptResult（抖音文案作为完整文本）
-            # 由于没有时间戳，创建一个整体 segment
-            from dataclasses import dataclass
-
             segment = TranscriptSegment(
                 start=0.0,
                 end=float(video_data.get("video", {}).get("duration", 0)),
@@ -869,19 +896,8 @@ class MediaExtractor:
             是否成功
         """
         try:
-            client = DouyinAPIClient()
-
-            # 获取视频信息和下载链接
             logger.info(f"Fetching douyin video info for download: {video_info.original_url}")
-            video_data, video_url = client.get_video_info(video_info.original_url)
-
-            # 更新视频信息
-            if not video_info.title:
-                video_info.title = video_data.get("desc", "")[:100]
-            if not video_info.author:
-                author_info = video_data.get("author", {})
-                video_info.author = author_info.get("nickname", "")
-
+            video_data, video_url = self._get_douyin_video_info(video_info)
             logger.info(f"Douyin video URL obtained: {video_url[:80]}...")
 
             headers = {
@@ -1103,42 +1119,38 @@ class MediaExtractor:
             是否成功
         """
         try:
-            client = DouyinAPIClient()
-
-            # 获取视频信息和下载链接
-            logger.info(f"Fetching douyin video info via local API: {video_info.original_url}")
-            video_data, video_url = client.get_video_info(video_info.original_url)
-
-            # 更新视频信息
-            if not video_info.title:
-                video_info.title = video_data.get("desc", "")[:100]  # 描述可能很长，截取前100字符
-            if not video_info.author:
-                author_info = video_data.get("author", {})
-                video_info.author = author_info.get("nickname", "")
-
-            logger.info(f"Douyin video URL obtained: {video_url[:80]}...")
-
-            # 使用 requests 下载视频（绕过 CDN 防盗链）
             mp3_path = output_path.with_suffix(".mp3")
             video_tmp = output_path.with_suffix(".mp4")
+            reused_cached = False
 
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Referer": "https://www.douyin.com/",
-                "Accept": "*/*",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            }
+            # 复用 _try_image_video 已下载的视频文件
+            if video_info._cached_video_path and os.path.exists(video_info._cached_video_path):
+                import shutil
+                shutil.move(video_info._cached_video_path, str(video_tmp))
+                video_info._cached_video_path = None
+                reused_cached = True
+                logger.info(f"Reusing cached video file: {video_tmp} ({video_tmp.stat().st_size} bytes)")
+            else:
+                logger.info(f"Fetching douyin video info via local API: {video_info.original_url}")
+                video_data, video_url = self._get_douyin_video_info(video_info)
+                logger.info(f"Douyin video URL obtained: {video_url[:80]}...")
 
-            # 下载视频
-            logger.info("Downloading video with requests...")
-            resp = requests.get(video_url, headers=headers, timeout=60, stream=True)
-            if resp.status_code != 200:
-                logger.error(f"Video download failed: HTTP {resp.status_code}")
-                return False
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Referer": "https://www.douyin.com/",
+                    "Accept": "*/*",
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                }
 
-            with open(video_tmp, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
+                logger.info("Downloading video with requests...")
+                resp = requests.get(video_url, headers=headers, timeout=60, stream=True)
+                if resp.status_code != 200:
+                    logger.error(f"Video download failed: HTTP {resp.status_code}")
+                    return False
+
+                with open(video_tmp, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        f.write(chunk)
 
             logger.info(f"Video downloaded: {video_tmp} ({video_tmp.stat().st_size} bytes)")
 
@@ -1161,22 +1173,14 @@ class MediaExtractor:
 
             if result.returncode == 0 and mp3_path.exists():
                 logger.info(f"Douyin audio extracted successfully: {mp3_path}")
-                # 清理临时视频文件
-                if video_tmp.exists():
-                    video_tmp.unlink()
-                    logger.debug(f"Cleaned up temp video: {video_tmp}")
                 return True
             else:
                 stderr = result.stderr.decode('utf-8', errors='replace')
                 logger.error(f"ffmpeg error (returncode={result.returncode}): {stderr[:500]}")
-                # 清理临时文件
-                if video_tmp.exists():
-                    video_tmp.unlink()
                 return False
 
         except ValueError as e:
             logger.error(f"Douyin API error: {e}")
-            # ⭐ 重新抛出异常，让上层能够正确分类和记录错误
             raise
         except subprocess.TimeoutExpired:
             logger.error("ffmpeg timeout (>120s)")
@@ -1184,6 +1188,12 @@ class MediaExtractor:
         except Exception as e:
             logger.error(f"Douyin audio extraction failed: {e}")
             raise
+        finally:
+            if video_tmp.exists():
+                try:
+                    video_tmp.unlink()
+                except OSError:
+                    pass
 
 
 # ============================================================================
@@ -1211,7 +1221,7 @@ class BaseTranscriber(ABC):
 class DashScopeASRTranscriber(BaseTranscriber):
     """阿里云百炼 ASR 转录器"""
 
-    def __init__(self, api_key: str, model: str = "paraformer-realtime-v2"):
+    def __init__(self, api_key: str, model: str = "paraformer-v2"):  # v2:高质量版
         self.api_key = api_key
         self.model = model
         self._available = bool(api_key)
@@ -1964,6 +1974,11 @@ class TranscriptProvider:
                 logger.info("Detected image/slide video, using VLM processing")
                 return self.image_video_processor.process_image_video(video_info, video_path)
 
+            # 非图片视频：保存已下载的文件供后续音频提取复用，避免二次下载
+            import shutil
+            _, persist_path = tempfile.mkstemp(suffix=".mp4", prefix="distill_reuse_")
+            shutil.copy2(str(video_path), persist_path)
+            video_info._cached_video_path = persist_path
             return None
 
     def _transcribe_with_asr(self, video_info: VideoInfo, save_audio_path: Optional[Path] = None) -> TranscriptResult:
@@ -2112,7 +2127,12 @@ def extract_keywords_from_transcript(transcript: str, top_n: int = 5) -> list[st
 
 def retrieve_background_knowledge(keywords: list[str], top_k: int = 3) -> str:
     """
-    从 zhiwei-rag 检索背景知识
+    从 zhiwei-rag 检索背景知识(通过 HTTP API,复用 core/rag_client)
+
+    旧实现直接 import HybridRetriever,需要 shared-venv 装 lancedb/sentence_transformers,
+    与 shared-venv 轻量定位冲突,且会因 zhiwei-rag/lancedb 空目录遮蔽等误判。改用 HTTP
+    调 8765/search(复用 core/rag_client.py 的 RAGClient,带 health 探测 + bridge 降级),
+    环境隔离,失败 try/except 降级返回空。
 
     Args:
         keywords: 关键词列表
@@ -2125,26 +2145,23 @@ def retrieve_background_knowledge(keywords: list[str], top_k: int = 3) -> str:
         return ""
 
     try:
-        # 动态导入避免循环依赖
-        rag_path = Path.home() / "zhiwei-rag"
-        try:
-            from retrieve.hybrid_retriever import HybridRetriever
-        except ImportError:
-            if str(rag_path) not in sys.path:
-                sys.path.insert(0, str(rag_path))
-            from retrieve.hybrid_retriever import HybridRetriever
+        # core/rag_client 在 zhiwei-bot 根,补 sys.path
+        bot_root = Path(__file__).parent.parent
+        if str(bot_root) not in sys.path:
+            sys.path.insert(0, str(bot_root))
+        from core.rag_client import get_rag_client
 
-        retriever = HybridRetriever()
+        client = get_rag_client()
         background_parts = []
 
         for kw in keywords[:3]:  # 最多检索 3 个关键词
-            results = retriever.search(kw, top_k=top_k, use_rerank=False)
+            results = client.search(kw, top_k=top_k)
 
             if results:
                 background_parts.append(f"**{kw}** 相关资料：")
                 for r in results[:2]:  # 每个关键词取前 2 条
-                    source = Path(r.source).stem if r.source else "未知来源"
-                    text = (r.text or r.raw_text or "")[:200]
+                    source = Path(r.get("source") or "").stem or "未知来源"
+                    text = (r.get("text") or r.get("raw_text") or r.get("content") or "")[:200]
                     background_parts.append(f"  - {source}: {text}...")
                 background_parts.append("")
 
@@ -2163,14 +2180,157 @@ def retrieve_background_knowledge(keywords: list[str], top_k: int = 3) -> str:
 # ============================================================================
 
 class KnowledgeDistiller:
-    """
-    知识蒸馏引擎
+    """知识蒸馏引擎 v2.0 - 两阶段蒸馏"""
 
-    使用统一 LLM 客户端 (llm_client.py) 进行知识提取
-    默认使用 qwen3.5-plus 模型，自动降级到 glm-5 → MiniMax-M2.5
-    """
+    # ── 第一阶段：清洗 + 分类 ──
+    STAGE1_SYSTEM_PROMPT = """你是转录文本清洗专家。对语音识别(ASR)产出的文本执行以下三项任务。
 
-    SYSTEM_PROMPT = """你是一个顶级的技术研究员与情报分析师，擅长从视频内容中“脱水”出极高密度的技术情报。
+1. **ASR 纠错**：修正语音识别错误。常见模式：
+   - 英文专有名词被音译为中文（如"靠比Y"→"ComfyUI"、"爱语言模型"→"AI语言模型"、"恰吉梯"→"ChatGPT"）
+   - 同音字错误（如"悲视频"→"配视频"、"新鸟"→"新的"）
+   - 只修正明显的语音误识别，保持原意不变
+
+2. **内容分类**（按以下判据严格区分）：
+   - tech_tutorial: 以特定工具/框架/代码为核心，教观众"怎么用"。关键信号：演示操作步骤、展示代码/配置、讲解特定工具的功能和参数
+   - business_insight: 以市场/商业/投资判断为核心。关键信号：讨论市场规模、竞争格局、商业模式、融资、行业趋势
+   - creative_workflow: 以内容创作的完整流程为核心，教观众"怎么做出作品"。关键信号：涉及多工具串联生产内容（视频/图像/音频/文案），强调工作流SOP和产出物
+   - knowledge_explainer: 以概念/方法论/认知框架为核心，教观众"怎么理解/怎么学"。关键信号：讲解抽象概念、学习方法、思维模型、类比推理，不以特定工具实操为主线
+   - general: 不属于以上任何一类
+   注意：如果视频同时涉及"概念讲解"和"工具实操"，以主线判断——讲概念时顺带提工具→knowledge_explainer；讲工具时顺带解释原理→tech_tutorial
+
+3. **实体提取**：列出视频中提到的关键工具、技术、人物、平台、产品名称。
+
+严格输出合法 JSON，不要添加额外解释文字：
+{"corrected_transcript": "纠错后的完整文本", "content_type": "tech_tutorial", "entities": ["工具1", "技术2"], "correction_count": 12}"""
+
+    # ── 第二阶段：按类型分析 ──
+    STAGE2_PROMPTS = {
+        "tech_tutorial": """你是顶级技术研究员，从视频转录中提取可直接指导工程实现的技术情报。
+
+**评级标准**：A级=能闭环复现 | B级=关键点明确 | C级=仅供跟踪 | D级=无实质内容
+
+**输出 JSON**（严格合法 JSON，无额外文字）：
+{
+  "title": "主张式标题（观点/价值，非描述）",
+  "core_insight": "一句话核心洞察",
+  "content_tier": "A/B/C/D",
+  "key_points": [{"timestamp": "MM:SS", "insight": "技术锚点"}],
+  "technical_reconstruction": {
+    "architecture": "底层架构/原理分析",
+    "tooling": "工具链：名称、版本、用途",
+    "metrics": "量化数据：性能/成本/效率指标",
+    "pitfalls": "避坑指南：常见问题和解决方案"
+  },
+  "summary": "150-300字深度总结：能得到什么，不是讲了什么",
+  "action_items": ["具体可执行的工程建议"],
+  "implementation_guide": {
+    "difficulty": "简单/中等/困难",
+    "prerequisites": "环境依赖",
+    "steps": ["复现步骤"],
+    "key_code_logic": "核心逻辑/伪代码"
+  },
+  "tags": ["3-5个具体标签"],
+  "related_concepts": ["关联知识概念"]
+}""",
+
+        "business_insight": """你是资深商业分析师，从视频转录中提取商业洞察和决策情报。
+
+**评级标准**：A级=有数据支撑的深度分析 | B级=有明确观点和逻辑 | C级=仅信息汇总 | D级=无实质内容
+
+**输出 JSON**（严格合法 JSON，无额外文字）：
+{
+  "title": "主张式标题",
+  "core_insight": "一句话核心判断",
+  "content_tier": "A/B/C/D",
+  "key_points": [{"timestamp": "MM:SS", "insight": "关键判断"}],
+  "market_analysis": {
+    "market_size": "市场规模/增长数据",
+    "competitive_landscape": "竞争格局分析",
+    "opportunities": "机会评估",
+    "risks": "风险因素"
+  },
+  "summary": "150-300字商业摘要",
+  "action_items": ["决策建议"],
+  "tags": ["3-5个标签"],
+  "related_concepts": ["关联概念"]
+}""",
+
+        "creative_workflow": """你是创意工作流专家，从视频转录中拆解可复制的创作流程和工具链。
+
+**评级标准**：A级=完整可复现的SOP | B级=流程清晰但需补充细节 | C级=仅概述 | D级=无实质内容
+
+**输出 JSON**（严格合法 JSON，无额外文字）：
+{
+  "title": "主张式标题",
+  "core_insight": "一句话核心价值",
+  "content_tier": "A/B/C/D",
+  "key_points": [{"timestamp": "MM:SS", "insight": "流程节点"}],
+  "workflow_sop": {
+    "pipeline": "输入→处理→输出 全流程概述",
+    "tool_chain": [{"tool": "工具名", "role": "用途", "alternatives": "替代方案"}],
+    "steps": ["详细步骤（可直接按步骤操作）"],
+    "cost_estimate": "成本/时间估算",
+    "quality_tips": "提升产出质量的关键技巧"
+  },
+  "summary": "150-300字摘要",
+  "action_items": ["立即可做的事"],
+  "tags": ["3-5个标签"],
+  "related_concepts": ["关联概念"]
+}""",
+
+        "knowledge_explainer": """你是知识蒸馏专家，从视频转录中提取核心概念和认知升级点。
+
+**评级标准**：A级=深刻且有原创性 | B级=清晰系统的讲解 | C级=基础科普 | D级=无实质内容
+
+**输出 JSON**（严格合法 JSON，无额外文字）：
+{
+  "title": "主张式标题",
+  "core_insight": "一句话核心认知",
+  "content_tier": "A/B/C/D",
+  "key_points": [{"timestamp": "MM:SS", "insight": "认知锚点"}],
+  "knowledge_framework": {
+    "core_concepts": ["核心概念及定义"],
+    "mental_model_shift": "认知升级点：与常见理解的差异",
+    "learning_path": "推荐学习路径",
+    "further_reading": "延伸阅读方向"
+  },
+  "summary": "150-300字知识摘要",
+  "action_items": ["学习建议"],
+  "tags": ["3-5个标签"],
+  "related_concepts": ["关联概念"]
+}""",
+
+        "general": """你是内容分析师，从视频转录中提取关键信息。
+
+**输出 JSON**（严格合法 JSON，无额外文字）：
+{
+  "title": "主张式标题",
+  "core_insight": "一句话核心内容",
+  "content_tier": "A/B/C/D",
+  "key_points": [{"timestamp": "MM:SS", "insight": "要点"}],
+  "summary": "100-200字摘要",
+  "action_items": ["建议"],
+  "tags": ["3-5个标签"],
+  "related_concepts": ["关联概念"]
+}"""
+    }
+
+    STAGE2_USER_TEMPLATE = """视频信息：
+- 平台：{platform}
+- 时长：{duration}秒
+- 作者：{author}
+- 内容类型：{content_type}
+- 识别实体：{entities}
+
+转录文本（已纠错）：
+{transcript}
+
+{background_section}
+
+请深度分析并输出 JSON。"""
+
+    # 保留旧版 prompt 作为兼容回退
+    SYSTEM_PROMPT = """你是一个顶级的技术研究员与情报分析师，擅长从视频内容中"脱水"出极高密度的技术情报。
 你的目标是：**拒绝泛泛而谈的摘要，追求能够直接指导工程实现的技术重建。**
 
 **第一步：评估内容质量等级（量化标准）**
@@ -2264,7 +2424,7 @@ class KnowledgeDistiller:
 
 {background_section}
 
-请提取知识点，并特别关注 **“如何复现视频中的方案”**。
+请提取知识点，并特别关注 **"如何复现视频中的方案"**。
 输出 JSON 格式结果。"""
 
     def __init__(self, config: AppConfig):
@@ -2273,65 +2433,221 @@ class KnowledgeDistiller:
 
     def _init_client(self):
         """初始化统一 LLM 客户端"""
-        # 导入统一客户端
         try:
-            from llm_client import llm_client
+            from llm_client import get_client
         except ImportError:
-            sys.path.insert(0, str(Path(__file__).parent.parent))
-            from llm_client import llm_client
+            # llm_client.py 位于 zhiwei-common 项目根目录（不在 zhiwei_common 包内，
+            # 故未被 pip install 安装）。zhiwei_common 以 installed 包形式存在时，
+            # 文件头部的 sys.path.insert(zhiwei-common) 不会执行，需在此显式补上。
+            sys.path.insert(0, str(Path.home() / "zhiwei-common"))
+            from llm_client import get_client
 
-        self.llm_client = llm_client
-        logger.info("Using unified LLM client with distill role (qwen3.5-plus)")
+        # llm_client.py 已重构为 LLMClient 类 + get_client() 工厂，接口与本模块
+        # 原先依赖的旧单例不同：
+        #   旧: call(role, message, system_prompt, timeout) -> (success, content)
+        #   新: LLMClient.call(task_type, prompt, ...) -> dict{success, content, ...}
+        # 用适配器桥接，避免改动下方 Stage1/Stage2 共 3 处调用点。
+        # 注：新接口无 system_prompt 形参，这里把 system_prompt 拼到 prompt 前面。
+        class _LLMClientCompat:
+            def __init__(self):
+                self._c = get_client()
+            def call(self, role="basic", message="", system_prompt=None, timeout=None, **kw):
+                prompt = f"{system_prompt}\n\n---\n\n{message}" if system_prompt else message
+                try:
+                    r = self._c.call(task_type=role, prompt=prompt)
+                except Exception as e:
+                    return False, f"[LLM 调用异常: {e}]"
+                return bool(r.get("success", False)), r.get("content")
 
-    def distill(self, video_info: VideoInfo, transcript: TranscriptResult) -> DistilledKnowledge:
-        """执行知识蒸馏（使用统一客户端自动降级）
+        self.llm_client = _LLMClientCompat()
+        logger.info("Using unified LLM client (v2.0: two-stage distillation)")
 
-        v1.2.0 新增：RAG 背景增强
-        """
-        logger.info("Distilling knowledge with distill role (qwen3.5-plus + auto-fallback)")
+    def _stage1_clean_and_classify(self, transcript_text: str) -> dict:
+        """第一阶段：ASR 纠错 + 内容分类 + 实体提取（format role, 轻量快速）"""
+        logger.info("Stage 1: ASR correction + content classification (format role)")
 
-        # v1.2.0: RAG 背景增强
-        transcript_text = transcript.to_text()[:8000]  # 限制长度
-        background_section = ""
+        user_msg = f"请处理以下 ASR 转录文本：\n\n{transcript_text}"
 
         try:
-            # 提取关键词
+            success, content = self.llm_client.call(
+                role="format",
+                message=user_msg,
+                system_prompt=self.STAGE1_SYSTEM_PROMPT,
+                timeout=90
+            )
+
+            if success:
+                json_match = re.search(r'\{[\s\S]*\}', content)
+                if json_match:
+                    result = json.loads(json_match.group())
+                    corrections = result.get("correction_count", 0)
+                    content_type = result.get("content_type", "general")
+                    entities = result.get("entities", [])
+                    logger.info(f"Stage 1 complete: type={content_type}, corrections={corrections}, entities={len(entities)}")
+                    return result
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"Stage 1 parse failed: {e}")
+
+        return {
+            "corrected_transcript": transcript_text,
+            "content_type": "general",
+            "entities": [],
+            "correction_count": 0
+        }
+
+    def _get_background(self, transcript_text: str) -> str:
+        """RAG 背景增强"""
+        try:
             keywords = extract_keywords_from_transcript(transcript_text)
             if keywords:
                 logger.info(f"[RAG] 提取关键词: {keywords}")
-                # 检索背景知识
                 background_knowledge = retrieve_background_knowledge(keywords)
                 if background_knowledge:
-                    background_section = f"**背景知识（来自本地知识库）：**\n{background_knowledge}"
+                    return f"**背景知识（来自本地知识库）：**\n{background_knowledge}"
         except Exception as e:
-            logger.warning(f"[RAG] 背景增强失败，继续无背景处理: {e}")
+            logger.warning(f"[RAG] 背景增强失败: {e}")
+        return ""
 
-        # 构建提示
-        user_prompt = self.USER_PROMPT_TEMPLATE.format(
+    def _chunk_transcript(self, transcript: TranscriptResult, max_chars: int = 8000) -> list:
+        """长视频分段：超出 max_chars 时按时间戳均分"""
+        full_text = transcript.to_text()
+        if len(full_text) <= max_chars:
+            return [full_text]
+
+        segments = transcript.segments
+        if not segments:
+            # 无时间戳，按字符均分
+            n_chunks = (len(full_text) // max_chars) + 1
+            chunk_size = len(full_text) // n_chunks
+            return [full_text[i*chunk_size:(i+1)*chunk_size] for i in range(n_chunks)]
+
+        # 按时间戳均分为 2-3 段
+        n_chunks = min(3, (len(full_text) // max_chars) + 1)
+        chunk_size = len(segments) // n_chunks
+        chunks = []
+        for i in range(n_chunks):
+            start = i * chunk_size
+            end = (i + 1) * chunk_size if i < n_chunks - 1 else len(segments)
+            chunk_text = " ".join(s.text for s in segments[start:end])
+            if segments[start:end]:
+                time_range = f"[{segments[start].start:.0f}s - {segments[end-1].end:.0f}s]"
+                chunks.append(f"{time_range}\n{chunk_text}")
+            else:
+                chunks.append(chunk_text)
+        logger.info(f"Transcript split into {len(chunks)} chunks ({len(full_text)} chars total)")
+        return chunks
+
+    def distill(self, video_info: VideoInfo, transcript: TranscriptResult) -> DistilledKnowledge:
+        """两阶段知识蒸馏 v2.0
+
+        Stage 1: ASR 纠错 + 内容分类（format role / MiniMax-M2.5）
+        Stage 2: 按类型深度分析（research role / qwen3.7-plus）
+        """
+        transcript_text = transcript.to_text()
+        logger.info(f"Distilling {len(transcript_text)} chars transcript (v2.0 two-stage)")
+
+        # ── 第一阶段：清洗 + 分类 ──
+        # VLM 帧描述（图片视频）没有 ASR 错误，只需分类不需纠错
+        is_vlm = transcript.source and "vlm" in transcript.source
+        if is_vlm and len(transcript_text) > 6000:
+            # 截取前 3000 字符做分类即可，纠错跳过
+            logger.info("Stage 1: VLM source detected, classification only (skip correction)")
+            stage1_input = transcript_text[:3000]
+        else:
+            stage1_input = transcript_text[:12000]
+        stage1_result = self._stage1_clean_and_classify(stage1_input)
+
+        content_type = stage1_result.get("content_type", "general")
+        entities = stage1_result.get("entities", [])
+
+        # VLM 源不需要纠错，直接用原始文本
+        if is_vlm:
+            corrected_text = transcript_text
+        else:
+            corrected_text = stage1_result.get("corrected_transcript", transcript_text)
+
+        # 防御：如果纠错后文本明显短于原文（LLM 截断），拼接原文剩余部分
+        if not is_vlm and len(corrected_text) < len(transcript_text) * 0.7:
+            logger.warning(f"Stage 1 truncated output ({len(corrected_text)}/{len(transcript_text)} chars), appending remainder")
+            corrected_text = corrected_text + transcript_text[len(corrected_text):]
+
+        # 更新 video_info 的 content_type 供后续使用
+        video_info.description = content_type
+
+        # ── RAG 背景增强 ──
+        background_section = self._get_background(corrected_text)
+
+        # ── 第二阶段：按类型深度分析 ──
+        stage2_prompt = self.STAGE2_PROMPTS.get(content_type, self.STAGE2_PROMPTS["general"])
+
+        # 长视频分段处理（使用纠错后文本）
+        corrected_len = len(corrected_text)
+        # 默认整段；corrected_len<=8000 时不分块，避免 chunks/all_key_points 未定义
+        # （否则下方 2634 行 `if len(chunks) > 1` 会 NameError）
+        chunks = [corrected_text]
+        all_key_points = []
+        if corrected_len > 8000:
+            # 按字符均分为 2-3 段
+            n_chunks = min(3, (corrected_len // 8000) + 1)
+            chunk_size = corrected_len // n_chunks
+            chunks = [corrected_text[i*chunk_size:(i+1)*chunk_size] for i in range(n_chunks)]
+            logger.info(f"Transcript split into {n_chunks} chunks ({corrected_len} chars)")
+            for i, chunk in enumerate(chunks[:-1]):
+                logger.info(f"Stage 2: analyzing chunk {i+1}/{n_chunks}")
+                chunk_prompt = f"提取此视频片段的 key_points（只需时间戳和洞察点）：\n{chunk}\n\n输出 JSON: {{\"key_points\": [{{\"timestamp\": \"MM:SS\", \"insight\": \"...\"}}]}}"
+                try:
+                    ok, resp = self.llm_client.call(role="format", message=chunk_prompt, timeout=60)
+                    if ok:
+                        m = re.search(r'\{[\s\S]*\}', resp)
+                        if m:
+                            pts = json.loads(m.group()).get("key_points", [])
+                            all_key_points.extend(pts)
+                except Exception:
+                    pass
+
+            analysis_text = corrected_text[:8000]
+            if all_key_points:
+                prev_points = "\n".join(f"- [{p.get('timestamp','')}] {p.get('insight','')}" for p in all_key_points)
+                background_section += f"\n\n**前段已提取的要点：**\n{prev_points}"
+        else:
+            analysis_text = corrected_text
+
+        user_prompt = self.STAGE2_USER_TEMPLATE.format(
             platform=video_info.platform,
             duration=video_info.duration,
             author=video_info.author or "未知",
-            transcript=transcript_text,
+            content_type=content_type,
+            entities=", ".join(entities[:15]),
+            transcript=analysis_text,
             background_section=background_section
         )
 
+        logger.info(f"Stage 2: deep analysis with research role (content_type={content_type})")
+
         try:
-            # 使用统一客户端调用（自动降级）
             success, content = self.llm_client.call(
-                role="distill",
+                role="research",
                 message=user_prompt,
-                system_prompt=self.SYSTEM_PROMPT,
+                system_prompt=stage2_prompt,
                 timeout=120
             )
 
             if success:
-                return self._parse_response(content)
+                result = self._parse_response(content)
+                # 补充分段提取的 key_points
+                if len(chunks) > 1 and all_key_points:
+                    existing_ts = {p.get("timestamp") for p in result.key_points}
+                    for p in all_key_points:
+                        if p.get("timestamp") not in existing_ts:
+                            result.key_points.append(p)
+                    result.key_points.sort(key=lambda x: x.get("timestamp", "99:99"))
+                return result
             else:
-                logger.error(f"LLM distillation failed: {content}")
+                logger.error(f"Stage 2 failed: {content}")
                 return self._fallback_distill(video_info, transcript)
 
         except Exception as e:
-            logger.error(f"LLM distillation error: {e}")
+            logger.error(f"Stage 2 error: {e}")
             return self._fallback_distill(video_info, transcript)
 
     def _parse_response(self, content: str) -> DistilledKnowledge:
@@ -2346,6 +2662,14 @@ class KnowledgeDistiller:
 
         try:
             data = json.loads(json_str)
+            # 按内容类型取对应的分析字段，统一存入 technical_reconstruction
+            type_analysis = (
+                data.get("technical_reconstruction")
+                or data.get("knowledge_framework")
+                or data.get("market_analysis")
+                or data.get("workflow_sop")
+                or {"architecture": "未提取", "tooling": "未提取", "metrics": "未提取", "pitfalls": "未提取"}
+            )
             return DistilledKnowledge(
                 title=data.get("title", "未命名"),
                 core_insight=data.get("core_insight", data.get("one_liner", "")),
@@ -2358,12 +2682,7 @@ class KnowledgeDistiller:
                 action_items=data.get("action_items", []),
                 references=data.get("references", []),
                 related_concepts=data.get("related_concepts", []),
-                technical_reconstruction=data.get("technical_reconstruction", {
-                    "architecture": "未提取",
-                    "tooling": "未提取",
-                    "metrics": "未提取",
-                    "pitfalls": "未提取"
-                }),
+                technical_reconstruction=type_analysis,
                 implementation_guide=data.get("implementation_guide", {})
             )
         except json.JSONDecodeError as e:
@@ -2404,178 +2723,289 @@ class KnowledgeDistiller:
 # ============================================================================
 
 class MarkdownWriter:
-    """Markdown 笔记生成与写入"""
+    """Markdown 笔记生成与写入 v2.0 — 按 content_type 差异化输出"""
 
-    TEMPLATE = '''---
+    FRONTMATTER = '''---
 title: "{title}"
 source_url: "{source_url}"
 date: {date}
-tags: [{tags}]
 type: video_distill
+content_type: {content_type}
+tags: [{tags}]
 tier: {content_tier}
 asr_source: "{asr_source}"
 related: [{related_concepts}]
----
+rag: false
+---'''
 
+    HEADER = '''
 # {title}
 
-> **内容等级：{tier_display}** | **技术重建完成度：高**
+> **内容等级：{tier_display}** | **分类：{content_type_label}**
 
-## 💡 核心深度洞察
+## 核心洞察
 {core_insight}
+'''
 
-## 🏗️ 技术情报重建 (Technical Reconstruction)
+    SECTION_TECH = '''
+## 技术情报重建
 ### 架构与原理
 {tech_arch}
 
-### 工具链详情
+### 工具链
 {tech_tools}
 
-### 量化指标与数据
+### 量化指标
 {tech_metrics}
 
-### 实施细节与坑位
+### 避坑指南
 {tech_pitfalls}
+'''
 
-## 🧠 关键技术锚点
-{key_points}
+    SECTION_BUSINESS = '''
+## 商业洞察
+### 市场规模与数据
+{market_size}
 
-## 📝 深度技术摘要 (Intel-Brief)
-{summary}
+### 竞争格局
+{competitive_landscape}
 
-## ✅ 具体工程建议 (Action Items)
-{action_items_section}
+### 机会评估
+{opportunities}
 
-## 🛠️ 研发/复现指南
-- **难度等级**：{impl_difficulty}
+### 风险因素
+{risks}
+'''
+
+    SECTION_WORKFLOW = '''
+## 创作工作流 SOP
+### 全流程概述
+{pipeline}
+
+### 工具链
+{tool_chain}
+
+### 详细步骤
+{steps}
+
+### 成本与时间
+{cost_estimate}
+
+### 质量提升技巧
+{quality_tips}
+'''
+
+    SECTION_KNOWLEDGE = '''
+## 知识框架
+### 核心概念
+{core_concepts}
+
+### 认知升级点
+{mental_model_shift}
+
+### 学习路径
+{learning_path}
+
+### 延伸阅读
+{further_reading}
+'''
+
+    SECTION_IMPL = '''
+## 复现指南
+- **难度**：{impl_difficulty}
 - **环境依赖**：{impl_prerequisites}
-- **核心逻辑/代码**：
+- **核心逻辑**：
 ```text
 {impl_code_logic}
 ```
-- **复现路径**：
+- **步骤**：
 {impl_steps}
+'''
+
+    FOOTER = '''
+## 关键锚点
+{key_points}
+
+## 摘要
+{summary}
+
+## 行动建议
+{action_items_section}
 
 {references_section}
 
-## 📂 关联资产
-- 🎙️ 原始音频：[点击播放]({asset_audio_url})
-- 📄 转录简报：[查看摘要]({asset_transcript_url})
+## 关联资产
+- 原始音频：[播放]({asset_audio_url})
+- 转录全文：[查看]({asset_transcript_url})
 
 ---
+- 来源：{platform} / {author}
+- 原始链接：[查看]({source_url})
 
-## 📹 原始信息
-- 来源平台：{platform}
-- 作者：{author}
-- 原始链接：[点击查看]({source_url})
-
----
-
-## 📜 详细 ASR 转录文本 (完整保留)
 <details>
-<summary>点击展开 100% 原始转录细节（防止信息丢失）</summary>
+<summary>ASR 转录原文</summary>
 
 {full_transcript}
 
 </details>
 
 ---
-> 由知微系统生成，建议关联已有知识并添加个人洞察。
-> **RAG 隔离标记**：`rag: false` (默认不入库，移动至 Knowledge_Base 目录可入库)
+> 由知微系统 v2.0 生成
 '''
+
+    @staticmethod
+    def _format_steps(steps):
+        """格式化步骤列表，去除 LLM 产出的重复编号前缀"""
+        if not steps:
+            return "参考摘要"
+        if not isinstance(steps, list):
+            return str(steps)
+        lines = []
+        for i, s in enumerate(steps):
+            s = re.sub(r'^\d+[\.\)、]\s*', '', str(s).strip())
+            lines.append(f"{i+1}. {s}")
+        return "\n".join(lines)
+
+    CONTENT_TYPE_LABELS = {
+        "tech_tutorial": "技术教程",
+        "business_insight": "商业洞察",
+        "creative_workflow": "创意工作流",
+        "knowledge_explainer": "知识科普",
+        "general": "综合内容"
+    }
 
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
 
+    def _build_type_section(self, knowledge: DistilledKnowledge, content_type: str) -> str:
+        """根据 content_type 构建差异化中段"""
+        tr = knowledge.technical_reconstruction or {}
+
+        if content_type == "tech_tutorial":
+            impl = getattr(knowledge, 'implementation_guide', {}) or {}
+            steps = impl.get('steps', [])
+            impl_steps = self._format_steps(steps)
+            section = self.SECTION_TECH.format(
+                tech_arch=tr.get("architecture", "未提取"),
+                tech_tools=tr.get("tooling", "未提取"),
+                tech_metrics=tr.get("metrics", "未提取"),
+                tech_pitfalls=tr.get("pitfalls", "未提取")
+            )
+            section += self.SECTION_IMPL.format(
+                impl_difficulty=impl.get('difficulty', '未知'),
+                impl_prerequisites=impl.get('prerequisites', '见摘要'),
+                impl_code_logic=impl.get('key_code_logic', '见摘要'),
+                impl_steps=impl_steps
+            )
+            return section
+
+        elif content_type == "business_insight":
+            ma = tr if "market_size" in tr else knowledge.__dict__.get("market_analysis", tr)
+            return self.SECTION_BUSINESS.format(
+                market_size=ma.get("market_size", "未提取"),
+                competitive_landscape=ma.get("competitive_landscape", "未提取"),
+                opportunities=ma.get("opportunities", "未提取"),
+                risks=ma.get("risks", "未提取")
+            )
+
+        elif content_type == "creative_workflow":
+            wf = tr if "pipeline" in tr else knowledge.__dict__.get("workflow_sop", tr)
+            tool_chain = wf.get("tool_chain", [])
+            if isinstance(tool_chain, list):
+                tc_str = "\n".join(f"- **{t.get('tool',t)}**：{t.get('role','')}" if isinstance(t, dict) else f"- {t}" for t in tool_chain)
+            else:
+                tc_str = str(tool_chain)
+            steps = wf.get("steps", [])
+            steps_str = self._format_steps(steps)
+            section = self.SECTION_WORKFLOW.format(
+                pipeline=wf.get("pipeline", "未提取"),
+                tool_chain=tc_str,
+                steps=steps_str,
+                cost_estimate=wf.get("cost_estimate", "未提取"),
+                quality_tips=wf.get("quality_tips", "未提取")
+            )
+            impl = getattr(knowledge, 'implementation_guide', {}) or {}
+            if impl.get('steps'):
+                impl_steps = self._format_steps(impl['steps'])
+                section += self.SECTION_IMPL.format(
+                    impl_difficulty=impl.get('difficulty', '未知'),
+                    impl_prerequisites=impl.get('prerequisites', '见摘要'),
+                    impl_code_logic=impl.get('key_code_logic', '见摘要'),
+                    impl_steps=impl_steps
+                )
+            return section
+
+        elif content_type == "knowledge_explainer":
+            kf = tr if "core_concepts" in tr else knowledge.__dict__.get("knowledge_framework", tr)
+            concepts = kf.get("core_concepts", [])
+            if isinstance(concepts, list):
+                concepts_str = "\n".join(f"- {c}" for c in concepts)
+            else:
+                concepts_str = str(concepts)
+            return self.SECTION_KNOWLEDGE.format(
+                core_concepts=concepts_str,
+                mental_model_shift=kf.get("mental_model_shift", "未提取"),
+                learning_path=kf.get("learning_path", "未提取"),
+                further_reading=kf.get("further_reading", "未提取")
+            )
+
+        return ""
+
     def write(self, video_info: VideoInfo, transcript: TranscriptResult,
               knowledge: DistilledKnowledge, noise_tags: list[str]) -> Path:
-        """生成并写入 Markdown 文件，同时归档资产"""
-        # 准备内容
+        """生成并写入 Markdown 文件，按 content_type 差异化输出"""
         date_str = datetime.now().strftime("%Y-%m-%d")
         tags_str = ", ".join(f'"{tag}"' for tag in knowledge.tags)
-        
-        # 确定文件名和资产目录
         safe_title = re.sub(r'[<>:"/\\|?*]', '', knowledge.title)[:50]
         asset_folder_name = f"{date_str}_{safe_title}"
         asset_dir = self.output_dir / "Assets" / asset_folder_name
         asset_dir.mkdir(parents=True, exist_ok=True)
 
-        # 归档转录全文
         transcript_filename = "transcript_full.txt"
-        transcript_path = asset_dir / transcript_filename
-        transcript_path.write_text(transcript.to_text(), encoding="utf-8")
-        
-        # 归档音频 (如果有临时文件路径，需要传入。这里假设 transcript 对象或 video_info 携带了 path)
-        # 注意：实际音频提取在 TranscriptProvider._transcribe_with_asr 中，
-        # 为了简单，我们在这里通过 link 协议引用，具体物理移动需在 distiller 主流程配合。
+        (asset_dir / transcript_filename).write_text(transcript.to_text(), encoding="utf-8")
         asset_audio_url = f"Assets/{asset_folder_name}/audio.mp3"
         asset_transcript_url = f"Assets/{asset_folder_name}/{transcript_filename}"
 
-        # 内容等级显示
-        tier_labels = {"A": "⭐⭐⭐ 深度干货", "B": "⭐⭐ 有价值", "C": "⭐ 浅层内容", "D": "⚠️ 信息稀薄"}
+        tier_labels = {"A": "A 深度干货", "B": "B 有价值", "C": "C 浅层内容", "D": "D 信息稀薄"}
         tier_display = tier_labels.get(knowledge.content_tier, "未评估")
 
-        # 实施指南数据
-        impl = getattr(knowledge, 'implementation_guide', {})
-        impl_difficulty = impl.get('difficulty', '未知')
-        impl_prerequisites = impl.get('prerequisites', '见摘要')
-        impl_code_logic = impl.get('key_code_logic', '# 提取中...')
-        impl_steps = "\n".join([f"{i+1}. {s}" for i, s in enumerate(impl.get('steps', ['参考摘要说明']))])
+        content_type = getattr(video_info, 'description', '') or "general"
+        content_type_label = self.CONTENT_TYPE_LABELS.get(content_type, "综合内容")
 
-        # 格式化知识点
-        key_points_str = "\n".join(f"- **[{kp['timestamp']}]** {kp['insight']}" for kp in knowledge.key_points)
-
-        # 适用场景
-        use_cases_section = f"## 🎯 适用场景\n{knowledge.use_cases}" if knowledge.use_cases else ""
-
-        # 知识关联
-        related_section = ", ".join(f"[[{c}]]" for c in knowledge.related_concepts) if knowledge.related_concepts else "暂无关联"
-
-        # 行动建议
-        items_str = "\n".join(f"- [ ] {item}" for item in knowledge.action_items) if knowledge.action_items else "- [ ] 思考如何将此知识应用到实际场景"
-
-        # 参考资源
+        key_points_str = "\n".join(f"- **[{kp.get('timestamp','')}]** {kp.get('insight','')}" for kp in knowledge.key_points)
+        items_str = "\n".join(f"- [ ] {item}" for item in knowledge.action_items) if knowledge.action_items else ""
         refs_str = "\n".join(f"- {ref}" for ref in knowledge.references) if knowledge.references else ""
-        references_section = f"## 📚 参考资料\n{refs_str}" if refs_str else ""
+        references_section = f"## 参考资料\n{refs_str}" if refs_str else ""
+        related_str = ", ".join(f'"{c}"' for c in knowledge.related_concepts) if knowledge.related_concepts else ""
 
-        # 生成 Markdown
-        content = self.TEMPLATE.format(
-            title=knowledge.title,
-            source_url=video_info.original_url,
-            date=date_str,
-            tags=tags_str,
-            content_tier=knowledge.content_tier,
-            tier_display=tier_display,
-            target_audience=knowledge.target_audience or "通用",
-            asr_source=transcript.source,
-            related_concepts=", ".join(f'"{c}"' for c in knowledge.related_concepts) if knowledge.related_concepts else "",
-            core_insight=knowledge.core_insight,
-            key_points=key_points_str,
-            summary=knowledge.summary,
-            use_cases_section=use_cases_section,
-            related_section=related_section,
-            action_items_section=items_str,
-            references_section=references_section,
-            platform=video_info.platform,
-            author=video_info.author or "未知",
-            impl_difficulty=impl_difficulty,
-            impl_prerequisites=impl_prerequisites,
-            impl_code_logic=impl_code_logic,
-            impl_steps=impl_steps,
-            asset_audio_url=asset_audio_url,
-            asset_transcript_url=asset_transcript_url,
-            tech_arch=knowledge.technical_reconstruction.get("architecture", "未提取"),
-            tech_tools=knowledge.technical_reconstruction.get("tooling", "未提取"),
-            tech_metrics=knowledge.technical_reconstruction.get("metrics", "未提取"),
-            tech_pitfalls=knowledge.technical_reconstruction.get("pitfalls", "未提取"),
-            full_transcript=transcript.to_text()
-        )
+        # 组装：frontmatter + header + 类型化中段 + footer
+        parts = [
+            self.FRONTMATTER.format(
+                title=knowledge.title, source_url=video_info.original_url,
+                date=date_str, tags=tags_str, content_tier=knowledge.content_tier,
+                asr_source=transcript.source, related_concepts=related_str,
+                content_type=content_type
+            ),
+            self.HEADER.format(
+                title=knowledge.title, tier_display=tier_display,
+                content_type_label=content_type_label,
+                core_insight=knowledge.core_insight
+            ),
+            self._build_type_section(knowledge, content_type),
+            self.FOOTER.format(
+                key_points=key_points_str, summary=knowledge.summary,
+                action_items_section=items_str, references_section=references_section,
+                asset_audio_url=asset_audio_url, asset_transcript_url=asset_transcript_url,
+                platform=video_info.platform, author=video_info.author or "未知",
+                source_url=video_info.original_url, full_transcript=transcript.to_text()
+            )
+        ]
 
+        content = "\n".join(parts)
         filename = f"{date_str}_{safe_title}.md"
         output_path = self.output_dir / filename
         output_path.write_text(content, encoding="utf-8")
         logger.info(f"Markdown saved to: {output_path}")
-
         return output_path
 
 
@@ -2656,11 +3086,13 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
         return 1
 
     if not transcript.full_text:
-        # 优先使用透传的详细报错
         err_msg = transcript.error_details or "无法获取转录文本 (ASR 返回空或识别失败)"
         error_json = json.dumps({"error_type": VideoErrorType.ASR_FAILED.value, "error_message": err_msg})
         print(error_json, file=sys.stderr)
         logger.error(f"Failed to get transcript: {err_msg}")
+        # 清理空资产目录
+        if asset_dir.exists() and not any(asset_dir.iterdir()):
+            asset_dir.rmdir()
         return 1
 
     logger.info(f"Transcript source: {transcript.source}")
@@ -2709,18 +3141,66 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
         print(f"Summary: {knowledge.summary[:100]}...")
         return 0
 
-    # 5. 生成 Markdown
+    # 5. 智能 Wikilinks — 用 RAG 验证 related_concepts
     logger.info("=" * 50)
-    logger.info("Step 5: Writing Markdown")
+    logger.info("Step 5: Validating wikilinks via RAG")
+    original_count = len(knowledge.related_concepts)
+    try:
+        validated_links = []
+        for concept in knowledge.related_concepts[:10]:
+            bg = retrieve_background_knowledge([concept])
+            if bg and len(bg) > 10:
+                validated_links.append(concept)
+        if validated_links:
+            knowledge.related_concepts = validated_links
+            logger.info(f"Validated {len(validated_links)}/{original_count} wikilinks via RAG")
+        else:
+            logger.info("No wikilinks matched RAG, keeping as plain concepts")
+    except Exception as e:
+        logger.warning(f"Wikilink validation skipped: {e}")
+
+    # 6. 生成 Markdown
+    logger.info("=" * 50)
+    logger.info("Step 6: Writing Markdown")
     writer = MarkdownWriter(config.output_dir)
     output_path = writer.write(video_info, transcript, knowledge, noise_tags)
+
+    # 7. RAG 闭环 — A/B 级笔记复制到 JD 目录
+    if knowledge.content_tier in ("A", "B"):
+        logger.info("=" * 50)
+        logger.info(f"Step 7: RAG promotion (tier {knowledge.content_tier})")
+        try:
+            import requests as req
+            classify_resp = req.post(
+                "http://localhost:8766/classify",
+                json={"title": knowledge.title, "content": knowledge.summary[:500]},
+                timeout=5
+            )
+            if classify_resp.status_code == 200:
+                jd = classify_resp.json()
+                jd_dir = Path(config.output_dir).parent.parent / jd.get("jd_dir", "")
+                if jd_dir.exists():
+                    import shutil
+                    dest = jd_dir / output_path.name
+                    shutil.copy2(str(output_path), str(dest))
+                    # 在副本中标记 rag: true
+                    dest_content = dest.read_text(encoding="utf-8")
+                    dest_content = dest_content.replace("rag: false", "rag: true", 1)
+                    dest.write_text(dest_content, encoding="utf-8")
+                    logger.info(f"Promoted to JD directory: {dest}")
+                else:
+                    logger.warning(f"JD directory not found: {jd_dir}")
+            else:
+                logger.warning(f"Classify API returned {classify_resp.status_code}")
+        except Exception as e:
+            logger.warning(f"RAG promotion failed (non-fatal): {e}")
 
     # 标记已处理
     store.mark_processed(video_info.resolved_url, output_path, knowledge.title, video_id=video_id)
 
     logger.info("=" * 50)
     logger.info(f"✅ Done! Output: {output_path}")
-    print(f"✅ Done! Output: {output_path}")  # 同时输出到 stdout，供调用方检测
+    print(f"✅ Done! Output: {output_path}")
     return 0
 
 

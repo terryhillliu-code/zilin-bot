@@ -60,6 +60,27 @@ def reply_message(message_id: str, text: str, **kwargs) -> bool:
     return False
 
 
+def reply_interactive(message_id: str, card: dict, **kwargs) -> bool:
+    """回复交互卡片（msg_type=interactive，2026-07-26 P1）。失败返回 False，调用方降级为纯文本"""
+    try:
+        request = ReplyMessageRequest.builder() \
+            .message_id(message_id) \
+            .request_body(ReplyMessageRequestBody.builder()
+                .content(json.dumps(card, ensure_ascii=False))
+                .msg_type("interactive")
+                .build()) \
+            .build()
+        response = client.im.v1.message.reply(request)
+        if response.success():
+            record_call("reply")
+            return True
+        print(f"❌ 卡片回复失败: {response.code} - {response.msg}")
+        return False
+    except Exception as e:
+        print(f"❌ 卡片回复异常: {e}")
+        return False
+
+
 def send_direct_message(user_id: str, text: str, **kwargs) -> bool:
     """通过用户ID直接发送消息，用于主动推送"""
     max_retries = 3

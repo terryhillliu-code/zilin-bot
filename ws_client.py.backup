@@ -262,12 +262,6 @@ def call_openclaw_agent(message: str, session_id: str, agent: str = "main") -> s
     import logging
     logger = logging.getLogger(__name__)
 
-    # kill-switch: OPENCLAW_ENABLED=0 时直接走 chat_handler
-    if os.getenv("OPENCLAW_ENABLED", "1") != "1":
-        logger.info("OpenClaw 已禁用(OPENCLAW_ENABLED=0),直接走 chat_handler")
-        handler = get_chat_handler()
-        return handler.handle_sync(message, session_id, role=agent)
-
     try:
         # 构建命令
         cmd = [
@@ -543,44 +537,6 @@ def do_p2_card_action_trigger_v1(data) -> None:
             reply_message(message_id, "✅ 已取消研究")
             return
 
-        # ⭐ 2026-07-26 P1: 自然语言路由确认回调（捕获/研究/撤销/取消）
-        elif action_type == "confirm_capture":
-            from commands.knowledge_commands import do_capture
-            from core.confirm_card import build_capture_receipt
-            from feishu_api import reply_interactive
-            text = value.get("text", "")
-            ok, info, filename = do_capture(text, user_id, source="飞书自然语言捕获")
-            if ok:
-                if not reply_interactive(message_id, build_capture_receipt(filename, info)):
-                    reply_message(message_id, f"✅ 已捕获: {filename}")
-            else:
-                reply_message(message_id, f"❌ 捕获失败: {info}")
-            return
-
-        elif action_type == "confirm_research":
-            from commands.nl_router import _confirm_research
-            from types import SimpleNamespace
-            ctx = SimpleNamespace(reply_message=reply_message)
-            _confirm_research(value.get("query", ""), user_id, message_id, ctx)
-            return
-
-        elif action_type == "undo_capture":
-            from pathlib import Path as _Path
-            fp = _Path(value.get("filepath", ""))
-            try:
-                if fp.name.startswith("raw_insight_") and fp.exists():
-                    fp.unlink()
-                    reply_message(message_id, f"↩️ 已撤销: {fp.name}")
-                else:
-                    reply_message(message_id, "⚠️ 文件不存在或不可撤销")
-            except Exception as e:
-                reply_message(message_id, f"❌ 撤销失败: {e}")
-            return
-
-        elif action_type == "cancel_nl_action":
-            reply_message(message_id, "已取消。")
-            return
-
         elif action_type == "show_config_form":
             # TODO: 显示详细配置表单
             reply_message(message_id, "⚙️ 详细配置功能开发中...")
@@ -823,18 +779,20 @@ def main():
                 zombie_idle_start = None  # 有消息来了，重置
                 last_event_count = current_count
 
-            # 连续 2 小时没收到消息——记录但不再重启（H1修复: 原版误杀健康空闲）
+            # 如果连续 2 小时没收到消息，主动断开重连
             ZOMBIE_THRESHOLD = 7200  # 2 小时
             if zombie_idle_start and (now - zombie_idle_start) > ZOMBIE_THRESHOLD:
                 zombie_minutes = int((now - zombie_idle_start) / 60)
                 print(f"🚨 僵尸连接检测：{zombie_minutes} 分钟未收到任何消息，主动断开重连...")
-                zombie_idle_start = now  # H1修复: 重置计时，每2h记一次不刷屏
+                zombie_idle_start = None  # 避免重复触发
 
                 # 记录到日志
                 with open(os.path.expanduser("~/logs/connection_monitor.log"), "a") as f:
                     f.write(f"{datetime.now().isoformat()}: ZOMBIE detected, forcing reconnect after {zombie_minutes}min\n")
 
-                # H1修复: 不再自杀重启——真实僵尸由 SDK keepalive ping 自动重连，进程死亡由 scheduler 心跳 watchdog 兜底
+                # SDK 无 stop() 方法，通过进程退出让 launchd 重启
+                print("\U0001f504 \u5f3a\u5236\u9000\u51fa\u8fdb\u7a0b\uff0c\u7531 launchd \u81ea\u52a8\u91cd\u542f...")
+                os._exit(1)
 
             # 写入心跳（即使空闲也写入，表示服务存活）
             write_heartbeat(status="connected")

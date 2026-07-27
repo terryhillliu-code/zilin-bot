@@ -9,6 +9,7 @@ import json
 import subprocess
 import logging
 import re
+import shutil
 import yaml
 from pathlib import Path
 from .persona_service import persona_service
@@ -132,8 +133,14 @@ class ResearchReportExecutor:
                     reply_func(message_id, f"⚠️ Claude 预处理失败（{e}），继续执行原有流程...")
                     # 继续执行原有流程
             # 1. 整理文件 (清理上一次的导出，防止混淆)
+            # 2026-07-26 S7 修复: 原版只 log 不删除 → 旧主题素材污染新研报; 真删除并重建
             if self.export_root.exists():
-                logger.info(f"清理导出分区... {self.export_root}")
+                try:
+                    shutil.rmtree(self.export_root)
+                    logger.info(f"已清理旧导出分区: {self.export_root}")
+                except Exception as e:
+                    logger.warning(f"清理导出分区失败: {e}")
+            self.export_root.mkdir(parents=True, exist_ok=True)
 
             # 2. 解析参数
             template_key = None  # None = 自动检测

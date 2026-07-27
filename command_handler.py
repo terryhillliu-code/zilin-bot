@@ -62,6 +62,21 @@ def handle_text_async(text, user_id, message_id, user_role="user"):
     text_lower = text_stripped.lower()
     session_id = f"feishu-{user_id}"
 
+    # ⭐ 2026-07-26 P2 语音接线：语音转写确认消费（此前 pending_voice 只写不读）
+    _pending_voice = getattr(_ctx, 'pending_voice', None)
+    if _pending_voice is not None and user_id in _pending_voice:
+        _confirm = ('确认', '确定', '提取', '是', '好', '好的', 'ok', 'yes')
+        _cancel = ('取消', '不', '不要', '算了', 'no')
+        if text_lower in _confirm:
+            _voice_text = _pending_voice.pop(user_id, {}).get('text', '')
+            if _voice_text:
+                _ctx.reply_message(message_id, f"🎙️ 正在处理语音内容：{_voice_text[:60]}…")
+                return handle_text_async(_voice_text, user_id, message_id, user_role)
+        elif text_lower in _cancel:
+            _pending_voice.pop(user_id, None)
+            _ctx.reply_message(message_id, "已取消，语音内容已丢弃。")
+            return
+
     try:
         # 1. 基础命令拦截
         if handle_dev_commands(text_lower, text_stripped, user_id, message_id, _ctx):
@@ -89,6 +104,11 @@ def handle_text_async(text, user_id, message_id, user_role="user"):
 
         # 2. Agent 智能路由 (Layer 2/3)
         if handle_agent_commands(text_lower, text_stripped, user_id, message_id, _ctx):
+            return
+
+        # 2.5 自然语言主路由（2026-07-26 P1）：斜杠命令全部落空后、对话兜底前
+        from commands.nl_router import route_natural_language
+        if route_natural_language(text_stripped, user_id, message_id, _ctx):
             return
 
         # 3. 传统对话

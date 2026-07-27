@@ -103,7 +103,7 @@ def check_launchd_service() -> dict:
                     pid = parts[0] if parts[0] != '-' else None
                     status = parts[1]
 
-                    result["running"] = pid is not None and status == '0'
+                    result["running"] = pid is not None and pid != '-'
                     result["pid"] = pid
                     break
 

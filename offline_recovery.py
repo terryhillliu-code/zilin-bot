@@ -51,17 +51,15 @@ class OfflineRecovery:
         except Exception as e:
             print(f"⚠️ 保存离线状态失败: {e}")
 
-    def cache_chat_id(self, user_id: str, chat_id: str):
+    def cache_chat_id(self, user_id: str, chat_id: str, alt_user_id: str = None):
         """
-        缓存用户 chat_id（在收到消息时调用）
-
-        Args:
-            user_id: 用户 ID (open_id)
-            chat_id: 私聊会话 ID
+        缓存用户 chat_id（同时用 open_id 和 user_id 做 key）
         """
         if "chat_id_cache" not in self.state:
             self.state["chat_id_cache"] = {}
         self.state["chat_id_cache"][user_id] = chat_id
+        if alt_user_id and alt_user_id != user_id:
+            self.state["chat_id_cache"][alt_user_id] = chat_id
         self._save_state()
 
     def get_cached_chat_id(self, user_id: str) -> Optional[str]:

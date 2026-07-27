@@ -61,7 +61,7 @@ def check_dashscope_asr() -> dict:
             def on_error(self, error): pass
 
         recognition = Recognition(
-            model='paraformer-realtime-v2',
+            model='paraformer-v2',
             format='aiff',
             sample_rate=44100,
             callback=SilentCallback()

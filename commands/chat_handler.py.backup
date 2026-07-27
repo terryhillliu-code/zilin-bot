@@ -36,10 +36,6 @@ def _call_openclaw_agent(message: str, session_id: str, agent: str = "main", tim
     Returns:
         (success: bool, response: str)
     """
-    # kill-switch: OPENCLAW_ENABLED=0 时直接返回失败，走降级
-    if os.getenv("OPENCLAW_ENABLED", "1") != "1":
-        return False, "OpenClaw 已禁用"
-
     try:
         cmd = [
             "docker", "exec", OPENCLAW_CONTAINER,
@@ -137,27 +133,21 @@ class ChatHandler:
 
             response = llm_client.call_with_session("chat", full_message, session_id)
 
-        # ⭐ 2026-07-26 H2 提速：先回复用户，记忆写入全部移到后台线程
-        # （原流程记忆写入阻塞回复，最坏 ~70s 才收到答案）
-        self.add_to_history(user_id, "bot", response)
-        self.reply_message(message_id, response)
+            # 更新本地记忆
+            memory.add_turn(text_stripped, response)
 
-        def _save_memories_bg():
+        # ⭐ v55.7: 保存对话到 Mem0 长期记忆
+        if mem0:
             try:
-                memory.add_turn(text_stripped, response)  # 仅降级分支定义 memory
-            except NameError:
-                pass  # openclaw 分支无本地记忆更新（与原行为一致）
-            except Exception as e:
-                logger.warning(f"后台记忆写入失败: {e}")
-            try:
-                if mem0:
-                    from core.mem0_client import add_conversation_memory
-                    add_conversation_memory(text_stripped, response, user_id)
+                from core.mem0_client import add_conversation_memory
+                add_conversation_memory(text_stripped, response, user_id)
+                logger.info(f"[Mem0] 已保存对话记忆")
             except Exception as e:
                 logger.warning(f"[Mem0] 保存记忆失败: {e}")
 
-        import threading as _threading
-        _threading.Thread(target=_save_memories_bg, daemon=True).start()
+        # 记录历史并回复
+        self.add_to_history(user_id, "bot", response)
+        self.reply_message(message_id, response)
 
         # ⭐ TTS 语音回复（用户开启时额外发送语音）
         try:

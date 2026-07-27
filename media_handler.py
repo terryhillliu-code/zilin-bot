@@ -118,48 +118,38 @@ def compress_image_base64(image_path: str, max_size: int = 800) -> str:
 
 
 def analyze_image_base64(image_base64: str, question: str = None) -> str:
-    """调用 DashScope API 分析图片"""
+    """调用统一LLM客户端分析图片"""
     try:
-        import httpx
-
-        # 获取 API Key - 使用统一密钥加载
-        from zhiwei_common import load_secrets
-        secrets = load_secrets()
-        api_key = secrets.get("DASHSCOPE_API_KEY") or secrets.get("BAILIAN_API_KEY") or secrets.get("CODING_PLAN_API_KEY")
-
-        if not api_key:
-            return "❌ 系统配置异常，请联系管理员"
+        # 使用统一LLM客户端，自动路由到qwen-vl-max多模态模型
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path.home() / "zhiwei-common"))
+        from llm_client import get_client
+        client = get_client()
 
         prompt = question if question else "请分析这张图片，描述内容并提取关键信息。"
+        print(f"🖼️ 调用多模态模型分析图片... 问题: {prompt[:30]}...")
 
-        print(f"🖼️ 调用 qwen3.5-plus... 问题: {prompt[:30]}...")
-        response = httpx.post(
-            "https://coding.dashscope.aliyuncs.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "qwen3.5-plus",
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
-                    ]
-                }],
-                "max_tokens": 2000
-            },
-            timeout=90
-        )
+        # 构建多模态消息
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+            ]
+        }]
 
-        if response.status_code == 200:
-            result = response.json()["choices"][0]["message"]["content"]
-            print(f"✅ 图片分析完成: {len(result)} 字符")
-            return f"🖼️ **图片分析结果**\n\n{result}"
+        # 直接调用，多模态需要特殊处理
+        result = client.call("vision", prompt, max_tokens=2000)
+
+        if result.get("success"):
+            analysis = result["content"]
+            print(f"✅ 图片分析完成: {len(analysis)} 字符")
+            return f"🖼️ **图片分析结果**\n\n{analysis}"
         else:
-            print(f"❌ 图片分析失败: {response.status_code}")
-            return f"❌ 图片分析失败: {response.status_code}"
+            error = result.get("error", "未知错误")
+            print(f"❌ 图片分析失败: {error}")
+            return f"❌ 图片分析失败: {error}"
     except Exception as e:
         print(f"❌ 图片分析异常: {e}")
         return f"❌ 图片分析异常: {str(e)}"
@@ -371,23 +361,30 @@ def process_video(text: str, message_id: str = None) -> str:
         if "bilibili.com" in url or "b23.tv" in url:
             # B站需要从浏览器读取 cookies（绕过412反爬）
             cmd.extend(["--cookies-from-browser", "chrome"])
-        else:
+        elif "douyin.com" in url or "iesdouyin.com" in url:
             # 抖音使用 cookies 文件
             cmd.extend(["--cookies", os.path.expanduser("~/zhiwei-bot/secrets/douyin_cookies.txt")])
+        # YouTube 及其他平台：不带 cookies（yt-dlp 默认即可，避免无谓加载
+        # 抖音 cookies 文件而在日志里产生 "cookie" 字样干扰错误归类）
 
         logger.info(f"🎬 调用 Distiller: {' '.join(cmd[:3])}...")
 
-        # ⭐ 2026-06-02: 子进程依赖预检查
+        # ⭐ 2026-06-02: 子进程依赖预检查（超时/异常降级，不阻塞主流程）
+        # 注：原 timeout=5 在系统高负载时易把"冷启动进程 + import"拖超时，
+        # 误报"环境检查失败"并拦在主命令之前。改为宽松超时 + 失败降级继续执行，
+        # 真正的依赖问题由下方主命令（timeout=600）自行暴露。
         try:
             check = subprocess.run(
-                [venv_python, "-c", "import dotenv; import requests; import yaml"],
-                capture_output=True, text=True, timeout=5
+                [venv_python, "-c", "import dotenv; import requests; import dashscope; import yt_dlp"],
+                capture_output=True, text=True, timeout=20
             )
             if check.returncode != 0:
                 logger.error(f"Distiller 依赖检查失败: {check.stderr.strip()[:200]}")
                 return "❌ 视频分析依赖不完整，请联系管理员修复"
+        except subprocess.TimeoutExpired:
+            logger.warning("Distiller 依赖预检查超时（疑似系统繁忙），降级继续执行主流程")
         except Exception as _e:
-            return f"❌ 视频分析环境检查失败: {_e}"
+            logger.warning(f"Distiller 依赖预检查异常，降级继续执行: {_e}")
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
@@ -528,105 +525,44 @@ def download_audio(message_id: str, file_key: str) -> str:
 
 
 def transcribe_audio(audio_path: str) -> str:
-    """转录语音文件为文字（三级降级链）
-
-    降级链: DashScope paraformer → MLX Whisper local → Mimo v2.5-asr
+    """转录语音文件为文字（使用统一的 DashScope ASR）
+    
+    v6.0: 移除本地重复逻辑，改为调用 douyin_distiller.DashScopeASRTranscriber
+    受益于 v5.9 的增强，现在支持详细错误捕获。
     """
-    audio_path_obj = Path(audio_path)
+    if not DashScopeASRTranscriber:
+        logger.error("DashScopeASRTranscriber not found in distiller")
+        return None
 
-    # 第一级: DashScope ASR
-    if DashScopeASRTranscriber:
-        try:
-            api_key = get_api_key(["BAILIAN_API_KEY", "CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY"])
-            if api_key:
-                transcriber = DashScopeASRTranscriber(api_key)
-                result = transcriber.transcribe(audio_path_obj)
-                if result and result.full_text:
-                    logger.info("✅ ASR 转录成功 (DashScope)")
-                    return result.full_text
-                elif result and result.error_details:
-                    logger.warning(f"DashScope ASR 失败: {result.error_details[:150]}")
-        except Exception as e:
-            logger.warning(f"DashScope ASR 异常，降级: {e}")
-
-    # 第二级: 本地 MLX Whisper
     try:
-        from scripts.douyin_distiller import LocalMLXWhisperTranscriber
-        transcriber = LocalMLXWhisperTranscriber("small")
-        if transcriber.is_available():
-            # 需要先格式化转换
-            converted = _ensure_audio_format(audio_path_obj)
-            result = transcriber.transcribe(converted)
-            if result and result.full_text:
-                logger.info("✅ ASR 转录成功 (MLX Whisper)")
-                return result.full_text
-    except ImportError:
-        pass
-    except Exception as e:
-        logger.warning(f"MLX Whisper 异常，降级到 Mimo ASR: {e}")
+        # 获取 API key（使用统一的延迟加载）
+        api_key = get_api_key(["BAILIAN_API_KEY", "CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY"])
+        if not api_key:
+            logger.error("API Key 未配置")
+            return None
 
-    # 第三级: Mimo v2.5-asr
-    try:
-        mimo_text = _transcribe_with_mimo_asr(audio_path_obj)
-        if mimo_text:
-            logger.info("✅ ASR 转录成功 (Mimo v2.5-asr)")
-            return mimo_text
-    except Exception as e:
-        logger.error(f"Mimo ASR 也失败了: {e}")
+        transcriber = DashScopeASRTranscriber(api_key)
+        audio_path_obj = Path(audio_path)
+        
+        # 执行转录
+        result = transcriber.transcribe(audio_path_obj)
+        
+        if result.full_text:
+            return result.full_text
+        else:
+            if result.error_details:
+                logger.error(f"ASR 详细报错: {result.error_details}")
+            return None
 
+    except Exception as e:
+        logger.error(f"ASR 转录异常: {e}")
+        return None
     finally:
         # 清理原文件
         if audio_path and os.path.exists(audio_path):
             try:
                 os.remove(audio_path)
             except: pass
-
-    return None
-
-
-def _transcribe_with_mimo_asr(audio_path: Path) -> Optional[str]:
-    """使用 Mimo v2.5-asr 转录音频（降级方案）"""
-    api_key = get_api_key(["MIMO_API_KEY", "BAILIAN_API_KEY", "CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY"])
-    if not api_key:
-        return None
-
-    import base64
-
-    # 确保格式为 wav
-    converted = _ensure_audio_format(audio_path)
-
-    # 读取并编码为 data URL
-    with open(converted, "rb") as f:
-        audio_data = f.read()
-    b64 = base64.b64encode(audio_data).decode()
-    data_url = f"data:audio/wav;base64,{b64}"
-
-    api_base = os.getenv("MIMO_API_BASE", "https://token-plan-cn.xiaomimimo.com")
-    url = f"{api_base}/v1/chat/completions"
-
-    payload = {
-        "model": "mimo-v2.5-asr",
-        "max_tokens": 200,
-        "messages": [{"role": "user", "content": [
-            {"type": "input_audio", "input_audio": {"data": data_url}}
-        ]}]
-    }
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    import requests
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
-
-    if r.status_code != 200:
-        logger.warning(f"Mimo ASR 请求失败: {r.status_code} - {r.text[:200]}")
-        return None
-
-    d = r.json()
-    text = d.get("choices", [{}])[0].get("message", {}).get("content", "")
-    return text if text else None
 
 
 def _ensure_audio_format(audio_path: Path) -> Path:

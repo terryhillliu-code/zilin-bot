@@ -26,7 +26,7 @@ def get_system_health_dict() -> dict:
     services = [
         "com.zhiwei.bot",
         "com.zhiwei.scheduler",
-        "com.zhiwei.dev-worker",
+        # com.zhiwei.dev-worker 2026-07-25 整体下线（plist .DISABLED），目录保留（messages.db 为 MessageBus 活库）
         "com.zhiwei.rag-api"
     ]
 
@@ -144,7 +144,12 @@ def format_health_status(status: dict) -> str:
         
         lines.append(f"\n**容器状态 ({checked_at}):**")
         for name, s in docker.items():
-            emoji = "✅" if "Up" in s or "running" in s else "❌"
+            if "disabled" in s:
+                emoji = "⏸️"
+            elif "Up" in s or "running" in s:
+                emoji = "✅"
+            else:
+                emoji = "❌"
             lines.append(f"  • {emoji} {name}: {s}")
     elif "error" in docker:
         lines.append(f"\n⚠️ **Docker 检查失败**: {docker['error']}")
