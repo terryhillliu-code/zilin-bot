@@ -121,10 +121,7 @@ def analyze_image_base64(image_base64: str, question: str = None) -> str:
     """调用统一LLM客户端分析图片"""
     try:
         # 使用统一LLM客户端，自动路由到qwen-vl-max多模态模型
-        import sys
-        from pathlib import Path
-        sys.path.insert(0, str(Path.home() / "zhiwei-common"))
-        from llm_client import get_client
+        from zhiwei_common.llm import get_client
         client = get_client()
 
         prompt = question if question else "请分析这张图片，描述内容并提取关键信息。"
@@ -386,7 +383,15 @@ def process_video(text: str, message_id: str = None) -> str:
         except Exception as _e:
             logger.warning(f"Distiller 依赖预检查异常，降级继续执行: {_e}")
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        except subprocess.TimeoutExpired as e:
+            # ⭐ 2026-07-27: 超时时记录 partial output，便于定位卡在哪一步
+            if e.stdout:
+                logger.error(f"Distiller timeout - stdout (last 2000 chars):\n{e.stdout[-2000:]}")
+            if e.stderr:
+                logger.error(f"Distiller timeout - stderr (last 2000 chars):\n{e.stderr[-2000:]}")
+            raise
 
         if result.returncode != 0:
             # 解析错误信息
@@ -413,7 +418,7 @@ def process_video(text: str, message_id: str = None) -> str:
 
             # ⭐ 2026-06-02: 错误脱敏，不向用户暴露堆栈
             friendly_msg = {
-                "timeout": "❌ 视频分析超时（超过 10 分钟），请检查链接是否有效",
+                "timeout": "❌ 视频分析超时（超过 15 分钟），请检查链接是否有效",
                 "network_error": "❌ 视频下载失败（网络错误），请检查链接是否有效后重试",
                 "module_error": "❌ 视频分析模块异常，请联系管理员",
                 "unknown": "❌ 视频处理失败（内部错误），已记录日志",

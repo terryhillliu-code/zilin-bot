@@ -73,7 +73,7 @@ class ChatHandler:
 
         # 导入 LLM 客户端
         try:
-            from llm_client import llm_client
+            from zhiwei_common.llm import llm_client
             self.llm = llm_client
             logger.info("✅ LLM 客户端加载成功")
         except ImportError as e:

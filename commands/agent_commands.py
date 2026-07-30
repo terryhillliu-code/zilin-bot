@@ -9,7 +9,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path.home()))
 
 try:
-    from zhiwei_agent.executor import AgentExecutor
+    # 2026-07-31 修复: executor/__init__.py 为空文件，AgentExecutor 实际由包根
+    # __init__.py 从 executor_module 导出，旧路径 zhiwei_agent.executor 恒 ImportError
+    from zhiwei_agent import AgentExecutor
     from zhiwei_agent.schemas import TaskLayer
     _agent_executor = AgentExecutor()
     _agent_available = True

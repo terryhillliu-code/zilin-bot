@@ -340,7 +340,7 @@ class MemoryManager:
             (anchors, summary) - 锚点列表和摘要文本
         """
         try:
-            from llm_client import llm_client
+            from zhiwei_common.llm import llm_client
         except ImportError:
             # 规则降级
             anchors = self._extract_anchors_by_rule(old_text)
@@ -572,7 +572,7 @@ def extract_important_info_enhanced(user_msg: str, assistant_msg: str) -> dict:
 def _extract_with_llm(user_msg: str, assistant_msg: str) -> dict:
     """LLM 智能提取重要信息"""
     try:
-        from llm_client import llm_client
+        from zhiwei_common.llm import llm_client
     except ImportError:
         return None
 

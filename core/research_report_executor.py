@@ -13,7 +13,7 @@ import shutil
 import yaml
 from pathlib import Path
 from .persona_service import persona_service
-from .llm_client import llm_client
+from zhiwei_common.llm import llm_client
 from .claude_preprocessor import ClaudePreprocessor
 
 # 配置日志

@@ -229,7 +229,7 @@ def test_chat_handler():
 def test_llm_client():
     """测试 LLM 客户端"""
     try:
-        from llm_client import llm_client
+        from zhiwei_common.llm import llm_client
         print("✅ llm_client 加载成功")
         return True
     except Exception as e:

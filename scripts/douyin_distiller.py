@@ -253,7 +253,7 @@ class AppConfig:
         # ASR 专用 key（仅 DASHSCOPE_API_KEY 有效）
         self.dashscope_api_key = get_asr_key() or ""
         self.qwen_model = os.getenv("QWEN_MODEL", "qwen3.7-plus")
-        self.asr_model = os.getenv("ASR_MODEL", "paraformer-v2")  # v2:高质量版(原realtime-v2)
+        self.asr_model = os.getenv("ASR_MODEL", "paraformer-realtime-v2")  # Recognition API 用 realtime 变体
         self.asr_policy = os.getenv("ASR_POLICY", "auto")
         self.local_asr_model = os.getenv("LOCAL_ASR_MODEL", "small")
 
@@ -1221,7 +1221,7 @@ class BaseTranscriber(ABC):
 class DashScopeASRTranscriber(BaseTranscriber):
     """阿里云百炼 ASR 转录器"""
 
-    def __init__(self, api_key: str, model: str = "paraformer-v2"):  # v2:高质量版
+    def __init__(self, api_key: str, model: str = "paraformer-realtime-v2"):  # Recognition API 专用模型名
         self.api_key = api_key
         self.model = model
         self._available = bool(api_key)
@@ -2434,32 +2434,16 @@ class KnowledgeDistiller:
     def _init_client(self):
         """初始化统一 LLM 客户端"""
         try:
-            from llm_client import get_client
+            from zhiwei_common.llm import llm_client
         except ImportError:
-            # llm_client.py 位于 zhiwei-common 项目根目录（不在 zhiwei_common 包内，
-            # 故未被 pip install 安装）。zhiwei_common 以 installed 包形式存在时，
-            # 文件头部的 sys.path.insert(zhiwei-common) 不会执行，需在此显式补上。
+            # zhiwei_common 未以 installed 包形式存在时，从项目根目录补上路径。
             sys.path.insert(0, str(Path.home() / "zhiwei-common"))
-            from llm_client import get_client
+            from zhiwei_common.llm import llm_client
 
-        # llm_client.py 已重构为 LLMClient 类 + get_client() 工厂，接口与本模块
-        # 原先依赖的旧单例不同：
-        #   旧: call(role, message, system_prompt, timeout) -> (success, content)
-        #   新: LLMClient.call(task_type, prompt, ...) -> dict{success, content, ...}
-        # 用适配器桥接，避免改动下方 Stage1/Stage2 共 3 处调用点。
-        # 注：新接口无 system_prompt 形参，这里把 system_prompt 拼到 prompt 前面。
-        class _LLMClientCompat:
-            def __init__(self):
-                self._c = get_client()
-            def call(self, role="basic", message="", system_prompt=None, timeout=None, **kw):
-                prompt = f"{system_prompt}\n\n---\n\n{message}" if system_prompt else message
-                try:
-                    r = self._c.call(task_type=role, prompt=prompt)
-                except Exception as e:
-                    return False, f"[LLM 调用异常: {e}]"
-                return bool(r.get("success", False)), r.get("content")
-
-        self.llm_client = _LLMClientCompat()
+        # zhiwei_common.llm.LLMClient.call(role, message, system_prompt, timeout)
+        # -> (success, content)，与下方 Stage1/Stage2 共 3 处调用点接口一致，
+        # 无需适配器桥接（role: format/research 均在 ROLE_PROMPTS 中）。
+        self.llm_client = llm_client
         logger.info("Using unified LLM client (v2.0: two-stage distillation)")
 
     def _stage1_clean_and_classify(self, transcript_text: str) -> dict:

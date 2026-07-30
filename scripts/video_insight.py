@@ -27,8 +27,7 @@ from video_cache import VideoCache, hash_url
 # 导入抖音Cookie模块
 from douyin_cookie import DouyinAPI, TokenManager
 # 导入统一LLM客户端
-sys.path.insert(0, str(Path.home() / "zhiwei-common"))
-from llm_client import LLMClient, get_client
+from zhiwei_common.llm import get_client
 
 
 # ==================== 配置 ====================

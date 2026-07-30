@@ -9,7 +9,7 @@ import json
 import subprocess
 import logging
 from pathlib import Path
-from .llm_client import llm_client
+from zhiwei_common.llm import llm_client
 
 logger = logging.getLogger("claude_preprocessor")
 

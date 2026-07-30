@@ -33,11 +33,11 @@ def do_capture(content: str, user_id: str, source: str = "飞书 /insight") -> t
 
 
 def do_knowledge_query(query: str, user_id: str, message_id: str, ctx, deep: bool = False) -> bool:
-    """知识库问答：rag_bridge 检索 + LLM 回答。deep=True 用扩展检索（研究确认路径）"""
+    """知识库问答：rag_client HTTP 检索 + LLM 回答。deep=True 用扩展检索（研究确认路径）"""
     ctx.reply_message(message_id, "🔍 正在检索知识库...")
 
-    from rag_bridge import get_context
-    context = get_context(query, top_k=10 if deep else 5)
+    from core.rag_client import get_rag_client
+    context = get_rag_client().get_context(query, top_k=10 if deep else 5)
 
     if not context:
         ctx.reply_message(message_id, "💡 知识库中未找到相关直接内容，知微将尝试根据通用知识回答。")
