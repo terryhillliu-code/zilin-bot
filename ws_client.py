@@ -3,6 +3,16 @@
 新增特性：
 - 📚 知识库检索 (RAG)：支持 /ask 命令和智能触发
 - 🧠 集成 klib 向量数据库
+
+2026-07-30 模块拆分：
+- ws_heartbeat.py         心跳监控 / 连接监控线程 / 断连告警
+- bus_consumer.py         MessageBus 消费线程
+- message_dedup.py        消息去重与限流状态
+- memory_cache_manager.py 记忆缓存过期管理
+- card_actions.py         卡片交互回调
+- agent_bridge.py         OpenClaw Agent 调用（含 chat_handler 降级）
+- ws_net.py               DNS 容错
+本文件保留：WebSocket 连接建立、事件回调注册、消息分发、主循环与模块组装。
 """
 
 # 加载全局密钥 (必须在最前面，在导入其他模块之前)
@@ -10,12 +20,6 @@ from zhiwei_common.secrets import load_secrets
 load_secrets(silent=True)
 
 import lark_oapi as lark
-from lark_oapi.api.im.v1 import (
-    CreateMessageRequest,
-    CreateMessageRequestBuilder,
-    CreateMessageRequestBody,
-    CreateMessageRequestBodyBuilder,
-)
 import json
 import re
 import subprocess
@@ -25,12 +29,11 @@ import tempfile
 import base64
 import threading
 import time
-from collections import defaultdict, deque
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import signal
 
 # 导入新模块
-from memory_manager import MemoryManager
 from task_logger import TaskLogger
 from message_log import message_log  # 入站消息日志
 from offline_recovery import init_offline_recovery, get_offline_recovery  # 离线消息恢复
@@ -48,16 +51,25 @@ from media_handler import (
 
 from command_handler import handle_text_async, show_help, get_session_id, get_quick_status, check_rate_limit
 
-from utils.model_routing import route_model_for_task
+# ========== 拆分模块 (2026-07-30) ==========
 
-# 使用统一共享包 (v57.0)
-from zhiwei_common.message_client import MessageBus
+# 消息去重与限流状态
+from message_dedup import processed_messages, user_last_request, RATE_LIMIT_SECONDS
+
+# 记忆缓存过期管理
+from memory_cache_manager import memory_cache, get_memory, cleanup_memory_cache
+
+# 心跳监控 / 连接监控（write_heartbeat 保留导出，供外部引用）
+import ws_heartbeat
+from ws_heartbeat import connection_status, record_message_event, write_heartbeat
+
+# MessageBus 消费线程
+from bus_consumer import start_bus_consumer
+
+# DNS 容错
+from ws_net import dns_resolve_with_retry, check_dns_available
 
 # ========== 全局状态 ==========
-
-# 限流
-user_last_request = defaultdict(float)
-RATE_LIMIT_SECONDS = 2
 
 # 语音待确认
 pending_voice = {}
@@ -69,48 +81,9 @@ pending_image = {}
 chat_history = {}
 MAX_HISTORY = 20
 
-# 记忆管理器缓存（user_id -> {manager, last_access_time}）
-# v69.0: 添加时间戳支持过期清理
-memory_cache = {}
-MEMORY_CACHE_EXPIRE_SECONDS = 3600  # 1小时未访问则清理
-
-# 消息去重 (deque 自动淘汰旧消息)
-processed_messages = deque(maxlen=500)
-
 # 线程池（根据 CPU 核心数动态设置，建议 3-5）
 _max_workers = min(5, (os.cpu_count() or 2))
 executor = ThreadPoolExecutor(max_workers=_max_workers, thread_name_prefix="msg_handler")
-
-# 连接状态监控 (ISSUE-003 / ISSUE-027 修复)
-# 简化版：仅监控业务事件，避免误判
-connection_status = {
-    "connected": True,
-    "last_event": time.time(),       # 业务事件（收到消息）
-}
-
-# 消息事件计数器 (2026-06-02 加固)
-# 用于 watchdog 区分"连接活着"和"真正在接收消息"
-message_event_count = 0
-
-# ========== WebSocket 心跳监控 (v44.4) ==========
-HEARTBEAT_FILE = os.path.expanduser("~/logs/ws_heartbeat.json")
-
-def write_heartbeat(conn_id: str = "", status: str = "connected"):
-    """写入心跳状态文件，供 watchdog 检测
-
-    2026-06-02 增强：加入消息事件计数，让 watchdog 能区分
-    "连接活着但 message loop 已死" 和 "连接正常工作" 的状态。
-    """
-    try:
-        with open(HEARTBEAT_FILE, "w") as f:
-            json.dump({
-                "timestamp": time.time(),
-                "conn_id": conn_id,
-                "status": status,
-                "message_events": message_event_count  # ⭐ 新增
-            }, f)
-    except Exception:
-        pass  # 心跳写入失败不影响主流程
 
 # 审批待确认 (T-056)
 pending_review = {}  # user_id -> task_id
@@ -185,32 +158,6 @@ from feishu_api import send_audio_reply as _send_audio_reply
 init_media_handler_with_audio(_send_audio_reply)
 
 
-def get_memory(user_id: str) -> MemoryManager:
-    """获取或创建用户的记忆管理器（v69.0: 添加时间戳）"""
-    current_time = time.time()
-    if user_id not in memory_cache:
-        memory_cache[user_id] = {
-            "manager": MemoryManager(user_id),
-            "last_access": current_time
-        }
-    else:
-        memory_cache[user_id]["last_access"] = current_time
-    return memory_cache[user_id]["manager"]
-
-
-def cleanup_memory_cache():
-    """清理过期的记忆管理器缓存（v69.0 新增）"""
-    current_time = time.time()
-    expired = []
-    for user_id, data in memory_cache.items():
-        if current_time - data.get("last_access", 0) > MEMORY_CACHE_EXPIRE_SECONDS:
-            expired.append(user_id)
-    for user_id in expired:
-        del memory_cache[user_id]
-    if expired:
-        print(f"[Cleanup] 清理 {len(expired)} 个过期记忆缓存")
-
-
 def cleanup_pending_images():
     """清理过期的待处理图片（10 分钟过期）"""
     current_time = time.time()
@@ -243,84 +190,8 @@ def get_history(user_id: str) -> str:
     return "\n".join(lines)
 
 
-# V2-203: 导入 ChatHandler 替代 OpenClaw
-from chat_handler import ChatHandler, chat_handler as _chat_handler_instance
-
-def get_chat_handler():
-    """获取 ChatHandler 实例"""
-    return _chat_handler_instance
-
-
-def call_openclaw_agent(message: str, session_id: str, agent: str = "main") -> str:
-    """
-    调用 OpenClaw Agent（真正的执行层）
-
-    v55.6 修复架构断裂：
-    - 真正调用 OpenClaw 容器的 agent 命令
-    - 如果 OpenClaw 不可用，降级到 chat_handler
-    """
-    import logging
-    logger = logging.getLogger(__name__)
-
-    # kill-switch: OPENCLAW_ENABLED=0 时直接走 chat_handler
-    if os.getenv("OPENCLAW_ENABLED", "1") != "1":
-        logger.info("OpenClaw 已禁用(OPENCLAW_ENABLED=0),直接走 chat_handler")
-        handler = get_chat_handler()
-        return handler.handle_sync(message, session_id, role=agent)
-
-    try:
-        # 构建命令
-        cmd = [
-            "docker", "exec", "clawdbot",
-            "openclaw", "agent",
-            "--agent", agent,
-            "--message", message,
-            "--session-id", f"zhiwei-{session_id}",
-            "--json"
-        ]
-
-        # 调用 OpenClaw
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120  # 2 分钟超时
-        )
-
-        if result.returncode != 0:
-            logger.warning(f"OpenClaw 返回错误: {result.stderr[:200]}")
-            # 降级到 chat_handler
-            handler = get_chat_handler()
-            return handler.handle_sync(message, session_id, role=agent)
-
-        # 解析 JSON 结果
-        try:
-            data = json.loads(result.stdout)
-            if data.get("status") == "ok" and data.get("result"):
-                payloads = data["result"].get("payloads", [])
-                if payloads and payloads[0].get("text"):
-                    return payloads[0]["text"]
-        except json.JSONDecodeError as e:
-            logger.warning(f"OpenClaw JSON 解析失败: {e}")
-
-        # 降级到 chat_handler
-        handler = get_chat_handler()
-        return handler.handle_sync(message, session_id, role=agent)
-
-    except subprocess.TimeoutExpired:
-        logger.warning("OpenClaw 调用超时，降级到 chat_handler")
-        handler = get_chat_handler()
-        return handler.handle_sync(message, session_id, role=agent)
-
-    except FileNotFoundError:
-        logger.warning("Docker 命令不可用，降级到 chat_handler")
-        handler = get_chat_handler()
-        return handler.handle_sync(message, session_id, role=agent)
-
-    except Exception as e:
-        logger.error(f"OpenClaw 调用异常: {e}")
-        handler = get_chat_handler()
-        return handler.handle_sync(message, session_id, role=agent)
+# V2-203 / v55.6: ChatHandler 与 OpenClaw 调用已拆分至 agent_bridge.py
+from agent_bridge import get_chat_handler, call_openclaw_agent
 
 # 初始化命令处理模块（需要 call_openclaw_agent 已定义）
 from command_handler import init_command_handler
@@ -361,10 +232,8 @@ def _trigger_self_heal(cmd: str, message_id: str, chat_id_hint: str = None):
 
 
 def do_p2_im_message_receive_v1(data) -> None:
-    global processed_messages, connection_status, message_event_count
-
-    # 递增消息事件计数器（2026-06-02 加固）
-    message_event_count += 1
+    # 递增消息事件计数器（2026-06-02 加固，状态在 ws_heartbeat 模块）
+    record_message_event()
 
     # 获取消息 ID 和类型
     message_id = "N/A"
@@ -496,159 +365,12 @@ def do_p2_im_message_receive_v1(data) -> None:
         traceback.print_exc()
 
 
-def do_p2_card_action_trigger_v1(data) -> None:
-    """处理卡片交互事件 (审批按钮 + v47.0 研究卡片)"""
-    try:
-        action = data.action
-        value = action.value  # 这是一个 dict，包含在卡片定义中
-        user_id = data.operator.user_id
-        message_id = data.context.open_message_id
-
-        action_type = value.get("action")
-        task_id = value.get("task_id")
-        plan_name = value.get("plan_name")
-
-        print(f"🔘 卡片交互：{action_type} for {plan_name or task_id} by {user_id}")
-
-        # ⭐ v47.0: 研究卡片回调处理
-        if action_type == "start_research":
-            topic = value.get("topic", "")
-            include_videos = value.get("include_videos", "true").lower() == "true"
-
-            print(f"[WSClient] 研究卡片确认: topic={topic}, videos={include_videos}")
-
-            reply_message(message_id, f"🚀 确认收到调研请求：「{topic}」\n已提交至巡检中心 (zhiwei-dev)，正在排队执行。")
-
-            # 统一入队 zhiwei-dev (backend='research')
-            from zhiwei_common import TaskStore
-            store = TaskStore()
-            
-            research_topic = topic
-            if include_videos:
-                research_topic += " --include-videos"
-
-            # v33.0: 根据研究主题自动路由模型
-            task_model = route_model_for_task(research_topic)
-            task_id = store.enqueue(research_topic, message_id=message_id, backend="research", model=task_model)
-            
-            # 记录用户映射
-            user_mappings_dir = os.path.expanduser("~/zhiwei-dev/user_mappings")
-            os.makedirs(user_mappings_dir, exist_ok=True)
-            with open(os.path.join(user_mappings_dir, f"task_{task_id}_user.json"), "w") as f:
-                json.dump({"user_id": user_id, "message_id": message_id, "source": "feishu"}, f)
-            
-            return
-
-        elif action_type == "cancel_research":
-            reply_message(message_id, "✅ 已取消研究")
-            return
-
-        # ⭐ 2026-07-26 P1: 自然语言路由确认回调（捕获/研究/撤销/取消）
-        elif action_type == "confirm_capture":
-            from commands.knowledge_commands import do_capture
-            from core.confirm_card import build_capture_receipt
-            from feishu_api import reply_interactive
-            text = value.get("text", "")
-            ok, info, filename = do_capture(text, user_id, source="飞书自然语言捕获")
-            if ok:
-                if not reply_interactive(message_id, build_capture_receipt(filename, info)):
-                    reply_message(message_id, f"✅ 已捕获: {filename}")
-            else:
-                reply_message(message_id, f"❌ 捕获失败: {info}")
-            return
-
-        elif action_type == "confirm_research":
-            from commands.nl_router import _confirm_research
-            from types import SimpleNamespace
-            ctx = SimpleNamespace(reply_message=reply_message)
-            _confirm_research(value.get("query", ""), user_id, message_id, ctx)
-            return
-
-        elif action_type == "undo_capture":
-            from pathlib import Path as _Path
-            fp = _Path(value.get("filepath", ""))
-            try:
-                if fp.name.startswith("raw_insight_") and fp.exists():
-                    fp.unlink()
-                    reply_message(message_id, f"↩️ 已撤销: {fp.name}")
-                else:
-                    reply_message(message_id, "⚠️ 文件不存在或不可撤销")
-            except Exception as e:
-                reply_message(message_id, f"❌ 撤销失败: {e}")
-            return
-
-        elif action_type == "cancel_nl_action":
-            reply_message(message_id, "已取消。")
-            return
-
-        elif action_type == "show_config_form":
-            # TODO: 显示详细配置表单
-            reply_message(message_id, "⚙️ 详细配置功能开发中...")
-            return
-
-        # 原有审批逻辑
-        if action_type in ["approve", "reject"]:
-            # 发送响应消息到 MessageBus
-            mb = MessageBus()
-            mb.publish(
-                sender=f"bot_{user_id}",
-                topic="plan_approval",
-                content=action_type,
-                metadata={
-                    "task_id": task_id,
-                    "plan_name": plan_name,
-                    "user_id": user_id,
-                    "timestamp": time.time()
-                }
-            )
-
-            # 更新卡片状态（可选，这里先简单回复一条消息）
-            reply_message(message_id, f"✅ 已收到您的「{ '批准' if action_type == 'approve' else '拒绝' }」操作。正在处理中...")
-
-    except Exception as e:
-        print(f"❌ 处理卡片回调失败：{e}")
-
-import socket
-import struct
-
-# ========== DNS 容错机制 (2026-06-02 加固) ==========
-
-def dns_resolve_with_retry(host: str, max_retries: int = 5, timeout: int = 3) -> str | None:
-    """DNS 解析容错：指数退避重试，IPv4 优先。
-
-    解决 macOS 在网络切换/VPN 环境下 DNS 解析不稳定导致的
-    WebSocket 无法连接问题。
-    """
-    for attempt in range(max_retries):
-        try:
-            # AF_INET = IPv4 优先，避免 IPv6 解析超时
-            result = socket.getaddrinfo(host, 443, socket.AF_INET)
-            ip = result[0][4][0]
-            if attempt > 0:
-                print(f"✅ DNS 解析成功：{host} -> {ip} (重试 {attempt+1} 次)")
-            else:
-                print(f"✅ DNS 解析成功：{host} -> {ip}")
-            return ip
-        except socket.gaierror as e:
-            delay = min(2 ** attempt, 16)  # 1s, 2s, 4s, 8s, 16s
-            print(f"⚠️ DNS 解析失败 ({attempt+1}/{max_retries})：{host} - {e}，{delay}s 后重试")
-            time.sleep(delay)
-    print(f"❌ DNS 解析最终失败：{host}，将在 WebSocket 重连时继续尝试")
-    return None
-
-
-def check_dns_available(host: str = "open.feishu.cn") -> bool:
-    """快速检查 DNS 是否可用，不阻塞"""
-    try:
-        socket.getaddrinfo(host, 443, socket.AF_INET)
-        return True
-    except socket.gaierror:
-        return False
+# 卡片交互回调（拆分至 card_actions.py）
+from card_actions import do_p2_card_action_trigger_v1
 
 
 def main():
     import time  # 模块级 time 在嵌套函数闭包中可能不可用 (Python 3.14)
-    from datetime import datetime  # 供 connection_monitor 使用
 
     # ⭐ DNS 预热：启动前尝试解析飞书域名，加速首次连接
     print("🔍 DNS 预热检查...")
@@ -728,280 +450,15 @@ def main():
     except Exception as e:
         print(f"⚠️ 告警用户设置失败: {e}")
 
-    # ISSUE-003: 断连监控和告警线程
+    # ISSUE-003: 断连监控和告警线程（拆分至 ws_heartbeat.py，依赖注入避免循环 import）
+    ws_heartbeat.start_connection_monitor(
+        get_offline_recovery=get_offline_recovery,
+        load_active_user=load_active_user,
+        cleanup_memory_cache=cleanup_memory_cache,
+    )
 
-    # 全局变量用于监控连接状态
-    # 告警状态文件路径
-    ALERT_STATE_FILE = os.path.expanduser("~/logs/ws_alert_state.json")
-
-    def load_alert_state() -> dict:
-        """加载告警状态"""
-        try:
-            if os.path.exists(ALERT_STATE_FILE):
-                with open(ALERT_STATE_FILE) as f:
-                    return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass  # 告警状态加载失败，使用默认值
-        return {"last_alert_time": 0, "alert_type": None}
-
-    def save_alert_state(state: dict):
-        """保存告警状态"""
-        try:
-            with open(ALERT_STATE_FILE, "w") as f:
-                json.dump(state, f)
-        except IOError:
-            pass  # 告警状态保存失败不影响主流程
-
-    def send_ws_alert(msg: str, alert_type: str = "disconnect") -> bool:
-        """发送 WebSocket 告警（通过钉钉，避免消耗飞书额度）"""
-        state = load_alert_state()
-        now = time.time()
-
-        # 告警频率控制：同一类型告警每小时最多发一次
-        if state.get("alert_type") == alert_type:
-            if now - state.get("last_alert_time", 0) < 3600:
-                print(f"⏭️ 告警频率限制，跳过推送：{alert_type}")
-                return False
-
-        # 尝试通过钉钉发送
-        try:
-            from zhiwei_common import DingTalkPusher
-            import yaml
-
-            config_path = os.path.expanduser("~/zhiwei-scheduler/config/settings.yaml")
-            with open(config_path) as f:
-                dt_conf = yaml.safe_load(f).get("push", {}).get("dingtalk", {})
-
-            if dt_conf.get("enabled"):
-                pusher = DingTalkPusher(dt_conf["webhook"], dt_conf["secret"])
-                pusher.send_text(msg)
-                print(f"📱 WebSocket 告警已发送: {msg[:50]}...")
-
-                # 更新告警状态
-                save_alert_state({
-                    "last_alert_time": now,
-                    "alert_type": alert_type
-                })
-                return True
-            else:
-                print("⚠️ 钉钉未启用，无法发送告警")
-        except Exception as e:
-            print(f"❌ 发送 WebSocket 告警失败: {e}")
-
-        return False
-
-    def connection_monitor():
-        """连接监控线程 - 优化版 (v44.5, 2026-06-02 加固)
-
-        功能：
-        1. 每分钟写入心跳文件（供 watchdog 检测）
-        2. 业务消息空闲时记录日志（不发送钉钉告警，避免误报）
-        3. ⭐ 离线恢复检测：长时间空闲后恢复时尝试恢复离线消息
-        4. ⭐ v48.0: 定期清理 memory_cache（每10分钟）
-        5. ⭐ 2026-06-02: 僵尸连接检测（心跳正常但不收消息时主动重连）
-        """
-        # 启动时立即写入心跳
-        write_heartbeat(status="starting")
-
-        # 离线检测状态
-        was_idle_long = False  # 上一次检查时是否长时间空闲
-        cleanup_counter = 0  # 清理计数器
-        last_event_count = message_event_count  # 上次检查时的事件计数
-        zombie_idle_start = None  # 僵尸连接开始时间
-
-        while True:
-            time.sleep(60)  # 每分钟检查一次
-            now = time.time()
-            event_idle = now - connection_status.get("last_event", now)
-
-            # ⭐ 僵尸连接检测：如果事件计数不增长
-            current_count = message_event_count
-            if current_count == last_event_count:
-                if zombie_idle_start is None:
-                    zombie_idle_start = now  # 开始计时
-            else:
-                zombie_idle_start = None  # 有消息来了，重置
-                last_event_count = current_count
-
-            # 连续 2 小时没收到消息——记录但不再重启（H1修复: 原版误杀健康空闲）
-            ZOMBIE_THRESHOLD = 7200  # 2 小时
-            if zombie_idle_start and (now - zombie_idle_start) > ZOMBIE_THRESHOLD:
-                zombie_minutes = int((now - zombie_idle_start) / 60)
-                print(f"🚨 僵尸连接检测：{zombie_minutes} 分钟未收到任何消息，主动断开重连...")
-                zombie_idle_start = now  # H1修复: 重置计时，每2h记一次不刷屏
-
-                # 记录到日志
-                with open(os.path.expanduser("~/logs/connection_monitor.log"), "a") as f:
-                    f.write(f"{datetime.now().isoformat()}: ZOMBIE detected, forcing reconnect after {zombie_minutes}min\n")
-
-                # H1修复: 不再自杀重启——真实僵尸由 SDK keepalive ping 自动重连，进程死亡由 scheduler 心跳 watchdog 兜底
-
-            # 写入心跳（即使空闲也写入，表示服务存活）
-            write_heartbeat(status="connected")
-
-            # ⭐ v48.0: 每10分钟清理 memory_cache
-            cleanup_counter += 1
-            if cleanup_counter >= 10:
-                cleanup_counter = 0
-                try:
-                    cleanup_memory_cache()
-                except Exception as e:
-                    print(f"⚠️ memory_cache 清理异常: {e}")
-
-            # 检测长时间空闲（超过 5 分钟）
-            is_idle_long = event_idle > 300  # 5 分钟
-
-            # ⭐ 离线恢复检测：从长时间空闲恢复到活跃
-            if was_idle_long and not is_idle_long:
-                # 刚从长时间空闲恢复，尝试离线恢复
-                offline_recovery = get_offline_recovery()
-                if offline_recovery and offline_recovery.should_recover(threshold_seconds=300):
-                    idle_minutes = int(event_idle / 60)
-                    print(f"🔄 检测到离线恢复（空闲 {idle_minutes} 分钟），尝试恢复离线消息...")
-
-                    # 获取最近活跃用户
-                    active_user = load_active_user()
-                    if active_user:
-                        try:
-                            # 获取私聊会话 ID
-                            chat_id = offline_recovery.get_p2p_chat_id(active_user)
-                            if chat_id:
-                                # 恢复离线消息
-                                since_time = offline_recovery.state.get("last_disconnect_time", time.time() - 3600)
-                                messages = offline_recovery.recover_messages(chat_id, since_time)
-                                if messages:
-                                    print(f"📬 恢复了 {len(messages)} 条离线消息")
-                                    # 处理恢复的消息（模拟消息事件）
-                                    for msg in messages[-5:]:  # 最多处理最近 5 条
-                                        print(f"   📨 离线消息: {msg.content[:50] if msg.content else 'N/A'}...")
-                        except Exception as e:
-                            print(f"⚠️ 离线恢复失败: {e}")
-
-                    # 记录重连时间
-                    offline_recovery.record_reconnect()
-
-            # 长时间空闲时记录断连时间（必须在 was_idle_long 更新之前检查）
-            if is_idle_long and not was_idle_long:
-                offline_recovery = get_offline_recovery()
-                if offline_recovery:
-                    offline_recovery.record_disconnect()
-
-            # 更新空闲状态
-            was_idle_long = is_idle_long
-
-            # 业务消息空闲超过 30 分钟才记录日志（不再发送钉钉告警）
-            if event_idle > 1800:  # 30 分钟
-                idle_minutes = int(event_idle / 60)
-
-                # 仅记录到日志，不发送钉钉告警
-                with open(os.path.expanduser("~/logs/connection_monitor.log"), "a") as f:
-                    f.write(f"{datetime.now().isoformat()}: Business idle {idle_minutes}min (normal)\n")
-
-                print(f"💡 业务消息空闲 {idle_minutes} 分钟（正常现象，连接通过 ping 保持）")
-
-                # 重置时间戳，避免频繁记录日志
-                connection_status["last_event"] = now
-
-    # 启动监控线程
-    monitor_thread = threading.Thread(target=connection_monitor, daemon=True)
-    monitor_thread.start()
-
-    # 启动统一的 MessageBus 消费线程
-    def poll_message_bus():
-        import feishu_api as _feishu_api_mod
-        mb = MessageBus()
-        print("💡 MessageBus 消费线程已启动")
-        
-        # 启动时发布自检消息（带冷却期检查）
-        try:
-            COOLDOWN_MINUTES = 30  # 30 分钟内不重复发送
-            with mb._connect() as conn:
-                cursor = conn.execute(
-                    """SELECT created_at FROM messages
-                       WHERE sender = 'bot/startup' AND topic = 'feishu_notification'
-                       ORDER BY created_at DESC LIMIT 1"""
-                )
-                row = cursor.fetchone()
-                if row:
-                    from datetime import timedelta
-                    last_startup = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
-                    if datetime.now() - last_startup < timedelta(minutes=COOLDOWN_MINUTES):
-                        print(f"⏸️ 跳过启动通知（{COOLDOWN_MINUTES}分钟冷却期内，上次: {row[0]}）")
-                    else:
-                        raise Exception("cooldown expired")  # 跳转到 publish
-                else:
-                    raise Exception("no previous startup")
-        except:
-            try:
-                mb.publish(
-                    sender="bot/startup",
-                    topic="feishu_notification",
-                    content=f"🤖知微机器人已重启\n时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nAppID: {APP_ID[:8]}...",
-                    metadata={"user_id": load_active_user()}
-                )
-            except: pass
-
-        while True:
-            try:
-                # 消费飞书通知和审批主题 (v55.0: 包含 legacy notification)
-                topics = ["feishu_notification", "feishu_card_notification", "notification"]
-                for topic in topics:
-                    try:
-                        messages = mb.consume_pending(topic=topic, limit=5)
-                        if messages:
-                            print(f"📥 MessageBus: 发现 {len(messages)} 条新消息 ({topic})")
-                        for msg in messages:
-                            print(f"🔄 MessageBus: 正在处理消息 {msg['id']}...")
-                            try:
-                                meta = json.loads(msg["metadata"] or "{}")
-                                target_user = meta.get("user_id") or last_active_user.get("user_id") or load_active_user()
-                                
-                                if not target_user:
-                                    print(f"⚠️ MessageBus: 消息 {msg['id']} 找不到目标用户，标记为失败")
-                                    mb.mark_failed(msg["id"], "No target user found")
-                                    continue
-
-                                if topic in ["feishu_notification", "notification"]:
-                                    success = _feishu_api_mod.send_direct_message(target_user, msg["content"])
-                                else:
-                                    # 卡片消息 - 自动识别 ID 类型
-                                    id_type = "user_id"
-                                    if target_user.startswith("ou_"):
-                                        id_type = "open_id"
-                                    elif target_user.startswith("on_"):
-                                        id_type = "union_id"
-                                    elif target_user.startswith("oc_"):
-                                        id_type = "chat_id"
-
-                                    request = CreateMessageRequest.builder() \
-                                        .receive_id_type(id_type) \
-                                        .request_body(CreateMessageRequestBody.builder()
-                                            .receive_id(target_user)
-                                            .content(msg["content"])
-                                            .msg_type("interactive")
-                                            .build()) \
-                                        .build()
-                                    response = client.im.v1.message.create(request)
-                                    success = response.success()
-
-                                if success:
-                                    mb.mark_sent(msg["id"])
-                                    print(f"✅ MessageBus: 消息 {msg['id']} 已成功推送到飞书")
-                                else:
-                                    mb.mark_failed(msg["id"], "Feishu API delivery failed")
-                                    print(f"❌ MessageBus: 消息 {msg['id']} 推送失败")
-                            except Exception as em:
-                                print(f"❌ MessageBus: 处理单条消息 {msg['id']} 异常：{em}")
-                                mb.mark_failed(msg["id"], str(em))
-                    except Exception as et:
-                        print(f"❌ MessageBus: [Topic: {topic}] 轮询异常：{et}")
-                time.sleep(2)
-            except Exception as e:
-                print(f"❌ MessageBus: 主循环异常：{e}")
-                time.sleep(5)
-
-    msg_bus_thread = threading.Thread(target=poll_message_bus, daemon=True)
-    msg_bus_thread.start()
+    # 启动统一的 MessageBus 消费线程（拆分至 bus_consumer.py，依赖注入避免循环 import）
+    start_bus_consumer(client, APP_ID, last_active_user, load_active_user)
 
     try:
         cli.start()
