@@ -292,7 +292,7 @@ class ResearchResultCard:
                     "tag": "div",
                     "text": {
                         "tag": "lark_md",
-                        "content": "#### 💡 NotebookLM 进阶指令\n请将上述文件夹内的文件导入 NotebookLM 后，使用提示词开启深度研究。"
+                        "content": "#### 💡 Gemini Notebook 进阶指令\n请将上述文件夹内的文件导入 Gemini Notebook（https://notebooklm.google）后，使用提示词开启深度研究。"
                     }
                 },
                 {

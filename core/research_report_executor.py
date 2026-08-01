@@ -127,7 +127,7 @@ class ResearchReportExecutor:
                 try:
                     summary_path = preprocessor.preprocess(topic)
                     logger.info(f"预处理摘要已保存: {summary_path}")
-                    reply_func(message_id, f"✅ Claude 预处理完成，摘要已保存到 {summary_path}\n\n⏳ 正在上传到 NotebookLM 并执行深度分析...")
+                    reply_func(message_id, f"✅ Claude 预处理完成，摘要已保存到 {summary_path}\n\n⏳ 正在整理素材包，随后可一键导入 Gemini Notebook 做深度分析...")
                 except Exception as e:
                     logger.error(f"预处理失败: {e}")
                     reply_func(message_id, f"⚠️ Claude 预处理失败（{e}），继续执行原有流程...")
@@ -274,7 +274,7 @@ class ResearchReportExecutor:
                 success, final_report = llm_client.call(
                     role="research",
                     message=final_prompt,
-                    system_prompt="你是知微系统内置的首席硬件系统架构师，请忽略 NotebookLM 专用的格式要求，直接输出最终的精美 Markdown 排版研报。字数不限，要深度且数据详实。",
+                    system_prompt="你是知微系统内置的首席硬件系统架构师，请忽略 Gemini Notebook 专用的格式要求，直接输出最终的精美 Markdown 排版研报。字数不限，要深 度且数据详实。",
                     timeout=300
                 )
                 
@@ -302,7 +302,7 @@ class ResearchReportExecutor:
                 card_content += f"💡 需要更多学术论文？发送 `/research {actual_topic} --deep`\n\n"
 
             card_content += "---\n"
-            card_content += "#### 💡 NotebookLM 进阶指令\n"
+            card_content += "#### 💡 Gemini Notebook 进阶指令\n"
             card_content += f"```markdown\n{super_prompt}\n```"
 
             reply_card_func(message_id, f"📑 {actual_topic} 研究情报就绪", card_content)

@@ -9,11 +9,11 @@
 3. **系统维护**：熟悉知微系统的核心组件：
     - `zhiwei-bot`: 核心交互层（基于本地 WebSocket 和 ChatHandler）。
     - `zhiwei-rag`: 知识检索层（基于 LanceDB 和语义向量）。
-    - `arxiv-paper-analyzer`: 论文自动分析与导出（现已集成 NotebookLM 联动流）。
-4. **NotebookLM 联动流维护**：
+    - `arxiv-paper-analyzer`: 论文自动分析与导出（集成 Gemini Notebook 联动流）。
+4. **Gemini Notebook 联动流维护**：
     - 熟悉拦截器位于 `command_handler.py`。
     - 熟悉检索逻辑位于 `manage.py`。
-    - 熟悉模板引擎位于 `notebooklm_templates.yaml`。
+    - 熟悉模板引擎位于 `arxiv-paper-analyzer/backend/app/notebooklm_templates.yaml`。
 
 ## 协作规范
 - 虽然你不再通过 [ACTION] 触发复杂的外部流程，但你依然负责通过代码实现来优化这些流程。
