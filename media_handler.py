@@ -18,14 +18,19 @@ from typing import Optional
 try:
     from zhiwei_common import get_api_key
 except ImportError:
-    sys.path.insert(0, str(Path.home() / "zhiwei-common"))
     from zhiwei_common import get_api_key
 
-# 引入 distiller 以便复用 ASR 逻辑 (v6.0)
+# 引入 distiller 以便复用 ASR 逻辑 (v6.0; v3.3 增 mimo-asr + MLX 本地)
 try:
-    from scripts.douyin_distiller import DashScopeASRTranscriber
+    from scripts.douyin_distiller import (
+        DashScopeASRTranscriber, MimoASRTranscriber,
+        LocalMLXWhisperTranscriber, AppConfig,
+    )
 except ImportError:
     DashScopeASRTranscriber = None
+    MimoASRTranscriber = None
+    LocalMLXWhisperTranscriber = None
+    AppConfig = None
 
 # 引入 Mimo TTS 客户端
 try:
@@ -118,35 +123,28 @@ def compress_image_base64(image_path: str, max_size: int = 800) -> str:
 
 
 def analyze_image_base64(image_base64: str, question: str = None) -> str:
-    """调用统一LLM客户端分析图片"""
+    """调用统一多模态出口分析图片
+
+    2026-07-31 修复：旧实现构建了 messages（含 image_url）却从未使用，
+    实际只把文本 prompt 传给 client.call("vision", ...)——图片从没进过模型，
+    所谓"图片分析"实为凭文本瞎编。现改调 zhiwei_common.llm.call_vision，
+    真正将图片送入模型（已实测验证）。
+    """
     try:
-        # 使用统一LLM客户端，自动路由到qwen-vl-max多模态模型
-        from zhiwei_common.llm import get_client
-        client = get_client()
+        from zhiwei_common.llm import call_vision
 
         prompt = question if question else "请分析这张图片，描述内容并提取关键信息。"
         print(f"🖼️ 调用多模态模型分析图片... 问题: {prompt[:30]}...")
 
-        # 构建多模态消息
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
-            ]
-        }]
+        success, content = call_vision(
+            prompt, image_b64=image_base64, image_mime="image/jpeg", max_tokens=2000
+        )
 
-        # 直接调用，多模态需要特殊处理
-        result = client.call("vision", prompt, max_tokens=2000)
-
-        if result.get("success"):
-            analysis = result["content"]
-            print(f"✅ 图片分析完成: {len(analysis)} 字符")
-            return f"🖼️ **图片分析结果**\n\n{analysis}"
-        else:
-            error = result.get("error", "未知错误")
-            print(f"❌ 图片分析失败: {error}")
-            return f"❌ 图片分析失败: {error}"
+        if success:
+            print(f"✅ 图片分析完成: {len(content)} 字符")
+            return f"🖼️ **图片分析结果**\n\n{content}"
+        print(f"❌ 图片分析失败: {content}")
+        return f"❌ 图片分析失败: {content}"
     except Exception as e:
         print(f"❌ 图片分析异常: {e}")
         return f"❌ 图片分析异常: {str(e)}"
@@ -318,6 +316,68 @@ def handle_video_async(text: str, message_id: str, user_id: str):
     thread.start()
 
 
+def _wants_vision(text: str) -> bool:
+    """判断用户是否请求视觉分析(v3.0)
+
+    触发方式: 消息以 /video vision 开头,或消息同时含视频链接与「视觉分析」/「抽帧」关键词。
+    典型场景: 看完视频后把链接带关键词再发一次,触发抽帧+VLM 图表提取并重蒸馏。
+    """
+    stripped = text.strip().lower()
+    if stripped.startswith("/video vision"):
+        return True
+    return any(kw in text for kw in ("视觉分析", "抽帧"))
+
+
+def _extract_md_section(text: str, heading: str, max_chars: int = 500) -> str:
+    """从 markdown 里取指定二级标题下的正文（不含子标题以后的内容）"""
+    pattern = re.compile(
+        r"^##\s*" + re.escape(heading) + r"\s*$(.*?)(?=^##\s|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    m = pattern.search(text)
+    if not m:
+        return ""
+    body = m.group(1).strip()
+    # 去掉空行与 Obsidian 内链语法，保留可读要点
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    body = "\n".join(lines)
+    return body[:max_chars].rstrip()
+
+
+def _build_video_digest(output_path: str, title: str) -> str:
+    """⭐ N2 (2026-07-31): 视频处理完成后直接回推要点摘要
+
+    背景：旧行为只回“文件已生成 + 请到 Obsidian 查看”，而粘链接是用户
+    88% 的真实用途（入站消息统计），每次都要自己去翻笔记，闭环断在最后一步。
+    现从生成的笔记中抽“核心洞察/摘要/行动建议”回推；读文件失败则降级为原行为。
+    """
+    header = f"✅ 视频知识笔记已生成\n\n📝 **{title}**"
+    try:
+        content = Path(output_path).read_text(errors="ignore")
+    except Exception as e:
+        logger.warning(f"摘要抽取失败，降级回文件路径: {e}")
+        return f"{header}\n\n📁 {output_path}"
+
+    parts = [header]
+    for label, heading, limit in (
+        ("💡 核心洞察", "核心洞察", 420),
+        ("📊 量化指标", "量化指标", 200),
+        ("✅ 行动建议", "行动建议", 260),
+    ):
+        body = _extract_md_section(content, heading, limit)
+        if body:
+            parts.append(f"{label}\n{body}")
+
+    # 核心洞察缺失时用“摘要”兜底，避免只回一个标题
+    if len(parts) == 1:
+        fallback = _extract_md_section(content, "摘要", 420)
+        if fallback:
+            parts.append(f"📄 摘要\n{fallback}")
+
+    parts.append(f"📁 完整笔记: {output_path}")
+    return "\n\n".join(parts)
+
+
 def process_video(text: str, message_id: str = None) -> str:
     """处理视频分析 - 调用宿主机 Distiller
 
@@ -325,6 +385,7 @@ def process_video(text: str, message_id: str = None) -> str:
     - 详细错误分类和记录
     - 自动重试临时性错误
     - 严重错误飞书告警
+    v3.0 新增：按需视觉分析(--vision,抽帧+VLM 图表提取)
     """
     video_history = None
     url = None
@@ -354,15 +415,28 @@ def process_video(text: str, message_id: str = None) -> str:
             "--output-dir", os.path.expanduser("~/Documents/ZhiweiVault/70-79_个人笔记/75_视频笔记_Video-Distill"),
         ]
 
+        # ⭐ v3.0: 按需视觉分析(--vision 隐含 --force,重跑时复用转写缓存)
+        vision_mode = _wants_vision(text)
+        if vision_mode:
+            cmd.append("--vision")
+            logger.info("🔍 视觉分析模式: 抽帧 + VLM 图表提取")
+
         # 根据平台选择 cookies 策略
         if "bilibili.com" in url or "b23.tv" in url:
-            # B站需要从浏览器读取 cookies（绕过412反爬）
+            # B站需要从浏览器读取 cookies（AI 字幕需登录态；网页解析已改走官方 API）
             cmd.extend(["--cookies-from-browser", "chrome"])
         elif "douyin.com" in url or "iesdouyin.com" in url:
             # 抖音使用 cookies 文件
             cmd.extend(["--cookies", os.path.expanduser("~/zhiwei-bot/secrets/douyin_cookies.txt")])
-        # YouTube 及其他平台：不带 cookies（yt-dlp 默认即可，避免无谓加载
-        # 抖音 cookies 文件而在日志里产生 "cookie" 字样干扰错误归类）
+        elif "youtube.com" in url or "youtu.be" in url:
+            # ⭐ v3.1: YouTube 需登录 cookies 才能过 bot 检测拿字幕列表；
+            # 网络出口由 distiller 内部自动走日本 VM 的 SOCKS5 隔离(平台感知)。
+            yt_ck = os.path.expanduser("~/zhiwei-bot/secrets/youtube_cookies.txt")
+            if os.path.exists(yt_ck):
+                cmd.extend(["--cookies", yt_ck])
+            else:
+                logger.warning("YouTube cookies 缺失，字幕提取可能被 bot 检测拦截")
+        # 其余平台：不带 cookies（避免无谓加载抖音 cookies 而在日志里产生 "cookie" 字样干扰错误归类）
 
         logger.info(f"🎬 调用 Distiller: {' '.join(cmd[:3])}...")
 
@@ -384,7 +458,9 @@ def process_video(text: str, message_id: str = None) -> str:
             logger.warning(f"Distiller 依赖预检查异常，降级继续执行: {_e}")
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+            # ⭐ v3.0: vision 模式含视频下载+抽帧+逐帧 VLM,耗时更长
+            _timeout = 1800 if vision_mode else 900
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=_timeout)
         except subprocess.TimeoutExpired as e:
             # ⭐ 2026-07-27: 超时时记录 partial output，便于定位卡在哪一步
             if e.stdout:
@@ -438,7 +514,9 @@ def process_video(text: str, message_id: str = None) -> str:
                 # 记录成功
                 if video_history:
                     video_history.record_done(url, title, output_path)
-                return f"✅ 视频知识笔记已生成\n\n📁 文件: {output_path}\n\n请到 Obsidian Inbox 查看完整内容。"
+                # ⭐ 2026-07-31 N2: 不再只回文件路径（旧行为要求用户自己去
+                # Obsidian 翻），直接把笔记里的要点摘要回推，形成闭环。
+                return _build_video_digest(output_path, title)
             return f"✅ 视频处理完成\n\n{output[-500:]}"
 
         return f"⚠️ 视频处理完成但输出格式异常\n\n{output[-500:]}"
@@ -530,34 +608,43 @@ def download_audio(message_id: str, file_key: str) -> str:
 
 
 def transcribe_audio(audio_path: str) -> str:
-    """转录语音文件为文字（使用统一的 DashScope ASR）
-    
-    v6.0: 移除本地重复逻辑，改为调用 douyin_distiller.DashScopeASRTranscriber
-    受益于 v5.9 的增强，现在支持详细错误捕获。
+    """转录语音文件为文字
+
+    v3.3 (2026-07-31): 原单用 DashScope, 但 DASHSCOPE_API_KEY 已 401 失效,
+    飞书语音消息识别一直静默失败。改为 mimo-asr 云端首选(短语音实测 4.7s/60s),
+    本地 MLX Whisper 兜底——两者都不依赖已死的 DashScope key。
     """
-    if not DashScopeASRTranscriber:
-        logger.error("DashScopeASRTranscriber not found in distiller")
-        return None
-
+    from pathlib import Path as _P
+    audio_obj = _P(audio_path)
     try:
-        # 获取 API key（使用统一的延迟加载）
-        api_key = get_api_key(["BAILIAN_API_KEY", "CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY"])
-        if not api_key:
-            logger.error("API Key 未配置")
-            return None
+        cfg = AppConfig() if AppConfig else None
 
-        transcriber = DashScopeASRTranscriber(api_key)
-        audio_path_obj = Path(audio_path)
-        
-        # 执行转录
-        result = transcriber.transcribe(audio_path_obj)
-        
-        if result.full_text:
-            return result.full_text
-        else:
-            if result.error_details:
-                logger.error(f"ASR 详细报错: {result.error_details}")
-            return None
+        # 1. mimo-asr 云端首选(飞书语音多为短语音, mimo 快且准)
+        if MimoASRTranscriber and cfg and getattr(cfg, "mimo_api_key", ""):
+            try:
+                tr = MimoASRTranscriber(cfg.mimo_api_key, cfg.mimo_api_base, cfg.mimo_asr_model)
+                res = tr.transcribe(audio_obj)
+                if res and res.full_text:
+                    logger.info(f"飞书语音 mimo-asr 成功: {len(res.full_text)} 字")
+                    return res.full_text
+                logger.warning("mimo-asr 空结果, 降级本地 MLX")
+            except Exception as e:
+                logger.warning(f"mimo-asr 失败: {e}, 降级本地 MLX")
+
+        # 2. 本地 MLX Whisper 兜底(免费, 不依赖云端 key)
+        if LocalMLXWhisperTranscriber:
+            try:
+                local = LocalMLXWhisperTranscriber(getattr(cfg, "local_asr_model", "small") if cfg else "small")
+                if local.is_available():
+                    res = local.transcribe(audio_obj)
+                    if res and res.full_text:
+                        logger.info(f"飞书语音 本地 MLX 成功: {len(res.full_text)} 字")
+                        return res.full_text
+            except Exception as e:
+                logger.error(f"本地 MLX 也失败: {e}")
+
+        logger.error("语音转写全部失败(mimo-asr + 本地 MLX)")
+        return None
 
     except Exception as e:
         logger.error(f"ASR 转录异常: {e}")

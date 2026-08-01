@@ -8,9 +8,8 @@ import os
 import sys
 import json
 
-# 添加路径
+# 添加路径（2026-07-31: 仅保留自指；zhiwei-dev 已退役，TaskStore 改走正式包）
 sys.path.insert(0, os.path.expanduser("~/zhiwei-bot"))
-sys.path.insert(0, os.path.expanduser("~/zhiwei-dev"))
 
 # 模拟全局变量
 test_results = []
@@ -135,7 +134,7 @@ def test_voice_task_store():
 def test_task_store():
     """测试 /dev 依赖"""
     try:
-        from task_store import TaskStore
+        from zhiwei_common import TaskStore
         store = TaskStore()
         recent = store.list_recent(5)
         print(f"最近任务: {len(recent)} 条")
@@ -148,12 +147,14 @@ def test_task_store():
 def test_rag_bridge():
     """测试 /ask 依赖 (RAG)"""
     try:
-        from rag_bridge import is_available, get_context
-        available = is_available()
+        # 2026-07-31: 直调 core.rag_client（rag_bridge shim 已删）
+        from core.rag_client import get_rag_client
+        client = get_rag_client()
+        available = client.is_available()
         print(f"RAG 可用: {available}")
         if available:
             # 简单查询测试
-            context = get_context("测试", top_k=1)
+            context = client.get_context("测试", top_k=1)
             print(f"检索结果长度: {len(context) if context else 0}")
         return True
     except Exception as e:

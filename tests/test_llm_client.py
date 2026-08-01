@@ -15,8 +15,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-# 添加项目路径
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "zhiwei-common"))
+# 项目路径无需手工补（2026-07-31: zhiwei-common 已 editable 安装于各 venv）
 
 
 def test_circuit_breaker_triggers_at_3_fails():

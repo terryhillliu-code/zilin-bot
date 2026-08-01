@@ -2,10 +2,11 @@
 """
 ASR 服务健康检查
 
-检查项目：
-1. DashScope ASR API 可用性
-2. 本地 MLX Whisper 可用性
-3. API Key 配置状态
+检查项目（v3.3 重排: mimo-asr 为主用引擎）：
+1. mimo-asr 云端可用性(小米 MiMo, 当前主用)
+2. 本地 MLX Whisper 可用性(兜底)
+3. DashScope ASR 可用性(已退居次要, key 可能 401)
+4. API Key 配置状态
 
 用法：
     python scripts/asr_health_check.py
@@ -21,10 +22,59 @@ from datetime import datetime
 
 # 添加路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path.home() / "zhiwei-common"))
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
+
+
+def check_mimo_asr() -> dict:
+    """检查 mimo-asr 云端可用性(v3.3 主用引擎)
+
+    实测探测: 用系统自带短音频转 16k 单声道 wav, 真调一次 mimo-asr。
+    比单测连通性更可靠——能真拿到转写才算健康。
+    """
+    result = {
+        "service": "mimo_asr",
+        "available": False,
+        "api_key_configured": False,
+        "api_key_valid": False,
+        "error": None,
+    }
+    try:
+        sys.path.insert(0, str(Path.home() / "zhiwei-bot" / "scripts"))
+        from douyin_distiller import MimoASRTranscriber, AppConfig
+
+        cfg = AppConfig()
+        if not getattr(cfg, "mimo_api_key", ""):
+            result["error"] = "MIMO_API_KEY not configured"
+            return result
+        result["api_key_configured"] = True
+
+        # 实测探测: 系统音效前 2 秒转 wav
+        import subprocess
+        import tempfile
+        test_src = "/System/Library/Sounds/Glass.aiff"
+        if not Path(test_src).exists():
+            # 无系统音频时退而只校验配置(不阻断)
+            result["available"] = True
+            result["error"] = "skipped probe (no test audio), config ok"
+            return result
+        wav = tempfile.mktemp(suffix=".wav")
+        subprocess.run(["ffmpeg", "-y", "-i", test_src, "-t", "2",
+                        "-ar", "16000", "-ac", "1", wav],
+                       capture_output=True, timeout=30)
+        tr = MimoASRTranscriber(cfg.mimo_api_key, cfg.mimo_api_base, cfg.mimo_asr_model)
+        # 直接调单片接口验证连通(系统音无人声, 能返回即 API 通)
+        tr._transcribe_clip(Path(wav))
+        result["available"] = True
+        result["api_key_valid"] = True
+        try:
+            os.unlink(wav)
+        except OSError:
+            pass
+    except Exception as e:
+        result["error"] = str(e)[:200]
+    return result
 
 
 def check_dashscope_asr() -> dict:
@@ -120,6 +170,7 @@ def check_api_keys() -> dict:
 
         asr_key = get_asr_key()
         result["keys"]["DASHSCOPE_API_KEY"] = bool(asr_key)
+        result["keys"]["MIMO_API_KEY"] = bool(os.environ.get("MIMO_API_KEY"))
 
         llm_key = get_llm_key()
         result["keys"]["LLM_KEY"] = bool(llm_key)
@@ -141,19 +192,23 @@ def run_health_check(json_output: bool = False) -> dict:
         "checks": []
     }
 
-    # 1. DashScope ASR
+    # 1. mimo-asr 云端(主用引擎)
+    results["checks"].append(check_mimo_asr())
+
+    # 2. DashScope ASR(已退居次要)
     results["checks"].append(check_dashscope_asr())
 
-    # 2. 本地 Whisper
+    # 3. 本地 Whisper(兜底)
     results["checks"].append(check_local_whisper())
 
-    # 3. API Keys
+    # 4. API Keys
     results["checks"].append(check_api_keys())
 
-    # 汇总状态
+    # 汇总状态: mimo-asr 或本地 Whisper 可用即健康(主链路+兜底)
+    # DashScope 已退居次要, 不影响健康判定
     asr_available = any(
         c.get("available") for c in results["checks"]
-        if c.get("service") in ["dashscope_asr", "local_whisper"]
+        if c.get("service") in ["mimo_asr", "local_whisper"]
     )
     results["status"] = "healthy" if asr_available else "degraded"
 

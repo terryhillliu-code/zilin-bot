@@ -21,6 +21,7 @@ from commands import (
     handle_agent_commands,
     handle_lark_commands,  # ⭐ v57.0
     handle_podcast_commands,  # ⭐ 播客管理命令
+    handle_youtube_commands,  # ⭐ v71 YouTube 频道追更
     ChatHandler
 )
 
@@ -77,6 +78,31 @@ def handle_text_async(text, user_id, message_id, user_role="user"):
             _ctx.reply_message(message_id, "已取消，语音内容已丢弃。")
             return
 
+    # ⭐ F2 2026-07-31 图片追问：pending_image 已存 base64（10 分钟有效）但从未被消费，
+    # 之前只能单次分析。现支持发图后紧接追问（/vision <问题> 或直接提问），
+    # 多轮追问复用同一张图，走 zhiwei_common.llm.call_vision 统一出口。
+    _pending_image = getattr(_ctx, 'pending_image', None)
+    if _pending_image is not None and user_id in _pending_image:
+        _img = _pending_image.get(user_id) or {}
+        _b64 = _img.get("base64") if isinstance(_img, dict) else None
+        _is_vision_cmd = text_lower.startswith("/vision")
+        _question = text_stripped[len("/vision"):].strip() if _is_vision_cmd else text_stripped
+        # 命令式总是追问；非命令则仅当不是其他斜杠命令/空消息时视为追问
+        if _b64 and _question and (_is_vision_cmd or not text_stripped.startswith("/")):
+            try:
+                from zhiwei_common.llm import call_vision
+                _ctx.reply_message(message_id, f"🖼️ 就刚才那张图追问：{_question[:40]}…")
+                ok, ans = call_vision(_question, image_b64=_b64, max_tokens=2000)
+                # 刷新时间戳，让多轮追问不致于 10 分钟窗口中途过期
+                if isinstance(_img, dict):
+                    _img["time"] = time.time()
+                _ctx.reply_message(
+                    message_id,
+                    f"🖼️ **图片追问**\n\n{ans}" if ok else f"❌ 图片追问失败: {ans}")
+                return
+            except Exception as e:
+                print(f"⚠️ 图片追问异常，降级走常规流程: {e}")
+
     try:
         # 1. 基础命令拦截
         if handle_dev_commands(text_lower, text_stripped, user_id, message_id, _ctx):
@@ -96,6 +122,10 @@ def handle_text_async(text, user_id, message_id, user_role="user"):
 
         # ⭐ 播客管理命令
         if handle_podcast_commands(text_lower, text_stripped, user_id, message_id, _ctx):
+            return
+
+        # ⭐ v71 YouTube 频道追更命令
+        if handle_youtube_commands(text_lower, text_stripped, user_id, message_id, _ctx):
             return
 
         # ⭐ v57.0 飞书操作命令
