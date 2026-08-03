@@ -133,7 +133,14 @@ def do_knowledge_query(query: str, user_id: str, message_id: str, ctx, deep: boo
         extra = "\n\n要求：综合上述材料给出有组织的要点，注明来源文档，并指出信息缺口。" if deep else ""
         prompt = f"{prefix}\n{context}\n\n问题：{query}{extra}"
 
-    response = llm_client.call_with_session("chat", prompt, f"ask-{user_id}")
+    # ⭐ 合规调整 (2026-08-03): deep=True 源于用户自然语言主动表达的深入分析意愿
+    # (research 意图，nl_router 已逐次确认)，故显式走 token_plan preview 深度模型；
+    # 普通查询 deep=False 走合规 Coding Plan(auto)。token_plan 失败会自动落回降级链。
+    prefer = "token_plan" if deep else "auto"
+    if deep:
+        ctx.reply_message(message_id, "🔬 已按你的要求启用深度分析模型...")
+    response = llm_client.call_with_session("chat", prompt, f"ask-{user_id}",
+                                            prefer_api=prefer)
     ctx.reply_message(message_id, response)
 
     # ⭐ F4: 若检索命中图表 chunk，额外回传原图（失败不影响上方回答）
