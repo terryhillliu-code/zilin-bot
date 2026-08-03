@@ -134,11 +134,13 @@ def do_knowledge_query(query: str, user_id: str, message_id: str, ctx, deep: boo
         prompt = f"{prefix}\n{context}\n\n问题：{query}{extra}"
 
     # ⭐ 合规调整 (2026-08-03): deep=True 源于用户自然语言主动表达的深入分析意愿
-    # (research 意图，nl_router 已逐次确认)，故显式走 token_plan preview 深度模型；
-    # 普通查询 deep=False 走合规 Coding Plan(auto)。token_plan 失败会自动落回降级链。
-    prefer = "token_plan" if deep else "auto"
+    # (research 意图，nl_router 已逐次确认)，显式指定深度引擎。
+    # 2026-08-03: preview 8/5 下线，深度引擎从 token_plan 切到 LongCat-2.0
+    # （已充值、实测质量与 preview 同档、按量付费条款允许自动化）。
+    # longcat 失败会自动落回 auto 降级链（Coding Plan 等），不会硬断。
+    prefer = "longcat" if deep else "auto"
     if deep:
-        ctx.reply_message(message_id, "🔬 已按你的要求启用深度分析模型...")
+        ctx.reply_message(message_id, "🔬 已按你的要求启用深度分析模型(LongCat-2.0)...")
     response = llm_client.call_with_session("chat", prompt, f"ask-{user_id}",
                                             prefer_api=prefer)
     ctx.reply_message(message_id, response)
