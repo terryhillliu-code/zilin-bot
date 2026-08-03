@@ -37,7 +37,6 @@ except ImportError:
 try:
     from zhiwei_common import get_api_key, get_asr_key, get_llm_key
 except ImportError:
-    sys.path.insert(0, str(Path.home() / "zhiwei-common"))
     from zhiwei_common import get_api_key, get_asr_key, get_llm_key
 
 # 配置日志
@@ -206,6 +205,9 @@ class DistilledKnowledge:
     action_items: list[str] = field(default_factory=list)
     references: list[str] = field(default_factory=list)
     related_concepts: list[str] = field(default_factory=list)  # 可关联知识
+    # 作者观点与论据（2026-08-01）: [{claim, timestamp, evidences:[{content, type, timestamp}]}]
+    # 忠实提取作者主张及其依据，不做评判；批判/关联深挖由用户按需触发（/read 批判层）
+    author_claims: list[dict] = field(default_factory=list)
     technical_reconstruction: dict = field(default_factory=lambda: {
         "architecture": "未提取",
         "tooling": "未提取",
@@ -255,12 +257,33 @@ class AppConfig:
         self.qwen_model = os.getenv("QWEN_MODEL", "qwen3.7-plus")
         self.asr_model = os.getenv("ASR_MODEL", "paraformer-realtime-v2")  # Recognition API 用 realtime 变体
         self.asr_policy = os.getenv("ASR_POLICY", "auto")
-        self.local_asr_model = os.getenv("LOCAL_ASR_MODEL", "small")
+        self.local_asr_model = os.getenv("LOCAL_ASR_MODEL", "medium")
+
+        # ⭐ v3.3 (2026-07-31): mimo-asr 云端语音识别(小米 MiMo)
+        # 背景: 原云端 ASR 走 DashScope, 但 DASHSCOPE_API_KEY 已 401 失效;
+        # mimo-asr 实测 4.7s/60s 音频、中英混合准确, 作为云端首选。
+        # OpenAI 兼容协议, chat/completions + input_audio(base64)。
+        self.mimo_api_key = os.getenv("MIMO_API_KEY", "")
+        self.mimo_api_base = os.getenv("MIMO_API_BASE", "https://token-plan-cn.xiaomimimo.com").rstrip("/")
+        self.mimo_asr_model = os.getenv("MIMO_ASR_MODEL", "mimo-v2.5-asr")
+
+        # ⭐ v3.5 (2026-07-31): YouTube VM 转写前哨
+        # VM 出海 12.7MB/s 但回程隧道仅 82KB/s——在 VM 侧下载+转写, 回传仅文本(几KB),
+        # YouTube 处理提速 ~155倍。前哨挂了降级回本地隧道下载路径。
+        self.yt_prefetch_url = os.getenv("ZHIWEI_YT_PREFETCH_URL", "http://127.0.0.1:18799")
 
         # 输出配置（视频笔记专属目录）
         base_output_dir = os.getenv("OUTPUT_DIR", "~/Documents/ZhiweiVault/70-79_个人笔记/75_视频笔记_Video-Distill")
         self.output_dir = Path(base_output_dir).expanduser()
         self.assets_dir = self.output_dir / "Assets"
+
+        # ⭐ v3.1 (2026-07-31): 海外平台代理与 cookies
+        # 本机直连 youtube.com DNS 不通; 靠阿里云日本 VM 的 SSH SOCKS5 隔离中转。
+        # 平台感知: 仅海外站点走代理, 抖音/B站直连(走代理反而慢且可能触发风控)。
+        self.overseas_proxy = os.getenv("ZHIWEI_VIDEO_PROXY", "socks5://127.0.0.1:18081")
+        self.youtube_cookies = os.getenv(
+            "YOUTUBE_COOKIES_FILE",
+            str(Path.home() / "zhiwei-bot" / "secrets" / "youtube_cookies.txt"))
 
         # 日志级别
         log_level = os.getenv("LOG_LEVEL", "INFO")
@@ -285,6 +308,15 @@ class AppConfig:
         logger.info(f"Assets directory: {self.assets_dir}")
 
 
+# 需要代理的海外平台(v3.1): 国内平台直连更快且避免风控
+OVERSEAS_PLATFORMS = {"youtube", "tiktok", "twitter", "unknown"}
+
+
+def needs_proxy(platform: str) -> bool:
+    """平台是否需要走海外代理"""
+    return platform in OVERSEAS_PLATFORMS
+
+
 # ============================================================================
 # 分享文本提取器
 # ============================================================================
@@ -305,7 +337,8 @@ class ShareTextExtractor:
         r'https?://v\.kuaishou\.com/[A-Za-z0-9]+',           # 快手
         r'https?://www\.kuaishou\.com/short-video/[A-Za-z0-9]+',
         r'https?://(?:www\.)?youtube\.com/watch\?v=[A-Za-z0-9_-]+', # YouTube
-        r'https?://youtu\.be/[A-Za-z0-9_-]+',                      # YouTube Short
+        r'https?://youtu\.be/[A-Za-z0-9_-]+',                      # YouTube 短链
+        r'https?://(?:www\.)?youtube\.com/shorts/[A-Za-z0-9_-]+',    # YouTube Shorts(2026-08-02 补: RSS 中 shorts 链接此前无法识别)
         r'https?://t\.cn/[A-Za-z0-9]+',                      # 微博短链
         r'https?://weibo\.com/tv/show/[A-Za-z0-9]+',         # 微博视频
     ]
@@ -390,6 +423,12 @@ class ProcessedStore:
             )''')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_video_id ON processed(video_id)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_resolved_url ON processed(resolved_url)')
+            # v3.0 (2026-07-31): 转写缓存 + 成本追踪列(自 video_cache.py 僵尸模块整合)
+            existing_cols = {row[1] for row in conn.execute('PRAGMA table_info(processed)')}
+            for col, ddl in [("transcript", "TEXT"), ("asr_engine", "TEXT"),
+                             ("tokens_used", "INTEGER DEFAULT 0"), ("cost_usd", "REAL DEFAULT 0")]:
+                if col not in existing_cols:
+                    conn.execute(f'ALTER TABLE processed ADD COLUMN {col} {ddl}')
 
     def _migrate_json(self):
         """迁移历史 JSON 数据到 SQLite"""
@@ -438,16 +477,34 @@ class ProcessedStore:
             row = conn.execute('SELECT * FROM processed WHERE resolved_url=?', (resolved_url,)).fetchone()
             return dict(row) if row else None
 
-    def mark_processed(self, resolved_url: str, output_path: str, title: str = "", video_id: str = None):
-        """标记已处理"""
+    def mark_processed(self, resolved_url: str, output_path: str, title: str = "", video_id: str = None,
+                       transcript: str = "", asr_engine: str = "", tokens_used: int = 0, cost_usd: float = 0.0):
+        """标记已处理(v3.0: 附带转写缓存与成本估算,供 --vision 重跑免二次 ASR)"""
         import sqlite3
         vid = video_id or self.extract_video_id(resolved_url)
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''INSERT OR REPLACE INTO processed
-                (video_id, resolved_url, title, output_path)
-                VALUES (?,?,?,?)''',
-                (vid or None, resolved_url, title, str(output_path)))
+                (video_id, resolved_url, title, output_path, transcript, asr_engine, tokens_used, cost_usd)
+                VALUES (?,?,?,?,?,?,?,?)''',
+                (vid or None, resolved_url, title, str(output_path),
+                 transcript, asr_engine, tokens_used, cost_usd))
         logger.info(f"Marked as processed: {vid or resolved_url}")
+
+    def get_cached_transcript(self, resolved_url: str, video_id: str = None) -> Optional[tuple]:
+        """读取缓存转写(video_id 优先)。返回 (transcript, asr_engine) 或 None"""
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = None
+            if video_id:
+                row = conn.execute('SELECT transcript, asr_engine FROM processed WHERE video_id=?',
+                                   (video_id,)).fetchone()
+            if (row is None or not row["transcript"]) and resolved_url:
+                row = conn.execute('SELECT transcript, asr_engine FROM processed WHERE resolved_url=?',
+                                   (resolved_url,)).fetchone()
+            if row and row["transcript"]:
+                return row["transcript"], row["asr_engine"] or "cache"
+        return None
 
     def get_stats(self) -> dict:
         """获取统计信息"""
@@ -622,10 +679,61 @@ class DouyinAPIClient:
 class MediaExtractor:
     """使用 yt-dlp 提取字幕和音频，抖音使用本地 API"""
 
-    def __init__(self, cookies_browser: Optional[str] = None, cookies_file: Optional[str] = None):
+    def __init__(self, cookies_browser: Optional[str] = None, cookies_file: Optional[str] = None,
+                 overseas_proxy: Optional[str] = None, youtube_cookies: Optional[str] = None):
         self.yt_dlp_path = self._find_yt_dlp()
         self.cookies_browser = cookies_browser
         self.cookies_file = cookies_file
+        # v3.1: 海外平台代理 + YouTube 专属 cookies(过 bot 检测)
+        self.overseas_proxy = overseas_proxy
+        self.youtube_cookies = youtube_cookies
+
+    def _net_opts(self, platform: str) -> dict:
+        """构造平台感知的 yt-dlp 网络选项(代理 + cookies)
+
+        v3.1: 海外平台走 SOCKS5(日本 VM 隔离); YouTube 优先用专属 cookies 文件。
+        v3.2: YouTube 音视频流解锁三件套——
+          1. POT: VM 上 bgutil provider(systemd bgutil-pot, 经隧道 14416→4416)生成
+             Proof-of-Origin Token, 绕过"Sign in to confirm you're not a bot"风控。
+             POT 必须与下载出口同 IP 生成, 故跑在 VM 侧(VM 本地 microsocks:18081
+             镜像本机隧道端口, 使 yt-dlp 透传的 --proxy 参数在两端都可解析)。
+          2. EJS: 允许从 GitHub 拉 n-challenge 求解脚本(缺它拿不到可用 format URL)。
+          3. cookies: 登录态过 bot 检测。
+        """
+        opts = {}
+        if needs_proxy(platform) and self.overseas_proxy:
+            opts["proxy"] = self.overseas_proxy
+            # 隧道链路抖动会导致下载中途断连(实测: N bytes read, M more expected),
+            # 加重试+断点续传兼容
+            opts.update({"retries": 10, "fragment_retries": 10,
+                         "socket_timeout": 30, "continuedl": True})
+        if platform == "youtube":
+            pot_base = os.getenv("ZHIWEI_POT_BASE_URL", "http://127.0.0.1:14416")
+            opts["extractor_args"] = {"youtubepot-bgutilhttp": {"base_url": [pot_base]}}
+            opts["remote_components"] = ["ejs:github"]
+        # cookies 优先级(2026-08-02 修正): 显式浏览器 > 显式文件 > YouTube 专属文件。
+        # 原顺序把 youtube_cookies.txt 默认文件排在浏览器之前, 该文件被 YouTube
+        # 服务端吊销后, --cookies-from-browser 永远轮不到生效, bot 检测全灭。
+        if self.cookies_browser:
+            opts["cookiesfrombrowser"] = (self.cookies_browser,)
+        elif self.cookies_file and Path(self.cookies_file).exists():
+            opts["cookiefile"] = self.cookies_file
+        elif platform == "youtube" and self.youtube_cookies and Path(self.youtube_cookies).exists():
+            opts["cookiefile"] = self.youtube_cookies
+        return opts
+
+    def _requests_proxies(self, platform: str) -> Optional[dict]:
+        """requests 库的代理字典(字幕文件下载等直调场景)
+
+        ⭐ socks5 → socks5h: 前者在本地解析 DNS(本机解不了 youtube.com 会直接失败),
+        后者把 DNS 解析也交给代理端(等价 curl --socks5-hostname)。
+        """
+        if needs_proxy(platform) and self.overseas_proxy:
+            proxy = self.overseas_proxy
+            if proxy.startswith("socks5://"):
+                proxy = proxy.replace("socks5://", "socks5h://", 1)
+            return {"http": proxy, "https": proxy}
+        return None
 
     def _find_yt_dlp(self) -> str:
         """查找 yt-dlp 可执行文件"""
@@ -657,10 +765,16 @@ class MediaExtractor:
         """提取平台字幕（如果有）
 
         v2.1: 抖音平台使用 DouyinAPIClient 获取文案作为字幕
+        v3.1: B站走官方 API(yt-dlp 网页解析必 412); YouTube 走代理+cookies
+              且容忍 format 不可用(PO Token 风控下字幕仍可取)
         """
         # ⭐ 抖音平台：使用本地 API 获取文案作为字幕
         if video_info.platform == "douyin":
             return self._extract_douyin_subtitle(video_info)
+
+        # ⭐ v3.1 B站：yt-dlp 网页解析被风控拦截(HTTP 412)，改走官方 player API
+        if video_info.platform == "bilibili":
+            return self._extract_bilibili_subtitle(video_info)
 
         # 其他平台：使用 yt-dlp
         import yt_dlp
@@ -674,17 +788,20 @@ class MediaExtractor:
             "writesubtitles": True,
             "writeautomaticsub": True,
             "subtitleslangs": ["zh-Hans", "zh", "zh-CN", "en"],
+            # ⭐ v3.1 关键: YouTube PO Token 风控下只剩 storyboard format,
+            # 不容忍会让 extract_info 直接抛异常，连字幕一起丢掉。
+            "ignore_no_formats_error": True,
         }
-
-        # 添加 cookies 支持
-        if self.cookies_file:
-            ydl_opts["cookiefile"] = self.cookies_file
-        elif self.cookies_browser:
-            ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
+        ydl_opts.update(self._net_opts(video_info.platform))
+        if ydl_opts.get("proxy"):
+            logger.info(f"Using overseas proxy: {ydl_opts['proxy']}")
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(video_info.resolved_url, download=False)
+                if not info:
+                    logger.info("No video info returned")
+                    return None
 
                 # 更新视频信息
                 video_info.title = info.get("title", "")
@@ -692,30 +809,117 @@ class MediaExtractor:
                 video_info.duration = info.get("duration", 0)
                 video_info.description = info.get("description", "")
 
-                # 获取字幕
-                subtitles = info.get("subtitles", {}) or info.get("automatic_captions", {})
-
-                if not subtitles:
+                # ⭐ v3.1 修复: 原实现 `subtitles or automatic_captions` 短路——
+                # 人工字幕非空但无中英文时不会回退到自动字幕。现合并两者,
+                # 人工字幕优先(质量更高)。
+                manual = info.get("subtitles") or {}
+                auto = info.get("automatic_captions") or {}
+                if not manual and not auto:
                     logger.info("No subtitles found")
                     return None
 
-                # 优先选择中文字幕
-                for lang in ["zh-Hans", "zh", "zh-CN"]:
-                    if lang in subtitles:
-                        subtitle_url = subtitles[lang][0]["url"]
-                        return self._download_and_parse_subtitles(subtitle_url)
+                pref_langs = ["zh-Hans", "zh", "zh-CN", "zh-Hant", "en", "en-orig"]
+                for pool, pool_name in ((manual, "manual"), (auto, "auto")):
+                    for lang in pref_langs:
+                        if lang in pool and pool[lang]:
+                            logger.info(f"Using {pool_name} subtitles: {lang}")
+                            result = self._download_and_parse_subtitles(
+                                pool[lang][0]["url"], platform=video_info.platform)
+                            if result and result.full_text:
+                                result.source = f"platform_subtitle_{pool_name}_{lang}"
+                                return result
 
-                # 其次选择英文字幕
-                if "en" in subtitles:
-                    subtitle_url = subtitles["en"][0]["url"]
-                    return self._download_and_parse_subtitles(subtitle_url)
-
-                logger.info("No usable subtitles found")
+                logger.info(f"No usable subtitles (manual={list(manual)[:3]}, auto={list(auto)[:3]})")
                 return None
 
         except Exception as e:
             logger.error(f"Error extracting subtitles: {e}")
             return None
+
+    def _extract_bilibili_subtitle(self, video_info: VideoInfo) -> Optional[TranscriptResult]:
+        """通过 B站官方 API 提取字幕(v3.1)
+
+        yt-dlp 的 bilibili extractor 与当前风控不兼容，网页解析恒返 HTTP 412
+        (带完整 buvid3/buvid4 cookies 亦无法绕过)，但 api.bilibili.com 直接可用。
+        同时回填 title/author/duration 供后续蒸馏使用。
+        """
+        try:
+            bvid_match = re.search(r'BV(\w+)', video_info.resolved_url)
+            if not bvid_match:
+                logger.warning(f"Cannot extract bvid: {video_info.resolved_url}")
+                return None
+            bvid = f"BV{bvid_match.group(1)}"
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://www.bilibili.com",
+            }
+            cookies = self._load_cookie_header()
+            if cookies:
+                headers["Cookie"] = cookies
+
+            # 1. view API: 拿 cid 与元信息
+            view = requests.get(f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}",
+                               headers=headers, timeout=15).json()
+            if view.get("code") != 0:
+                logger.warning(f"B站 view API: {view.get('code')} {view.get('message')}")
+                return None
+            data = view["data"]
+            cid = data["cid"]
+            video_info.title = video_info.title or data.get("title", "")
+            video_info.author = video_info.author or (data.get("owner") or {}).get("name", "")
+            video_info.duration = video_info.duration or data.get("duration", 0)
+
+            # 2. player/v2 API: 拿字幕列表(需登录 cookies 才能拿到 AI 字幕)
+            player = requests.get(
+                f"https://api.bilibili.com/x/player/v2?bvid={bvid}&cid={cid}",
+                headers=headers, timeout=15).json()
+            subs = ((player.get("data") or {}).get("subtitle") or {}).get("subtitles") or []
+            if not subs:
+                logger.info("B站无可用字幕，降级到 ASR")
+                return None
+
+            # 优先中文字幕
+            chosen = next((s for s in subs if str(s.get("lan", "")).startswith("zh")), subs[0])
+            sub_url = chosen.get("subtitle_url") or ""
+            if sub_url.startswith("//"):
+                sub_url = "https:" + sub_url
+            if not sub_url:
+                return None
+
+            # 3. 下载 B站 JSON 字幕并转 TranscriptResult
+            body = requests.get(sub_url, headers=headers, timeout=20).json().get("body") or []
+            segments = [TranscriptSegment(start=float(it.get("from", 0)),
+                                          end=float(it.get("to", 0)),
+                                          text=str(it.get("content", "")).strip())
+                        for it in body if it.get("content")]
+            if not segments:
+                return None
+            full_text = " ".join(s.text for s in segments)
+            logger.info(f"B站字幕提取成功: {chosen.get('lan')} / {len(full_text)} 字符")
+            return TranscriptResult(segments=segments, full_text=full_text,
+                                    source=f"bilibili_api_subtitle_{chosen.get('lan', '')}",
+                                    language="zh", confidence=0.95)
+        except Exception as e:
+            logger.warning(f"B站字幕 API 失败(降级 ASR): {e}")
+            return None
+
+    def _load_cookie_header(self) -> str:
+        """从 Netscape cookies 文件拼 Cookie 请求头(B站 API 用)"""
+        path = self.cookies_file
+        if not path or not Path(path).exists():
+            return ""
+        try:
+            pairs = []
+            for line in Path(path).read_text(errors="ignore").splitlines():
+                if line.startswith("#") or not line.strip():
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7 and "bilibili" in parts[0]:
+                    pairs.append(f"{parts[5]}={parts[6]}")
+            return "; ".join(pairs)
+        except OSError:
+            return ""
 
     def _extract_douyin_subtitle(self, video_info: VideoInfo) -> Optional[TranscriptResult]:
         """从抖音 API 获取视频文案作为字幕
@@ -766,10 +970,13 @@ class MediaExtractor:
             logger.error(f"Douyin subtitle extraction failed: {e}")
             return None
 
-    def _download_and_parse_subtitles(self, url: str) -> TranscriptResult:
-        """下载并解析字幕文件"""
+    def _download_and_parse_subtitles(self, url: str, platform: str = "unknown") -> TranscriptResult:
+        """下载并解析字幕文件
+
+        v3.1: 海外平台字幕 URL(如 YouTube timedtext)必靠代理，否则 DNS 不通。
+        """
         try:
-            response = requests.get(url, timeout=30)
+            response = requests.get(url, timeout=30, proxies=self._requests_proxies(platform))
             response.raise_for_status()
             content = response.text
 
@@ -788,7 +995,17 @@ class MediaExtractor:
             return TranscriptResult()
 
     def _parse_subtitle_content(self, content: str) -> list[TranscriptSegment]:
-        """解析字幕内容（SRT/VTT 格式）"""
+        """解析字幕内容（SRT/VTT/json3 格式）
+
+        ⭐ v3.1: YouTube 的 timedtext 接口默认返 json3(URL 带 fmt=json3),
+        原实现只认 SRT/VTT 会默默解出 0 段，导致字幕明明拿到却被当成“无字幕”。
+        """
+        stripped = content.lstrip()
+        if stripped.startswith("{"):
+            json3 = self._parse_json3_subtitle(stripped)
+            if json3:
+                return json3
+
         segments = []
 
         # SRT 时间戳正则
@@ -825,16 +1042,43 @@ class MediaExtractor:
         return segments
 
     @staticmethod
+    def _parse_json3_subtitle(content: str) -> list[TranscriptSegment]:
+        """解析 YouTube json3 字幕
+
+        结构: {"events": [{"tStartMs":233, "dDurationMs":2567, "segs":[{"utf8":"文本"}]}]}
+        无 segs 的 event 为空行/换行标记，跳过。
+        """
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return []
+        segments = []
+        for ev in data.get("events") or []:
+            segs = ev.get("segs")
+            if not segs:
+                continue
+            text = "".join(s.get("utf8", "") for s in segs).strip()
+            if not text or text == "\n":
+                continue
+            start = float(ev.get("tStartMs", 0)) / 1000.0
+            end = start + float(ev.get("dDurationMs", 0)) / 1000.0
+            segments.append(TranscriptSegment(start=start, end=end, text=text))
+        if segments:
+            logger.info(f"Parsed json3 subtitle: {len(segments)} segments")
+        return segments
+
+    @staticmethod
     def _srt_time_to_seconds(h: str, m: str, s: str, ms: str) -> float:
         """将 SRT 时间转换为秒"""
         return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
 
-    def download_video(self, video_info: VideoInfo, output_path: Path) -> bool:
-        """下载视频文件（用于图片视频检测等场景）
+    def download_video(self, video_info: VideoInfo, output_path: Path, max_height: int = None) -> bool:
+        """下载视频文件（用于图片视频检测、--vision 抽帧等场景）
 
         Args:
             video_info: 视频信息
             output_path: 视频输出路径
+            max_height: 限制最大分辨率(如 480,用于 vision 抽帧省流量); None 为默认画质
 
         Returns:
             是否成功
@@ -848,18 +1092,21 @@ class MediaExtractor:
 
         logger.info(f"Downloading video to {output_path}")
 
+        if max_height:
+            fmt = f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best"
+        else:
+            fmt = "best[ext=mp4]/best"
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
-            "format": "best[ext=mp4]/best",
-            "outtmpl": str(output_path.with_suffix("")),
+            "format": fmt,
+            # 2026-08-02 修复: outtmpl 必须显式带 %(ext)s。否则 yt-dlp 按字面
+            # 输出无扩展名文件(实测生成 "video" 而非 "video.mp4"), 后续
+            # output_path.exists() 检查永远失败, 视觉分析被静默跳过。
+            "outtmpl": str(output_path.with_suffix("")) + ".%(ext)s",
         }
-
-        # 添加 cookies 支持
-        if self.cookies_file:
-            ydl_opts["cookiefile"] = self.cookies_file
-        elif self.cookies_browser:
-            ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
+        # v3.1: 平台感知代理 + cookies
+        ydl_opts.update(self._net_opts(video_info.platform))
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -959,12 +1206,8 @@ class MediaExtractor:
                 "preferredquality": "128",
             }],
         }
-
-        # 添加 cookies 支持
-        if self.cookies_file:
-            ydl_opts["cookiefile"] = self.cookies_file
-        elif self.cookies_browser:
-            ydl_opts["cookiesfrombrowser"] = (self.cookies_browser,)
+        # v3.1: 平台感知代理 + cookies
+        ydl_opts.update(self._net_opts(video_info.platform))
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1459,6 +1702,98 @@ class LocalMLXWhisperTranscriber(BaseTranscriber):
 
 
 # ============================================================================
+# Mimo ASR 云端语音识别器 (v3.3, 小米 MiMo)
+# ============================================================================
+
+class MimoASRTranscriber(BaseTranscriber):
+    """小米 MiMo 云端 ASR (mimo-v2.5-asr, OpenAI 兼容协议)
+
+    替代已 401 失效的 DashScope 云端 ASR。实测 4.7s/60s 音频、中英混合准。
+    调用: POST {base}/v1/chat/completions, messages 内 input_audio(base64 wav)。
+    ⚠️ ASR 请求不能带 text part(网关自注入 prompt)。
+    长音频按 ~5min 分片串行转写后拼接, 单片 base64 不至过大。
+    """
+
+    CHUNK_SECONDS = 300         # 每片 5 分钟(16k 单声道 wav 约 9.6MB, base64 ~13MB)
+    MAX_CHUNKS = 40             # 上限 200 分钟, 覆盖超长播客(Lex 3小时级); 超长交给 MLX
+
+    def __init__(self, api_key: str, api_base: str, model: str = "mimo-v2.5-asr"):
+        self.api_key = api_key
+        self.api_base = (api_base or "https://token-plan-cn.xiaomimimo.com").rstrip("/")
+        self.model = model
+        self._available = bool(api_key)
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def _audio_duration(self, audio_path: Path) -> float:
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(audio_path)],
+                capture_output=True, text=True, timeout=30)
+            return float(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else 0.0
+        except Exception:
+            return 0.0
+
+    def _transcribe_clip(self, wav_path: Path) -> str:
+        """转写单个 16k 单声道 wav 片段"""
+        import base64
+        b64 = base64.b64encode(wav_path.read_bytes()).decode()
+        resp = requests.post(
+            f"{self.api_base}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=120,
+            json={"model": self.model, "messages": [{"role": "user", "content": [
+                {"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}}]}]})
+        if resp.status_code != 200:
+            raise RuntimeError(f"mimo-asr HTTP {resp.status_code}: {resp.text[:200]}")
+        return (resp.json()["choices"][0]["message"]["content"] or "").strip()
+
+    def transcribe(self, audio_path: Path) -> TranscriptResult:
+        if not self._available:
+            raise RuntimeError("MIMO_API_KEY not configured")
+        logger.info(f"Transcribing with mimo-asr {self.model}: {audio_path}")
+        try:
+            duration = self._audio_duration(audio_path)
+            with tempfile.TemporaryDirectory(prefix="mimo_asr_") as td:
+                tdp = Path(td)
+                if duration <= self.CHUNK_SECONDS:
+                    # 短音频: 整段转 16k 单声道 wav 一次转写
+                    wav = tdp / "clip.wav"
+                    subprocess.run(["ffmpeg", "-y", "-i", str(audio_path),
+                                    "-ar", "16000", "-ac", "1", str(wav)],
+                                   capture_output=True, timeout=120)
+                    if not wav.exists():
+                        return TranscriptResult()
+                    text = self._transcribe_clip(wav)
+                else:
+                    # 长音频: 按 CHUNK_SECONDS 分片串行转写后拼接
+                    n = min(self.MAX_CHUNKS, int(duration // self.CHUNK_SECONDS) + 1)
+                    logger.info(f"mimo-asr 长音频分 {n} 片({duration:.0f}s)")
+                    parts = []
+                    for i in range(n):
+                        seg = tdp / f"seg_{i}.wav"
+                        subprocess.run(["ffmpeg", "-y", "-ss", str(i * self.CHUNK_SECONDS),
+                                        "-t", str(self.CHUNK_SECONDS), "-i", str(audio_path),
+                                        "-ar", "16000", "-ac", "1", str(seg)],
+                                       capture_output=True, timeout=120)
+                        if seg.exists() and seg.stat().st_size > 1024:
+                            try:
+                                parts.append(self._transcribe_clip(seg))
+                            except Exception as e:
+                                logger.warning(f"mimo-asr 片 {i+1}/{n} 失败: {e}")
+                    text = " ".join(p for p in parts if p)
+                if not text:
+                    return TranscriptResult()
+                return TranscriptResult(segments=[], full_text=text,
+                                        source="mimo_asr", language="zh", confidence=0.9)
+        except Exception as e:
+            logger.error(f"mimo-asr transcription error: {e}")
+            return TranscriptResult(error_details=str(e))
+
+
+# ============================================================================
 # 图片视频处理器
 # ============================================================================
 
@@ -1909,6 +2244,169 @@ class ImageVideoProcessor:
 
 
 # ============================================================================
+# 视觉分析器 (v3.0 --vision 模式, 2026-07-31)
+# ============================================================================
+
+class VisionAnalyzer:
+    """按需视觉分析: 场景切换抽帧 + VLM 图表/关键画面结构化提取
+
+    与 ImageVideoProcessor 的区别: 后者面向图片轮播类视频(替代 ASR),
+    本类面向普通视频的补充分析——提取图表/数据/演示画面作为蒸馏辅助信息。
+    默认关闭,仅 --vision 标志触发(看完视频后手动二次提交)。
+    """
+
+    SCENE_THRESHOLD = 0.3   # 场景切换阈值(高于图片视频检测的0.15,只取明显切换)
+    MAX_FRAMES = 10         # VLM 成本上限
+    MIN_FRAMES = 3          # 不足时降级均匀采样
+    # 2026-08-02 清晰度修复: 480p 抽帧图表文字看不清, 升 720p(流量约 2 倍但
+    # 仍是短视频流, 实测可接受); 时机修复: 切换帧常是转场模糊帧, 后移 1.5s
+    # 取场景稳定画面(见 _extract_scene_frames 两阶段实现)
+    DOWNLOAD_MAX_HEIGHT = 720
+    FRAME_DELAY_SEC = 1.5   # 场景切换点后移秒数, 避开转场模糊帧
+
+    VISION_PROMPT = """分析这一视频关键帧,重点关注图表、数据、代码、演示界面等承载关键信息的画面。
+必须按以下 JSON 格式输出(不要额外解释文字):
+{
+  "type": "chart|table|diagram|code|slide|scene",
+  "title": "画面标题(如有)",
+  "key_insights": ["关键发现1", "关键发现2"],
+  "data_summary": "图表/表格中的具体数值、对比、趋势(尽量完整提取);非数据画面填空字符串",
+  "description": "50-150字描述"
+}
+若画面无实质信息(纯人像/转场/黑屏),type 填 "scene" 且 key_insights 留空。"""
+
+    def __init__(self, config: AppConfig):
+        self.config = config
+        # 复用 ImageVideoProcessor 的 VLM 引擎加载逻辑(百炼 qwen-vl)
+        self._img_processor = ImageVideoProcessor(config)
+
+    def analyze(self, video_info: VideoInfo, media_extractor: "MediaExtractor") -> list[ImageFrame]:
+        """下载视频(≤480p) → 场景抽帧 → VLM 描述。返回带描述的帧列表(持久临时目录)。
+
+        帧文件位于 mkdtemp 目录,由调用方(MarkdownWriter)负责拷入 Assets 并清理。
+        失败返回空列表(不阻断主流程)。
+        """
+        frames_dir = Path(tempfile.mkdtemp(prefix="vision_frames_"))
+        video_path = None
+        cleanup_video = False
+        try:
+            # 1. 获取视频文件(优先复用图片视频检测阶段缓存的下载)
+            cached = getattr(video_info, "_cached_video_path", None)
+            if cached and Path(cached).exists():
+                video_path = Path(cached)
+                logger.info(f"[vision] 复用已下载视频: {video_path}")
+            else:
+                video_path = frames_dir / "video.mp4"
+                cleanup_video = True
+                logger.info(f"[vision] 下载视频流(≤{self.DOWNLOAD_MAX_HEIGHT}p)用于抽帧...")
+                if not media_extractor.download_video(video_info, video_path,
+                                                      max_height=self.DOWNLOAD_MAX_HEIGHT):
+                    logger.error("[vision] 视频下载失败,跳过视觉分析")
+                    return []
+
+            # 2. 场景切换抽帧
+            frames = self._extract_scene_frames(video_path, frames_dir)
+            if len(frames) < self.MIN_FRAMES:
+                logger.info(f"[vision] 场景帧不足({len(frames)}),降级均匀采样")
+                frames = self._img_processor.extract_key_frames(video_path, frames_dir)
+                frames = frames[:self.MAX_FRAMES]
+            if not frames:
+                logger.error("[vision] 抽帧失败")
+                return []
+
+            # 3. VLM 逐帧结构化描述(复用 ImageVideoProcessor 的 VLM 引擎)
+            frames = self._img_processor.describe_frames(frames, prompt=self.VISION_PROMPT)
+            valid = [f for f in frames if f.description and not f.description.startswith("[")]
+            logger.info(f"[vision] 视觉分析完成: {len(valid)}/{len(frames)} 帧有效")
+            return frames
+        except Exception as e:
+            logger.error(f"[vision] 视觉分析异常(不阻断主流程): {e}")
+            return []
+        finally:
+            # 只清视频文件,帧文件保留待 writer 拷走
+            if cleanup_video and video_path and video_path.exists():
+                try:
+                    video_path.unlink()
+                except OSError:
+                    pass
+
+    def _extract_scene_frames(self, video_path: Path, output_dir: Path) -> list[ImageFrame]:
+        """两阶段场景抽帧(2026-08-02 时机修复):
+        阶段1 ffmpeg 场景检测只取切换点时间戳(showinfo, 不产图);
+        阶段2 在每个切换点 +FRAME_DELAY_SEC 处精确取帧——
+        直接抓切换帧往往是转场模糊/信息未出全的画面, 后移取场景稳定帧。"""
+        frames: list[ImageFrame] = []
+        detect_cmd = [
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-vf", f"select='gt(scene,{self.SCENE_THRESHOLD})',showinfo",
+            "-vsync", "vfr", "-frames:v", str(self.MAX_FRAMES),
+            "-f", "null", "-",
+        ]
+        try:
+            result = subprocess.run(detect_cmd, capture_output=True, text=True, timeout=300)
+            timestamps = [float(m) for m in re.findall(r"pts_time:([\d.]+)", result.stderr or "")]
+            # 视频时长(避免后移越界)
+            dur_m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", result.stderr or "")
+            duration = (int(dur_m.group(1)) * 3600 + int(dur_m.group(2)) * 60
+                        + float(dur_m.group(3))) if dur_m else float("inf")
+
+            for i, ts in enumerate(timestamps[:self.MAX_FRAMES]):
+                grab = ts + self.FRAME_DELAY_SEC
+                if grab >= duration:
+                    grab = ts  # 结尾附近后移越界则退回切换帧本身
+                fp = output_dir / f"scene_{i:03d}.jpg"
+                grab_cmd = ["ffmpeg", "-y", "-ss", f"{grab:.2f}", "-i", str(video_path),
+                            "-frames:v", "1", "-q:v", "2", str(fp)]
+                try:
+                    r2 = subprocess.run(grab_cmd, capture_output=True, timeout=60)
+                    if r2.returncode == 0 and fp.exists() and fp.stat().st_size > 0:
+                        frames.append(ImageFrame(index=i, timestamp=grab, path=str(fp)))
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"[vision] 取帧超时(ts={grab:.1f})")
+            logger.info(f"[vision] 场景抽帧: {len(frames)} 帧(延迟{self.FRAME_DELAY_SEC}s取稳定帧)")
+        except subprocess.TimeoutExpired:
+            logger.warning("[vision] 场景检测超时")
+        except Exception as e:
+            logger.warning(f"[vision] 场景抽帧失败: {e}")
+        return frames
+
+    @staticmethod
+    def build_visual_context(frames: list[ImageFrame]) -> str:
+        """将帧描述合成为蒸馏 prompt 的「视觉信息」段落(过滤无信息帧)"""
+        parts = []
+        for f in frames:
+            if not f.description or f.description.startswith("["):
+                continue
+            info = VisionAnalyzer.parse_frame_json(f.description)
+            if info.get("type") == "scene" and not info.get("key_insights"):
+                continue  # 无实质信息画面
+            ts = f"{int(f.timestamp // 60):02d}:{int(f.timestamp % 60):02d}"
+            seg = [f"[{ts}] ({info.get('type', 'scene')}) {info.get('title', '')}".strip()]
+            if info.get("data_summary"):
+                seg.append(f"  数据: {info['data_summary']}")
+            if info.get("key_insights"):
+                seg.append("  要点: " + "; ".join(info["key_insights"]))
+            if info.get("description"):
+                seg.append(f"  描述: {info['description']}")
+            parts.append("\n".join(seg))
+        if not parts:
+            return ""
+        return "**视觉信息(关键帧 VLM 提取,含图表/数据,请与转录交叉分析):**\n" + "\n\n".join(parts)
+
+    @staticmethod
+    def parse_frame_json(description: str) -> dict:
+        """解析单帧 VLM JSON 输出;失败时降级为纯文本描述"""
+        try:
+            m = re.search(r"\{[\s\S]*\}", description)
+            if m:
+                return json.loads(m.group())
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return {"type": "scene", "title": "", "key_insights": [],
+                "data_summary": "", "description": description.strip()}
+
+
+# ============================================================================
 # 转录提供者（路由编排）
 # ============================================================================
 
@@ -1919,10 +2417,20 @@ class TranscriptProvider:
         self.config = config
         self.cookies_browser = cookies_browser
         self.cookies_file = cookies_file
-        self.media_extractor = MediaExtractor(cookies_browser, cookies_file)
+        self.media_extractor = MediaExtractor(
+            cookies_browser, cookies_file,
+            overseas_proxy=getattr(config, "overseas_proxy", None),
+            youtube_cookies=getattr(config, "youtube_cookies", None),
+        )
         self.dashscope_transcriber = DashScopeASRTranscriber(
             config.dashscope_api_key,
             config.asr_model
+        )
+        # v3.3: mimo-asr 云端首选(DashScope 已 401 失效)
+        self.mimo_transcriber = MimoASRTranscriber(
+            getattr(config, "mimo_api_key", ""),
+            getattr(config, "mimo_api_base", ""),
+            getattr(config, "mimo_asr_model", "mimo-v2.5-asr"),
         )
         self.local_transcriber = LocalMLXWhisperTranscriber(config.local_asr_model)
         self.image_video_processor = ImageVideoProcessor(config)
@@ -1933,6 +2441,19 @@ class TranscriptProvider:
         v2.2: 抖音平台跳过字幕提取，因为视频描述（hashtags）不是真正的语音内容
         """
         policy = self.config.asr_policy
+
+        # v3.5: YouTube 全部交给 VM 转写前哨(字幕+ASR 都在 VM 侧完成, 回传仅文本)
+        # 必须前置于本地 extract_subtitles——否则本地会先经隧道拉字幕(慢且浪费回程)。
+        # 前哨不可用时降级回本地隧道下载+ASR(POT+EJS)。
+        if video_info.platform == "youtube":
+            prefetch = self._try_vm_prefetch(video_info)
+            if prefetch and prefetch.full_text:
+                return prefetch
+            logger.info("VM 前哨未命中, 降级本地隧道字幕/下载+ASR (POT+EJS)")
+            subtitle_result = self.media_extractor.extract_subtitles(video_info)
+            if subtitle_result and subtitle_result.full_text:
+                return subtitle_result
+            return self._transcribe_with_asr(video_info, save_audio_path)
 
         # 策略：auto - 优先尝试字幕（但抖音平台跳过）
         # 抖音的"字幕"只是视频描述，通常只有 hashtags，没有实际语音内容
@@ -1957,6 +2478,41 @@ class TranscriptProvider:
 
         # 普通 ASR 转录
         return self._transcribe_with_asr(video_info, save_audio_path)
+
+    def _try_vm_prefetch(self, video_info: VideoInfo) -> Optional[TranscriptResult]:
+        """调 VM YouTube 转写前哨(v3.5): VM 侧下载+字幕/mimo-asr, 回传仅文本。
+
+        前哨在 VM 出海满速(12.7MB/s)处理, 避开回程隧道 82KB/s 瓶颈。
+        返回 None 表示前哨不可用/失败, 由调用方降级回本地隧道下载。
+        """
+        base = getattr(self.config, "yt_prefetch_url", "")
+        if not base:
+            return None
+        try:
+            import requests
+            # 长视频可能分片多轮 ASR, 给足超时(VM 处理, 不占本机)
+            resp = requests.post(f"{base.rstrip('/')}/transcript", timeout=1500,
+                                 json={"url": video_info.original_url or video_info.resolved_url})
+            if resp.status_code != 200:
+                logger.warning(f"VM 前哨 HTTP {resp.status_code}")
+                return None
+            data = resp.json()
+            if not data.get("ok") or not data.get("text"):
+                logger.info(f"VM 前哨无结果: {data.get('error', '')[:100]}")
+                return None
+            # 回填元信息
+            if data.get("title") and not video_info.title:
+                video_info.title = data["title"]
+            if data.get("duration") and not video_info.duration:
+                video_info.duration = data["duration"]
+            logger.info(f"VM 前哨命中: source={data.get('source')} chars={data.get('chars')}")
+            return TranscriptResult(
+                segments=[], full_text=data["text"],
+                source=f"vm_prefetch_{data.get('source', 'unknown')}",
+                language="zh", confidence=0.9)
+        except Exception as e:
+            logger.warning(f"VM 前哨调用失败: {e}")
+            return None
 
     def _try_image_video(self, video_info: VideoInfo) -> Optional[TranscriptResult]:
         """尝试作为图片视频处理"""
@@ -1997,32 +2553,41 @@ class TranscriptProvider:
             # 确保使用带后缀的路径进行识别 (MediaExtractor.extract_audio 会自动补全 .mp3)
             actual_audio_path = audio_path.with_suffix(".mp3")
 
-            # 策略：优先云端，失败自动降级到本地
+            # 策略(2026-08-03 统一): 本地 MLX 首选(免费,medium 模型已预拉) → mimo 云端兜底(受预算闸门)
+            # 此前 v3.4 是 mimo 优先,理由"MLX 首次依赖 HF 下载"已因 medium 模型经隧道预拉而过时。
+            # 与播客链路 transcribe_audio.py 对齐,两条链路共用 zhiwei_common.asr_budget 账本。
             transcript_result = None
 
-            # 1. 尝试 DashScope ASR
-            if self.dashscope_transcriber.is_available():
-                logger.info("尝试 DashScope ASR...")
-                try:
-                    transcript_result = self.dashscope_transcriber.transcribe(actual_audio_path)
-                    if transcript_result and transcript_result.full_text:
-                        logger.info(f"DashScope ASR 成功: {len(transcript_result.full_text)} 字符")
-                        return transcript_result
-                    logger.warning("DashScope ASR 返回空结果，尝试降级")
-                except Exception as e:
-                    logger.warning(f"DashScope ASR 失败: {e}，尝试降级到本地 Whisper")
-
-            # 2. 降级到本地 MLX Whisper
+            # 1. 本地 MLX Whisper 首选(免费)
             if self.local_transcriber.is_available():
-                logger.info("使用本地 MLX Whisper ASR（降级模式）")
+                logger.info("尝试本地 MLX Whisper ASR(首选)...")
                 try:
                     transcript_result = self.local_transcriber.transcribe(actual_audio_path)
                     if transcript_result and transcript_result.full_text:
-                        logger.info(f"本地 Whisper ASR 成功: {len(transcript_result.full_text)} 字符")
+                        logger.info(f"本地 MLX 成功: {len(transcript_result.full_text)} 字符")
                         return transcript_result
-                    logger.warning("本地 Whisper ASR 返回空结果")
+                    logger.warning("本地 MLX 返回空, 降级 mimo 云端")
                 except Exception as e:
-                    logger.error(f"本地 Whisper ASR 也失败: {e}")
+                    logger.warning(f"本地 MLX 失败: {e}, 降级 mimo 云端")
+
+            # 2. mimo 云端兜底(受每日预算闸门保护)
+            if self.mimo_transcriber.is_available():
+                try:
+                    from zhiwei_common import asr_budget
+                    est = asr_budget.estimate_minutes(actual_audio_path)
+                    if not asr_budget.budget_ok(est):
+                        logger.warning(
+                            f"mimo 日预算不足(已用{asr_budget.used_today():.0f}+{est:.0f}min), 跳过云端")
+                    else:
+                        logger.info("降级 mimo-asr 云端 ASR...")
+                        transcript_result = self.mimo_transcriber.transcribe(actual_audio_path)
+                        if transcript_result and transcript_result.full_text:
+                            asr_budget.budget_record(est)
+                            logger.info(f"mimo-asr 成功: {len(transcript_result.full_text)} 字符")
+                            return transcript_result
+                        logger.warning("mimo-asr 返回空结果")
+                except Exception as e:
+                    logger.error(f"mimo-asr 也失败: {e}")
 
             # 3. 无可用服务
             logger.error("No ASR service available (云端和本地都失败)")
@@ -2203,11 +2768,28 @@ class KnowledgeDistiller:
 严格输出合法 JSON，不要添加额外解释文字：
 {"corrected_transcript": "纠错后的完整文本", "content_type": "tech_tutorial", "entities": ["工具1", "技术2"], "correction_count": 12}"""
 
+    # ⭐ 2026-08-02 P0: Stage1 降级版提示词——仅分类+实体，不要求回显纠错稿。
+    # 背景：回显型任务(1.2万字纠错稿)在 90s 超时上结构性不稳，全链失败曾
+    # 静默降级 general 模板导致笔记变薄（远景能源访谈事故）。缩小任务重试。
+    STAGE1_CLASSIFY_ONLY_PROMPT = """你是内容分类专家。对给定文本（可能是 ASR 转录稿）仅做分类和实体提取，不要复述/纠错原文。
+
+内容分类判据：
+- tech_tutorial: 以特定工具/框架/代码为核心
+- business_insight: 以市场/商业/投资判断为核心
+- creative_workflow: 以内容创作流程为核心
+- knowledge_explainer: 以概念/方法论/认知框架为核心
+- general: 不属于以上任何一类
+
+严格输出合法 JSON（corrected_transcript 固定为空字符串）：
+{"corrected_transcript": "", "content_type": "general", "entities": ["实体1", "实体2"], "correction_count": 0}"""
+
     # ── 第二阶段：按类型分析 ──
     STAGE2_PROMPTS = {
         "tech_tutorial": """你是顶级技术研究员，从视频转录中提取可直接指导工程实现的技术情报。
 
 **评级标准**：A级=能闭环复现 | B级=关键点明确 | C级=仅供跟踪 | D级=无实质内容
+
+**观点论据收集**：author_claims 只忠实收集作者明确表达的观点及其依据（不做评判、不评级）；无依据的观点也要收录，evidences 留空数组。
 
 **输出 JSON**（严格合法 JSON，无额外文字）：
 {
@@ -2230,12 +2812,15 @@ class KnowledgeDistiller:
     "key_code_logic": "核心逻辑/伪代码"
   },
   "tags": ["3-5个具体标签"],
+  "author_claims": [{"claim": "作者明确主张的观点（一句话）", "timestamp": "MM:SS", "evidences": [{"content": "支撑该观点的论据", "type": "数据|推导|引用|类比|经验|断言", "timestamp": "MM:SS"}]}],
   "related_concepts": ["关联知识概念"]
 }""",
 
         "business_insight": """你是资深商业分析师，从视频转录中提取商业洞察和决策情报。
 
 **评级标准**：A级=有数据支撑的深度分析 | B级=有明确观点和逻辑 | C级=仅信息汇总 | D级=无实质内容
+
+**观点论据收集**：author_claims 只忠实收集作者明确表达的观点及其依据（不做评判、不评级）；无依据的观点也要收录，evidences 留空数组。
 
 **输出 JSON**（严格合法 JSON，无额外文字）：
 {
@@ -2252,12 +2837,15 @@ class KnowledgeDistiller:
   "summary": "150-300字商业摘要",
   "action_items": ["决策建议"],
   "tags": ["3-5个标签"],
+  "author_claims": [{"claim": "作者明确主张的观点（一句话）", "timestamp": "MM:SS", "evidences": [{"content": "支撑该观点的论据", "type": "数据|推导|引用|类比|经验|断言", "timestamp": "MM:SS"}]}],
   "related_concepts": ["关联概念"]
 }""",
 
         "creative_workflow": """你是创意工作流专家，从视频转录中拆解可复制的创作流程和工具链。
 
 **评级标准**：A级=完整可复现的SOP | B级=流程清晰但需补充细节 | C级=仅概述 | D级=无实质内容
+
+**观点论据收集**：author_claims 只忠实收集作者明确表达的观点及其依据（不做评判、不评级）；无依据的观点也要收录，evidences 留空数组。
 
 **输出 JSON**（严格合法 JSON，无额外文字）：
 {
@@ -2275,12 +2863,15 @@ class KnowledgeDistiller:
   "summary": "150-300字摘要",
   "action_items": ["立即可做的事"],
   "tags": ["3-5个标签"],
+  "author_claims": [{"claim": "作者明确主张的观点（一句话）", "timestamp": "MM:SS", "evidences": [{"content": "支撑该观点的论据", "type": "数据|推导|引用|类比|经验|断言", "timestamp": "MM:SS"}]}],
   "related_concepts": ["关联概念"]
 }""",
 
         "knowledge_explainer": """你是知识蒸馏专家，从视频转录中提取核心概念和认知升级点。
 
 **评级标准**：A级=深刻且有原创性 | B级=清晰系统的讲解 | C级=基础科普 | D级=无实质内容
+
+**观点论据收集**：author_claims 只忠实收集作者明确表达的观点及其依据（不做评判、不评级）；无依据的观点也要收录，evidences 留空数组。
 
 **输出 JSON**（严格合法 JSON，无额外文字）：
 {
@@ -2297,6 +2888,7 @@ class KnowledgeDistiller:
   "summary": "150-300字知识摘要",
   "action_items": ["学习建议"],
   "tags": ["3-5个标签"],
+  "author_claims": [{"claim": "作者明确主张的观点（一句话）", "timestamp": "MM:SS", "evidences": [{"content": "支撑该观点的论据", "type": "数据|推导|引用|类比|经验|断言", "timestamp": "MM:SS"}]}],
   "related_concepts": ["关联概念"]
 }""",
 
@@ -2436,8 +3028,7 @@ class KnowledgeDistiller:
         try:
             from zhiwei_common.llm import llm_client
         except ImportError:
-            # zhiwei_common 未以 installed 包形式存在时，从项目根目录补上路径。
-            sys.path.insert(0, str(Path.home() / "zhiwei-common"))
+            # zhiwei_common 未以 installed 包形式存在时的兜底（2026-07-31: 各 venv 已 editable 安装，hack 已去）
             from zhiwei_common.llm import llm_client
 
         # zhiwei_common.llm.LLMClient.call(role, message, system_prompt, timeout)
@@ -2476,8 +3067,32 @@ class KnowledgeDistiller:
             "corrected_transcript": transcript_text,
             "content_type": "general",
             "entities": [],
-            "correction_count": 0
+            "correction_count": 0,
+            "_llm_failed": True,  # ⭐ P0: 标记 LLM 调用失败（区别于真判为 general）
         }
+
+    def _stage1_classify_only(self, text: str) -> Optional[dict]:
+        """⭐ P0 (2026-08-02): Stage1 降级版——仅分类+实体（小输入，防回显超时）。
+
+        成功返回含 content_type 的 dict；失败返回 None。
+        corrected_transcript 为空串，distill 的防御逻辑会自动改用原文。
+        """
+        try:
+            success, content = self.llm_client.call(
+                role="format",
+                message=f"请处理以下文本：\n\n{text}",
+                system_prompt=self.STAGE1_CLASSIFY_ONLY_PROMPT,
+                timeout=60,
+            )
+            if success:
+                m = re.search(r'\{[\s\S]*\}', content)
+                if m:
+                    result = json.loads(m.group())
+                    logger.info(f"Stage 1 降级重试成功: type={result.get('content_type')}")
+                    return result
+        except Exception as e:
+            logger.warning(f"Stage 1 降级重试异常: {e}")
+        return None
 
     def _get_background(self, transcript_text: str) -> str:
         """RAG 背景增强"""
@@ -2521,25 +3136,30 @@ class KnowledgeDistiller:
         logger.info(f"Transcript split into {len(chunks)} chunks ({len(full_text)} chars total)")
         return chunks
 
-    def distill(self, video_info: VideoInfo, transcript: TranscriptResult) -> DistilledKnowledge:
+    def distill(self, video_info: VideoInfo, transcript: TranscriptResult,
+                extra_context: str = "") -> DistilledKnowledge:
         """两阶段知识蒸馏 v2.0
 
         Stage 1: ASR 纠错 + 内容分类（format role / MiniMax-M2.5）
         Stage 2: 按类型深度分析（research role / qwen3.7-plus）
+
+        Args:
+            extra_context: 额外上下文(如 --vision 的视觉信息段落),附入 Stage 2 prompt
         """
         transcript_text = transcript.to_text()
         logger.info(f"Distilling {len(transcript_text)} chars transcript (v2.0 two-stage)")
 
         # ── 第一阶段：清洗 + 分类 ──
-        # VLM 帧描述（图片视频）没有 ASR 错误，只需分类不需纠错
+        # ⭐ v70.3 (2026-08-02): Stage1 全面改为「仅分类」主路径，不再回显纠错稿。
+        # 证据链：百炼 coding plan 在长输出任务上系统性装死（90s 零字节，全系模型
+        # 裸 HTTP 复现，且早于任何代码改动）；分类/实体只需 3k 样本，快 10 倍；
+        # Stage2 大模型原生抗 ASR 噪声（纠错本属锦上添花）。
         is_vlm = transcript.source and "vlm" in transcript.source
-        if is_vlm and len(transcript_text) > 6000:
-            # 截取前 3000 字符做分类即可，纠错跳过
-            logger.info("Stage 1: VLM source detected, classification only (skip correction)")
-            stage1_input = transcript_text[:3000]
-        else:
-            stage1_input = transcript_text[:12000]
-        stage1_result = self._stage1_clean_and_classify(stage1_input)
+        stage1_result = self._stage1_classify_only(transcript_text[:3000])
+        if not stage1_result:
+            logger.warning("⚠️ Stage 1 仅分类调用失败，接受 general 模板（笔记将缺少类型化深度章节）")
+            stage1_result = {"corrected_transcript": "", "content_type": "general",
+                             "entities": [], "correction_count": 0}
 
         content_type = stage1_result.get("content_type", "general")
         entities = stage1_result.get("entities", [])
@@ -2560,6 +3180,10 @@ class KnowledgeDistiller:
 
         # ── RAG 背景增强 ──
         background_section = self._get_background(corrected_text)
+
+        # ── 视觉信息增强 (--vision) ──
+        if extra_context:
+            background_section = (background_section + "\n\n" + extra_context).strip()
 
         # ── 第二阶段：按类型深度分析 ──
         stage2_prompt = self.STAGE2_PROMPTS.get(content_type, self.STAGE2_PROMPTS["general"])
@@ -2613,7 +3237,7 @@ class KnowledgeDistiller:
                 role="research",
                 message=user_prompt,
                 system_prompt=stage2_prompt,
-                timeout=120
+                timeout=240  # v70.4: qwen3.8-max 中位 100-166s，120s 会误触发降级
             )
 
             if success:
@@ -2667,7 +3291,8 @@ class KnowledgeDistiller:
                 references=data.get("references", []),
                 related_concepts=data.get("related_concepts", []),
                 technical_reconstruction=type_analysis,
-                implementation_guide=data.get("implementation_guide", {})
+                implementation_guide=data.get("implementation_guide", {}),
+                author_claims=data.get("author_claims", [])
             )
         except json.JSONDecodeError as e:
             logger.error(f"JSON parse error: {e}")
@@ -2719,7 +3344,7 @@ tags: [{tags}]
 tier: {content_tier}
 asr_source: "{asr_source}"
 related: [{related_concepts}]
-rag: false
+rag: {rag_flag}
 ---'''
 
     HEADER = '''
@@ -2794,6 +3419,11 @@ rag: false
 {further_reading}
 '''
 
+    SECTION_CLAIMS = '''
+## 作者观点与论据
+{claims_block}
+'''
+
     SECTION_IMPL = '''
 ## 复现指南
 - **难度**：{impl_difficulty}
@@ -2804,6 +3434,11 @@ rag: false
 ```
 - **步骤**：
 {impl_steps}
+'''
+
+    SECTION_VISION = '''
+## 关键画面与图表
+{vision_frames}
 '''
 
     FOOTER = '''
@@ -2860,6 +3495,31 @@ rag: false
 
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
+
+    def _build_claims_section(self, knowledge: DistilledKnowledge) -> str:
+        """作者观点与论据区（忠实提取，不做评判；无此数据时静默省略）"""
+        claims = getattr(knowledge, "author_claims", None) or []
+        blocks = []
+        for i, c in enumerate(claims, 1):
+            claim = str(c.get("claim", "")).strip()
+            if not claim:
+                continue
+            ts = c.get("timestamp", "")
+            head = f"### C{i} · {claim}" + (f" [{ts}]" if ts else "")
+            lines = [head]
+            evs = c.get("evidences") or []
+            if evs:
+                for e in evs:
+                    etype = e.get("type", "论据")
+                    ets = e.get("timestamp", "")
+                    ts_s = f" [{ets}]" if ets else ""
+                    lines.append(f"- （{etype}）{ts_s} {e.get('content', '')}")
+            else:
+                lines.append("- （作者未给出依据）")
+            blocks.append("\n".join(lines))
+        if not blocks:
+            return ""
+        return self.SECTION_CLAIMS.format(claims_block="\n\n".join(blocks))
 
     def _build_type_section(self, knowledge: DistilledKnowledge, content_type: str) -> str:
         """根据 content_type 构建差异化中段"""
@@ -2935,8 +3595,47 @@ rag: false
 
         return ""
 
+    def _build_vision_section(self, visual_frames: list, asset_dir: Path, asset_folder_name: str) -> str:
+        """拷贝视觉帧到 Assets/{folder}/frames/ 并生成「关键画面与图表」章节(--vision)"""
+        if not visual_frames:
+            return ""
+        import shutil
+        frames_dir = asset_dir / "frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        blocks = []
+        for f in visual_frames:
+            if not f.description or f.description.startswith("["):
+                continue
+            info = VisionAnalyzer.parse_frame_json(f.description)
+            if info.get("type") == "scene" and not info.get("key_insights"):
+                continue
+            src = Path(f.path)
+            if not src.exists():
+                continue
+            dest_name = f"frame_{f.index:03d}.jpg"
+            try:
+                shutil.copy2(str(src), str(frames_dir / dest_name))
+            except OSError as e:
+                logger.warning(f"[vision] 帧拷贝失败: {e}")
+                continue
+            ts = f"{int(f.timestamp // 60):02d}:{int(f.timestamp % 60):02d}"
+            rel_path = f"Assets/{asset_folder_name}/frames/{dest_name}"
+            title = info.get("title") or f"画面 {f.index + 1}"
+            lines = [f"### [{ts}] {title}", "", f"![{title}]({rel_path})", ""]
+            if info.get("data_summary"):
+                lines.append(f"- **数据**: {info['data_summary']}")
+            for ins in info.get("key_insights", []):
+                lines.append(f"- {ins}")
+            if info.get("description"):
+                lines.append(f"- {info['description']}")
+            blocks.append("\n".join(lines))
+        if not blocks:
+            return ""
+        return self.SECTION_VISION.format(vision_frames="\n\n".join(blocks))
+
     def write(self, video_info: VideoInfo, transcript: TranscriptResult,
-              knowledge: DistilledKnowledge, noise_tags: list[str]) -> Path:
+              knowledge: DistilledKnowledge, noise_tags: list[str],
+              visual_frames: list = None) -> Path:
         """生成并写入 Markdown 文件，按 content_type 差异化输出"""
         date_str = datetime.now().strftime("%Y-%m-%d")
         tags_str = ", ".join(f'"{tag}"' for tag in knowledge.tags)
@@ -2962,20 +3661,24 @@ rag: false
         references_section = f"## 参考资料\n{refs_str}" if refs_str else ""
         related_str = ", ".join(f'"{c}"' for c in knowledge.related_concepts) if knowledge.related_concepts else ""
 
-        # 组装：frontmatter + header + 类型化中段 + footer
+        # 组装：frontmatter + header + 类型化中段 + 视觉章节(--vision) + footer
+        # v3.0: rag 标志按质量分级——A/B 级直接入库,C/D 级由 DKI 隔离(防 ASR 噪声污染知识库)
+        rag_flag = "true" if knowledge.content_tier in ("A", "B") else "false"
         parts = [
             self.FRONTMATTER.format(
                 title=knowledge.title, source_url=video_info.original_url,
                 date=date_str, tags=tags_str, content_tier=knowledge.content_tier,
                 asr_source=transcript.source, related_concepts=related_str,
-                content_type=content_type
+                content_type=content_type, rag_flag=rag_flag
             ),
             self.HEADER.format(
                 title=knowledge.title, tier_display=tier_display,
                 content_type_label=content_type_label,
                 core_insight=knowledge.core_insight
             ),
+            self._build_claims_section(knowledge),
             self._build_type_section(knowledge, content_type),
+            self._build_vision_section(visual_frames or [], asset_dir, asset_folder_name),
             self.FOOTER.format(
                 key_points=key_points_str, summary=knowledge.summary,
                 action_items_section=items_str, references_section=references_section,
@@ -2996,6 +3699,28 @@ rag: false
 # ============================================================================
 # 主程序入口
 # ============================================================================
+
+def _trigger_rag_ingest(note_path) -> None:
+    """触发 zhiwei-rag 增量入库(fire-and-forget, v3.0)
+
+    红线: 入库必须用 zhiwei-rag/venv(本 venv 无 lancedb)。--no-archive 保持笔记在 Vault 原路径。
+    """
+    try:
+        rag_python = Path.home() / "zhiwei-rag" / "venv" / "bin" / "python"
+        ingest_script = Path.home() / "zhiwei-rag" / "scripts" / "ingest_incremental.py"
+        if not rag_python.exists() or not ingest_script.exists():
+            logger.warning(f"[RAG] 入库环境缺失，跳过: {note_path}")
+            return
+        # 入库完成后刷新检索索引（2026-08-01: 消除 lance MVCC 快照导致的搜索断层）
+        cmd = (f'"{rag_python}" "{ingest_script}" --file "{note_path}" --no-archive '
+               f'&& curl -s -X POST http://localhost:8765/admin/refresh >/dev/null')
+        subprocess.Popen(
+            ["/bin/bash", "-c", cmd],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        logger.info(f"[RAG] 已触发增量入库: {Path(note_path).name}")
+    except Exception as e:
+        logger.warning(f"[RAG] 触发入库失败(不影响主流程): {e}")
+
 
 def process_single_video(url: str, config: AppConfig, args, store: ProcessedStore) -> int:
     """
@@ -3038,6 +3763,9 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
             logger.info(f"   原输出: {output_path}")
             logger.info(f"   处理时间: {record.get('processed_at', 'N/A')}")
             print(f"✅ Done! Output: {output_path}")  # 跳过也输出成功标志
+            if getattr(args, 'json', False):
+                print(json.dumps({"status": "skipped", "output_path": str(output_path),
+                                  "title": record.get('title', '')}, ensure_ascii=False))
         return 2
 
     # 2. 获取转录
@@ -3050,9 +3778,11 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
     if cookies_file:
         logger.info(f"Using cookies file: {cookies_file}")
 
+    vision_mode = getattr(args, 'vision', False)
+    provider = None
     try:
         provider = TranscriptProvider(config, cookies_browser, cookies_file)
-        
+
         # 预估资产保存路径（基于 URL 解析出的 Title，如果没有则生成 ID）
         date_str = datetime.now().strftime("%Y-%m-%d")
         raw_title = video_info.title or f"Video_{video_id or 'unknown'}"
@@ -3060,8 +3790,19 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
         asset_dir = config.output_dir / "Assets" / f"{date_str}_{safe_title}"
         asset_dir.mkdir(parents=True, exist_ok=True)
         save_audio_path = asset_dir / "audio" # 最终后缀由 extract_audio 补全
-        
-        transcript = provider.get_transcript(video_info, save_audio_path=save_audio_path)
+
+        # ⭐ v3.0: --vision 重跑时优先用缓存转写,免二次下载音频/ASR
+        transcript = None
+        if vision_mode:
+            cached = store.get_cached_transcript(video_info.resolved_url, video_id=video_id)
+            if cached:
+                cached_text, cached_engine = cached
+                transcript = TranscriptResult(
+                    segments=[], full_text=cached_text,
+                    source=f"{cached_engine}(cached)", language="zh", confidence=0.9)
+                logger.info(f"[vision] 命中转写缓存({len(cached_text)} 字符, engine={cached_engine}),跳过 ASR")
+        if transcript is None:
+            transcript = provider.get_transcript(video_info, save_audio_path=save_audio_path)
     except Exception as e:
         error_type, error_msg = classify_error(e)
         error_json = json.dumps({"error_type": error_type.value, "error_message": error_msg})
@@ -3102,9 +3843,23 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
     # 4. 知识蒸馏
     logger.info("=" * 50)
     logger.info("Step 4: Distilling knowledge")
+
+    # ⭐ v3.0: --vision 视觉分析(抽帧 + VLM),产出并入蒸馏 prompt 与笔记章节
+    visual_frames = []
+    visual_context = ""
+    if vision_mode:
+        logger.info("Step 4a: Vision analysis (--vision)")
+        analyzer = VisionAnalyzer(config)
+        visual_frames = analyzer.analyze(video_info, provider.media_extractor)
+        visual_context = VisionAnalyzer.build_visual_context(visual_frames)
+        if visual_context:
+            logger.info(f"[vision] 视觉信息段落: {len(visual_context)} 字符")
+        else:
+            logger.info("[vision] 无有效视觉信息(可能无图表画面)")
+
     distiller = KnowledgeDistiller(config)
     try:
-        knowledge = distiller.distill(video_info, transcript)
+        knowledge = distiller.distill(video_info, transcript, extra_context=visual_context)
     except Exception as e:
         error_type, error_msg = classify_error(e)
         error_json = json.dumps({"error_type": error_type.value, "error_message": error_msg})
@@ -3147,7 +3902,18 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
     logger.info("=" * 50)
     logger.info("Step 6: Writing Markdown")
     writer = MarkdownWriter(config.output_dir)
-    output_path = writer.write(video_info, transcript, knowledge, noise_tags)
+    output_path = writer.write(video_info, transcript, knowledge, noise_tags,
+                               visual_frames=visual_frames)
+
+    # 清理视觉帧临时目录(帧已拷入 Assets)
+    if visual_frames:
+        import shutil
+        try:
+            tmp_dir = Path(visual_frames[0].path).parent
+            if tmp_dir.name.startswith("vision_frames_"):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
     # 7. RAG 闭环 — A/B 级笔记复制到 JD 目录
     if knowledge.content_tier in ("A", "B"):
@@ -3179,12 +3945,28 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
         except Exception as e:
             logger.warning(f"RAG promotion failed (non-fatal): {e}")
 
-    # 标记已处理
-    store.mark_processed(video_info.resolved_url, output_path, knowledge.title, video_id=video_id)
+    # 标记已处理(v3.0: 附转写缓存 + 成本估算)
+    # 成本为粗估: 中文约 2 字符/token,百炼混合费率按 ~0.002 USD/1K tokens 计
+    tokens_est = (len(transcript.full_text) + len(visual_context)) // 2
+    if visual_frames:
+        tokens_est += len(visual_frames) * 800  # 每帧 VLM 调用粗估
+    cost_est = round(tokens_est / 1000 * 0.002, 4)
+    store.mark_processed(video_info.resolved_url, output_path, knowledge.title, video_id=video_id,
+                         transcript=transcript.full_text, asr_engine=transcript.source,
+                         tokens_used=tokens_est, cost_usd=cost_est)
+
+    # ⭐ v3.0: 触发 RAG 增量入库(含 --vision 的 VLM 描述文本,图表信息可被检索)
+    # 仅 A/B 级: C/D 级笔记 rag:false 会被 DKI 隔离(0 chunk),省去无效子进程
+    if not getattr(args, 'no_ingest', False) and knowledge.content_tier in ("A", "B"):
+        _trigger_rag_ingest(output_path)
 
     logger.info("=" * 50)
     logger.info(f"✅ Done! Output: {output_path}")
     print(f"✅ Done! Output: {output_path}")
+    if getattr(args, 'json', False):
+        print(json.dumps({"status": "ok", "output_path": str(output_path),
+                          "title": knowledge.title, "tier": knowledge.content_tier,
+                          "vision": bool(visual_frames)}, ensure_ascii=False))
     return 0
 
 
@@ -3223,6 +4005,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="只解析不生成文件")
     parser.add_argument("--transcript-only", action="store_true", help="只输出转录文本")
     parser.add_argument("--force", action="store_true", help="即使已处理过也强制重新蒸馏")
+    parser.add_argument("--vision", action="store_true",
+                        help="视觉分析模式: 抽取关键帧送 VLM 提取图表/数据(隐含 --force,重跑时复用转写缓存)")
+    parser.add_argument("--no-ingest", action="store_true", help="不触发 RAG 增量入库(调试用)")
     parser.add_argument("--output-dir", type=str, help="自定义输出目录")
     parser.add_argument("--cookies-from-browser", type=str, metavar="BROWSER",
                         help="从浏览器加载 cookies（chrome/safari/firefox/edge）")
@@ -3237,6 +4022,10 @@ def main():
     # 配置日志级别
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # --vision 隐含 --force(看完后二次提交的典型场景:已处理过,需重蒸馏)
+    if getattr(args, 'vision', False):
+        args.force = True
 
     # 处理 OpenClaw payload
     if getattr(args, 'openclaw_payload', None):
