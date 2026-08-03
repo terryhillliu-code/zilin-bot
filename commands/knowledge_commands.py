@@ -133,16 +133,11 @@ def do_knowledge_query(query: str, user_id: str, message_id: str, ctx, deep: boo
         extra = "\n\n要求：综合上述材料给出有组织的要点，注明来源文档，并指出信息缺口。" if deep else ""
         prompt = f"{prefix}\n{context}\n\n问题：{query}{extra}"
 
-    # ⭐ 合规调整 (2026-08-03): deep=True 源于用户自然语言主动表达的深入分析意愿
-    # (research 意图，nl_router 已逐次确认)，显式指定深度引擎。
-    # 2026-08-03: preview 8/5 下线，深度引擎从 token_plan 切到 LongCat-2.0
-    # （已充值、实测质量与 preview 同档、按量付费条款允许自动化）。
-    # longcat 失败会自动落回 auto 降级链（Coding Plan 等），不会硬断。
-    prefer = "longcat" if deep else "auto"
-    if deep:
-        ctx.reply_message(message_id, "🔬 已按你的要求启用深度分析模型(LongCat-2.0)...")
-    response = llm_client.call_with_session("chat", prompt, f"ask-{user_id}",
-                                            prefer_api=prefer)
+    # ⏪ 2026-08-03 用户决策回退：深度研究入口恢复原样，走 Coding Plan
+    # （deep=True 为用户主动触发的交互式深度分析，属交互式场景，用 Coding Plan 合规）。
+    # 此前曾切 token_plan(preview)、又切 LongCat-2.0，现均不挂；
+    # llm.py 里 longcat/token_plan 显式通道保留，待用户重新决定 LongCat 用法。
+    response = llm_client.call_with_session("chat", prompt, f"ask-{user_id}")
     ctx.reply_message(message_id, response)
 
     # ⭐ F4: 若检索命中图表 chunk，额外回传原图（失败不影响上方回答）
