@@ -3237,7 +3237,7 @@ class KnowledgeDistiller:
                 role="research",
                 message=user_prompt,
                 system_prompt=stage2_prompt,
-                timeout=240  # v70.4: qwen3.8-max 中位 100-166s，120s 会误触发降级
+                timeout=240  # v70.4: qwen3.8-max-preview 中位 100-166s，120s 会误触发降级
             )
 
             if success:
