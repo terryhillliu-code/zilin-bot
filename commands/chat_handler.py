@@ -133,7 +133,7 @@ class ChatHandler:
         context_prompt = memory.build_context_prompt()
         full_message = f"{context_prompt}\n\n{enriched_message}" if context_prompt else enriched_message
 
-        response = llm_client.call_with_session("chat", full_message, session_id)
+        response = llm_client.call_by_task_with_session("context_qa", full_message, session_id)
 
         # ⭐ 2026-07-26 H2 提速：先回复用户，记忆写入全部移到后台线程
         # （原流程记忆写入阻塞回复，最坏 ~70s 才收到答案）

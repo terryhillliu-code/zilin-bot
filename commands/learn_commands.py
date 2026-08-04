@@ -153,8 +153,8 @@ def _trigger_ingest(card_path: Path):
 def _gen_concept_profile(concept: str) -> dict | None:
     """LLM 生成概念档案 JSON, 失败返回 None"""
     try:
-        ok, text = llm_client.call(
-            "research",
+        ok, text = llm_client.call_by_task(
+            "structured",
             f"请生成概念「{concept}」的学习档案",
             system_prompt=PROFILE_PROMPT.format(concept=concept),
             timeout=LLM_TIMEOUT,

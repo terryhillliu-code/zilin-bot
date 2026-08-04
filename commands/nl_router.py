@@ -61,8 +61,8 @@ _CANCEL_WORDS = {"取消", "不", "不要", "算了", "no", "n"}
 def _parse_intent(text):
     """单轮 LLM 意图识别 → dict；失败返回 None"""
     try:
-        # ⭐ v70.3: 意图识别归队 format（轻量高频分类任务，原挂 chat 吃强模型浪费）
-        success, response = llm_client.call("format", text, system_prompt=INTENT_PROMPT, timeout=15)
+        # ⭐ 2026-08-04: 意图识别 → classify 任务 (qwen3-coder-next, 0.8s)
+        success, response = llm_client.call_by_task("classify", text, system_prompt=INTENT_PROMPT, timeout=15)
         if not success or not response:
             return None
         m = re.search(r"(\{.*\})", response, re.DOTALL)
@@ -112,7 +112,7 @@ def _exec_media_followup(action, artifact, instruction, user_id, message_id, ctx
         note = artifact.get("summary") or ""
     msg = (f"【背景：{artifact.get('kind', '内容')}《{artifact.get('title', '')}》的笔记】\n{note}\n\n"
            f"【用户追问】{instruction}")
-    ans = llm_client.call_with_session("chat", msg, f"feishu-{user_id}")
+    ans = llm_client.call_by_task_with_session("context_qa", msg, f"feishu-{user_id}")
     if ans and not ans.startswith("❌ AI 暂时无法响应"):
         ctx.reply_message(message_id, ans)
         conversation_store.record_turn(user_id, "user", instruction)

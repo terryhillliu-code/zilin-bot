@@ -137,7 +137,7 @@ def do_knowledge_query(query: str, user_id: str, message_id: str, ctx, deep: boo
     # （deep=True 为用户主动触发的交互式深度分析，属交互式场景，用 Coding Plan 合规）。
     # 此前曾切 token_plan(preview)、又切 LongCat-2.0，现均不挂；
     # llm.py 里 longcat/token_plan 显式通道保留，待用户重新决定 LongCat 用法。
-    response = llm_client.call_with_session("chat", prompt, f"ask-{user_id}")
+    response = llm_client.call_by_task_with_session("context_qa", prompt, f"ask-{user_id}")
     ctx.reply_message(message_id, response)
 
     # ⭐ F4: 若检索命中图表 chunk，额外回传原图（失败不影响上方回答）
