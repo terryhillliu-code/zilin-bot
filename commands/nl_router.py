@@ -19,10 +19,15 @@ INTENT_PROMPT = """你是飞书机器人「知微」的意图识别层。根据�
 - capture: 要求记录/保存/记下某条信息、灵感或想法
 - research: 要求对某主题做深入调研/研究/整理报告（一次性报告，不沉淀概念卡片）
 - status: 询问机器人或系统自身的状态/健康
+- media_followup: 针对「刚才发的视频/文章/播客」的追问、修正或要求重做。
+  识别标志：出现"刚才/那个视频/这条链接/重新分析/代入/你没理解"等回指词，且消息中不含新链接。
+  action 取 qa（基于已有产物直接问答）或 reanalyze（用户给了新指令/映射，要求重跑管线）。
 - chat: 闲聊、问候或不属于以上的任何内容
 
 输出格式（严格 JSON）:
-{"intent": "...", "confidence": 0.0到1.0的数, "topic": "核心主题或内容摘要（capture 意图放原始要点内容）", "action_summary": "一句话描述将执行的动作"}
+{"intent": "...", "confidence": 0.0到1.0的数, "topic": "核心主题或内容摘要（capture 意图放原始要点内容）", "action_summary": "一句话描述将执行的动作",
+ "action": "qa|reanalyze（仅 media_followup 输出）", "instruction": "用户的完整指令原文（仅 media_followup 输出）"}
+（非 media_followup 意图可不输出 action/instruction，向后兼容）
 
 示例:
 用户: 知识库里关于 HBM4 的笔记有哪些？
@@ -36,7 +41,11 @@ INTENT_PROMPT = """你是飞书机器人「知微」的意图识别层。根据�
 用户: 我想系统了解一下牛顿-舒尔茨迭代
 {"intent": "learn_concept", "confidence": 0.9, "topic": "牛顿-舒尔茨迭代", "action_summary": "生成 牛顿-舒尔茨迭代 概念学习卡片"}
 用户: 早上好
-{"intent": "chat", "confidence": 0.95, "topic": null, "action_summary": "闲聊"}"""
+{"intent": "chat", "confidence": 0.95, "topic": null, "action_summary": "闲聊"}
+用户: 这个博主的狮驼岭是指美国，凤仙郡是指中国，请代入重新分析刚才那个视频
+{"intent": "media_followup", "confidence": 0.92, "action": "reanalyze", "instruction": "狮驼岭=美国、凤仙郡=中国、棒子=韩国、鬼子=日本。代入这些真实指向还原代称后，重新输出整个视频的观点和摘要", "action_summary": "带代称映射重跑视频分析"}
+用户: 刚才那个视频第三点再展开讲讲
+{"intent": "media_followup", "confidence": 0.9, "action": "qa", "instruction": "展开讲第三点", "action_summary": "基于最近视频笔记回答追问"}"""
 
 # 确认策略阈值
 CAPTURE_AUTO = 0.85    # ≥ 直存 + 撤销回执
@@ -60,9 +69,12 @@ def _parse_intent(text):
         if not m:
             return None
         data = json.loads(m.group(1))
-        if data.get("intent") not in ("knowledge_query", "capture", "research", "status", "chat", "learn_concept"):
+        if data.get("intent") not in ("knowledge_query", "capture", "research", "status", "chat", "learn_concept", "media_followup"):
             return None
         data["confidence"] = float(data.get("confidence", 0.5))
+        # media_followup 的 action 仅允许 qa/reanalyze，非法值置 None
+        if data.get("intent") == "media_followup" and data.get("action") not in ("qa", "reanalyze"):
+            data["action"] = None
         return data
     except Exception:
         return None
@@ -71,6 +83,43 @@ def _parse_intent(text):
 def _confirm_research(query, user_id, message_id, ctx):
     from commands.knowledge_commands import do_knowledge_query
     do_knowledge_query(query, user_id, message_id, ctx, deep=True)
+
+
+def _exec_media_followup(action, artifact, instruction, user_id, message_id, ctx) -> bool:
+    """执行媒体追问：qa 基于产物笔记回答，reanalyze 带用户指令重跑管线（2026-08-04 P1.2）"""
+    from core.conversation_store import conversation_store
+    if action == "reanalyze":
+        conversation_store.set_instruction(artifact["id"], instruction)
+        try:
+            from media_handler import reprocess_with_instruction  # P1.3 提供
+            reprocess_with_instruction(user_id, artifact, instruction, message_id)
+            ctx.reply_message(message_id, "🎬 已带你的指令重新分析，约 3-5 分钟出结果。")
+        except ImportError:
+            ctx.reply_message(message_id, "📝 已记录你的指令，重跑管线能力即将上线，暂请重发链接处理。")
+        except Exception as e:
+            ctx.reply_message(message_id, f"❌ 重跑失败: {e}")
+        return True
+    # qa：基于产物笔记回答
+    note = ""
+    np = artifact.get("note_path")
+    if np:
+        try:
+            from pathlib import Path
+            note = Path(np).read_text(errors="ignore")[:4000]
+        except Exception:
+            note = ""
+    if not note:
+        note = artifact.get("summary") or ""
+    msg = (f"【背景：{artifact.get('kind', '内容')}《{artifact.get('title', '')}》的笔记】\n{note}\n\n"
+           f"【用户追问】{instruction}")
+    ans = llm_client.call_with_session("chat", msg, f"feishu-{user_id}")
+    if ans and not ans.startswith("❌ AI 暂时无法响应"):
+        ctx.reply_message(message_id, ans)
+        conversation_store.record_turn(user_id, "user", instruction)
+        conversation_store.record_turn(user_id, "assistant", ans)
+    else:
+        ctx.reply_message(message_id, ans or "❌ 追问回答失败，请稍后重试。")
+    return True
 
 
 def route_natural_language(text, user_id, message_id, ctx) -> bool:
@@ -91,6 +140,15 @@ def route_natural_language(text, user_id, message_id, ctx) -> bool:
             elif pending["kind"] == "learn":
                 from commands.learn_commands import do_learn
                 do_learn(pending["content"], user_id, message_id, ctx)
+            elif pending["kind"] == "media_followup":
+                c = pending["content"]
+                from core.conversation_store import conversation_store
+                artifact = conversation_store.get_last_artifact(user_id)
+                if not artifact or not isinstance(c, dict):
+                    ctx.reply_message(message_id, "原产物已失效，请重发链接重新处理。")
+                else:
+                    _exec_media_followup(c.get("action", "qa"), artifact,
+                                         c.get("instruction", ""), user_id, message_id, ctx)
             else:
                 from commands.knowledge_commands import do_capture
                 ok, info, filename = do_capture(pending["content"], user_id, source="飞书自然语言捕获")
@@ -129,6 +187,30 @@ def route_natural_language(text, user_id, message_id, ctx) -> bool:
                                   f"要为「{concept}」生成概念学习卡片吗？（约 1 分钟，沉淀进知识图谱）回复「确认」开始。")
                 return True
             return False
+
+        # 2.6) 媒体追问：基于最近产物问答或带指令重析（2026-08-04 P1.2）
+        if kind == "media_followup":
+            if conf < 0.5:
+                return False
+            from core.conversation_store import conversation_store
+            artifact = conversation_store.get_last_artifact(user_id)
+            if not artifact:
+                ctx.reply_message(message_id,
+                    "我这边没有找到最近处理过的视频/文章，请把链接重发一次，我重新处理。")
+                return True
+            instruction = intent.get("instruction") or topic or stripped
+            action = intent.get("action") or "qa"
+            if conf < 0.75:
+                _PENDING[user_id] = {"kind": "media_followup",
+                                     "content": {"action": action, "instruction": instruction,
+                                                 "artifact_id": artifact["id"]}}
+                _kind_zh = "视频" if artifact["kind"] == "video" else "内容"
+                _act_zh = "按你的指令重新分析" if action == "reanalyze" else "回答你的追问"
+                ctx.reply_message(message_id,
+                    f"理解为：基于最近的{_kind_zh}《{artifact.get('title', '')[:30]}》，"
+                    f"{_act_zh}。回复「确认」执行。")
+                return True
+            return _exec_media_followup(action, artifact, instruction, user_id, message_id, ctx)
 
         # 3) 捕获：按置信度分档
         if kind == "capture":
