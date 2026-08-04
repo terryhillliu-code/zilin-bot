@@ -141,3 +141,8 @@ find ~/zhiwei-common ~/zhiwei-bot ~/zhiwei-dev -name "__pycache__" -exec rm -rf 
 
 所有 launchd 配置位于 `~/Library/LaunchAgents/com.zhiwei.*.plist`。
 修改后需要 `launchctl bootout` + `launchctl bootstrap` 才能生效。
+
+## 8. 待归档：根目录 chat_handler.py（2026-08-04）
+
+根目录 `chat_handler.py` 在飞书文本路径上未被使用（`command_handler.py` 用的是
+`commands/chat_handler.py` 的 `ChatHandler`）。标记待归档，勿再扩展。

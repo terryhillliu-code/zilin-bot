@@ -306,11 +306,11 @@ def summarize_url(url: str) -> str:
         return f"❌ 网页处理异常: {str(e)}"
 
 
-def handle_video_async(text: str, message_id: str, user_id: str):
+def handle_video_async(text: str, message_id: str, user_id: str, instruction: str = None):
     """异步处理视频分析"""
     def _process():
         try:
-            response = process_video(text, message_id, user_id=user_id)
+            response = process_video(text, message_id, user_id=user_id, instruction=instruction)
             reply_message(message_id, response)
             TaskLogger.log_task("视频分析", "完成", extract_video_url(text))
         except Exception as e:
@@ -319,6 +319,16 @@ def handle_video_async(text: str, message_id: str, user_id: str):
 
     thread = threading.Thread(target=_process, daemon=True)
     thread.start()
+
+
+def reprocess_with_instruction(user_id, artifact, instruction, message_id):
+    """带用户指令重跑媒体管线（复用 distiller 转写缓存，不重新下载）
+
+    2026-08-04 P1.3: media_followup reanalyze 分支调用。artifact 为
+    ConversationStore.get_last_artifact 返回的 dict。
+    """
+    text = f"{artifact.get('url', '')} 重新分析"  # 含链接即可走原 extract 逻辑
+    handle_video_async(text, message_id, user_id, instruction=instruction)
 
 
 def _wants_vision(text: str) -> bool:
@@ -398,7 +408,7 @@ def _build_video_digest(output_path: str, title: str) -> str:
     return "\n\n".join(parts)
 
 
-def process_video(text: str, message_id: str = None, user_id: str = None) -> str:
+def process_video(text: str, message_id: str = None, user_id: str = None, instruction: str = None) -> str:
     """处理视频分析 - 调用宿主机 Distiller
 
     v2.0 新增：
@@ -454,6 +464,18 @@ def process_video(text: str, message_id: str = None, user_id: str = None) -> str
             # 网络出口由 distiller 内部自动走日本 VM 的 SOCKS5 隔离(平台感知)。
             cmd.extend(["--cookies-from-browser", "chrome"])
         # 其余平台：不带 cookies（避免无谓加载抖音 cookies 而在日志里产生 "cookie" 字样干扰错误归类）
+
+        # ⭐ 2026-08-04 P1.3: 用户指令注入(代称映射/还原)
+        if instruction:
+            _uid = user_id or "anon"
+            _inst_path = os.path.expanduser(f"~/zhiwei-bot/tmp/instruction_{_uid}.txt")
+            try:
+                os.makedirs(os.path.dirname(_inst_path), exist_ok=True)
+                Path(_inst_path).write_text(instruction, encoding='utf-8')
+                cmd.extend(["--instruction-file", _inst_path])
+                logger.info(f"[instruction] 已注入用户指令文件: {_inst_path}")
+            except Exception as e:
+                logger.warning(f"指令文件写入失败,跳过指令注入: {e}")
 
         logger.info(f"🎬 调用 Distiller: {' '.join(cmd[:3])}...")
 

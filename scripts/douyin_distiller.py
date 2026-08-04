@@ -3857,9 +3857,25 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
         else:
             logger.info("[vision] 无有效视觉信息(可能无图表画面)")
 
+    # ⭐ 2026-08-04 P1.3: 用户指令注入(代称映射/还原指令),与视觉信息同通道并入蒸馏 prompt
+    instruction_context = ""
+    _instruction_file = getattr(args, 'instruction_file', None)
+    if _instruction_file:
+        try:
+            _inst_text = Path(_instruction_file).expanduser().read_text(encoding='utf-8').strip()
+            if _inst_text:
+                instruction_context = (
+                    "**用户指定背景/还原指令（最高优先级）：**\n"
+                    f"{_inst_text}\n"
+                    "请在分析与摘要中严格执行上述还原与映射。")
+                logger.info(f"[instruction] 用户指令段落: {len(instruction_context)} 字符")
+        except Exception as e:
+            logger.warning(f"读取 instruction-file 失败: {e}")
+
     distiller = KnowledgeDistiller(config)
     try:
-        knowledge = distiller.distill(video_info, transcript, extra_context=visual_context)
+        _extra = (visual_context + "\n\n" + instruction_context).strip() if (visual_context or instruction_context) else ""
+        knowledge = distiller.distill(video_info, transcript, extra_context=_extra)
     except Exception as e:
         error_type, error_msg = classify_error(e)
         error_json = json.dumps({"error_type": error_type.value, "error_message": error_msg})
@@ -4016,6 +4032,8 @@ def main():
     parser.add_argument("--debug", action="store_true", help="启用调试模式")
     parser.add_argument("--openclaw-payload", type=str, help="OpenClaw 消息 payload（JSON 或纯文本）")
     parser.add_argument("--json", action="store_true", help="JSON 格式输出结果")
+    parser.add_argument("--instruction-file", type=str, metavar="PATH",
+                        help="用户指令文件(代称映射/还原指令),并入蒸馏 prompt 最高优先级")
 
     args = parser.parse_args()
 

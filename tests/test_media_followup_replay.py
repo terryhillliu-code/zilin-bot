@@ -63,14 +63,15 @@ def test_reanalyze_sets_instruction():
         _seed(store, "u1", title="T")
         with patch.object(nr, "_parse_intent",
                           return_value=_intent("reanalyze", 0.92, "狮驼岭=美国")), \
-             patch("core.conversation_store.conversation_store", store):
+             patch("core.conversation_store.conversation_store", store), \
+             patch("media_handler.reprocess_with_instruction") as mock_reproc:
             ctx = _make_ctx()
             r = nr.route_natural_language("代入重新分析刚才那个视频", "u1", "m1", ctx)
-        last = store.get_last_artifact("u1")
-        if r and last["instruction"] == "狮驼岭=美国":
-            print("✅ PASS: reanalyze 调 set_instruction(P1.3 未上线走 ImportError 降级)")
+            last = store.get_last_artifact("u1")
+        if r and last["instruction"] == "狮驼岭=美国" and mock_reproc.called:
+            print("✅ PASS: reanalyze 调 set_instruction + reprocess_with_instruction")
             return True
-    print(f"❌ FAIL: r={r} instruction={last.get('instruction')}")
+    print(f"❌ FAIL: r={r} instruction={last.get('instruction')} called={mock_reproc.called}")
     return False
 
 
