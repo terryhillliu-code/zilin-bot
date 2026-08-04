@@ -39,14 +39,18 @@ from message_log import message_log  # 入站消息日志
 from offline_recovery import init_offline_recovery, get_offline_recovery  # 离线消息恢复
 
 # 导入飞书 API 模块
-from feishu_api import reply_message, reply_card
+from feishu_api import reply_message, reply_card, send_direct_message
+
+# ⭐ v70.6: 任务账本（中断恢复看门狗用）
+import task_journal
 
 # 导入媒体处理模块
 from media_handler import (
     download_image, compress_image_base64, handle_image_async,
     extract_video_url, extract_article_url, is_article_url, is_video_url, summarize_url,
-    handle_video_async, process_video,
-    download_audio, transcribe_audio, handle_voice_task_async
+    handle_video_async, process_video, process_pdf, process_audio_file,
+    download_audio, transcribe_audio, handle_voice_task_async, handle_pdf_async,
+    handle_audio_file_async
 )
 
 from command_handler import handle_text_async, show_help, get_session_id, get_quick_status, check_rate_limit
@@ -123,10 +127,10 @@ def load_active_user() -> str:
 # ========== RAG 知识库功能 (Phase 4 新增) ==========
 
 def query_knowledge_base(query: str, top_k: int = 3) -> str:
-    """检索知识库 - 委托给 rag_bridge 模块"""
-    from rag_bridge import get_context
+    """检索知识库 - 直调 core.rag_client HTTP（2026-07-31: rag_bridge shim 已删）"""
+    from core.rag_client import get_rag_client
     print(f"📚 RAG 检索：{query}")
-    return get_context(query, top_k=top_k) or None
+    return get_rag_client().get_context(query, top_k=top_k) or None
 
 
 
@@ -350,9 +354,27 @@ def do_p2_im_message_receive_v1(data) -> None:
             reply_message(message_id, "🖼️ 正在分析图片，请稍候...")
             executor.submit(handle_image_async, message_id, image_key, user_id)
 
-        elif msg_type in ["media", "file"]:
+        elif msg_type == "file":
+            # ⭐ 2026-08-02: 文件蒸馏（PDF 文档 / 音频录音，视频笔记同模板，
+            # 笔记入 Inbox + 同步飞书文档）
+            file_key = content_dict.get("file_key", "")
+            file_name = content_dict.get("file_name", "")
+            ext = ("." + file_name.lower().rsplit(".", 1)[-1]) if "." in file_name else ""
+            if ext == ".pdf":
+                print(f"   PDF：{file_name}")
+                reply_message(message_id, f"📄 收到《{file_name}》，正在蒸馏笔记（约1-3分钟）...")
+                executor.submit(handle_pdf_async, message_id, file_key, file_name, user_id)
+            elif ext in (".m4a", ".mp3", ".wav", ".aac", ".ogg", ".flac"):
+                print(f"   音频文件：{file_name}")
+                reply_message(message_id, f"🎧 收到《{file_name}》，正在转写并蒸馏笔记（约2-10分钟）...")
+                executor.submit(handle_audio_file_async, message_id, file_key, file_name, user_id)
+            else:
+                reply_message(message_id,
+                    f"📁 暂不支持此类文件（{file_name or '未知'}）\n\n支持：文字 | 图片 | 网页链接 | 视频链接 | PDF文档 | 音频文件")
+
+        elif msg_type == "media":
             reply_message(message_id,
-                "📁 暂不支持该文件类型\n\n支持：文字 | 图片 | 网页链接 | 视频链接")
+                "📁 暂不支持该文件类型\n\n支持：文字 | 图片 | 网页链接 | 视频链接 | PDF文档 | 音频文件")
 
         else:
             print(f"   ⏭️ 不支持：{msg_type}")
@@ -424,7 +446,7 @@ def main():
     print("🤖 知微 v2.1 启动 (RAG 增强版)")
     print("   新增：知识库检索 (/ask 或 '查一下')")
     print("   特性：三层记忆 | 意图路由 | 任务日志")
-    print("   支持：文字 | 图片 | 网页链接 | 视频链接")
+    print("   支持：文字 | 图片 | 网页链接 | 视频链接 | PDF文档 | 音频文件")
     print("-" * 50)
 
     # ⭐ 初始化离线恢复模块（直接从环境变量获取 bot_id）
@@ -449,6 +471,82 @@ def main():
             print("ℹ️ ALERT_USER_ID 未配置，视频处理告警未启用")
     except Exception as e:
         print(f"⚠️ 告警用户设置失败: {e}")
+
+    # ⭐ v70.6 (2026-08-03): 统一中断恢复（视频+文件类）+ 周期看门狗
+    # 视频走 video_history(v70.5)；PDF/音频走 task_journal(v70.6,飞书可重下载)。
+    # 启动时扫一次 + 20min 周期扫描(连工作线程静默死亡的也能救)。
+    def _rerun_interrupted_video(url: str):
+        """补跑被中断的视频任务，完成后主动推送（无原消息可回复）"""
+        try:
+            response = process_video(url)  # 裸 URL 即可, extract_video_url 兼容
+            alert_uid = os.getenv("ALERT_USER_ID")
+            if alert_uid:
+                send_direct_message(alert_uid, f"🔄 中断任务已自动补跑完成\n\n{response}")
+        except Exception as e:
+            print(f"❌ 中断任务补跑异常: {e}")
+
+    def _rerun_interrupted_file(rec: dict):
+        """补跑被中断的文件类任务(pdf/audio)：飞书重下载 + 状态机流转
+        成功→recovered；失败→回退 processing(retry_count+1, <3 可被看门狗再捞)"""
+        try:
+            if rec["task_type"] == "pdf":
+                response = process_pdf(rec["message_id"], rec["file_key"], rec["ref"])
+            elif rec["task_type"] == "audio":
+                response = process_audio_file(rec["message_id"], rec["file_key"], rec["ref"])
+            else:
+                task_journal.mark_recovered(rec["id"])
+                return
+            if response and not response.startswith("❌"):
+                task_journal.mark_recovered(rec["id"])
+                alert_uid = os.getenv("ALERT_USER_ID")
+                if alert_uid:
+                    send_direct_message(alert_uid, f"🔄 中断任务已自动补跑完成\n\n{response}")
+            else:
+                task_journal.mark_retry(rec["id"])
+                print(f"⚠️ 补跑失败已回退待重试: {rec['ref'][:50]}")
+        except Exception as e:
+            task_journal.mark_retry(rec["id"])
+            print(f"❌ 文件任务补跑异常(已回退): {e}")
+
+    def _sweep_interrupted_tasks():
+        from video_history import get_video_history
+        # 视频（v70.5）
+        try:
+            stale = get_video_history().get_stale_processing(minutes=30)
+            for rec in stale:
+                if (rec.get("retry_count") or 0) < 3:
+                    print(f"   ▶️ 补跑视频: {rec['url'][:60]}")
+                    executor.submit(_rerun_interrupted_video, rec["url"])
+            if stale:
+                print(f"🔄 视频中断恢复: {len(stale)} 个")
+        except Exception as e:
+            print(f"⚠️ 视频中断扫描失败: {e}")
+        # 文件类（v70.6）
+        try:
+            stale_files = [r for r in task_journal.get_stale(minutes=30)
+                           if (r.get("retry_count") or 0) < 3]
+            for rec in stale_files:
+                task_journal.mark_recovering(rec["id"])  # recovering 态防重捞,失败回退
+                print(f"   ▶️ 补跑{rec['task_type']}: {rec['ref'][:50]}")
+                executor.submit(_rerun_interrupted_file, rec)
+            if stale_files:
+                print(f"🔄 文件任务中断恢复: {len(stale_files)} 个")
+        except Exception as e:
+            print(f"⚠️ 文件中断扫描失败: {e}")
+
+    _sweep_interrupted_tasks()  # 启动时先扫一次
+
+    def _task_watchdog_loop():
+        import time as _t
+        while True:
+            _t.sleep(1200)
+            try:
+                _sweep_interrupted_tasks()
+            except Exception as e:
+                print(f"⚠️ 看门狗扫描异常: {e}")
+
+    threading.Thread(target=_task_watchdog_loop, daemon=True, name="task_watchdog").start()
+    print("🐶 任务看门狗已启动 (20min 周期)")
 
     # ISSUE-003: 断连监控和告警线程（拆分至 ws_heartbeat.py，依赖注入避免循环 import）
     ws_heartbeat.start_connection_monitor(

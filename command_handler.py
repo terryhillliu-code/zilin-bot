@@ -17,6 +17,7 @@ from commands import (
     handle_research_commands,
     handle_system_commands,
     handle_knowledge_commands,
+    handle_learn_commands,  # ⭐ 概念学习卡片
     handle_media_commands,
     handle_agent_commands,
     handle_lark_commands,  # ⭐ v57.0
@@ -112,6 +113,10 @@ def handle_text_async(text, user_id, message_id, user_role="user"):
             return
 
         if handle_knowledge_commands(text_lower, text_stripped, user_id, message_id, _ctx):
+            return
+
+        # ⭐ 概念学习卡片（/learn → KarpathyVault/Concepts）
+        if handle_learn_commands(text_lower, text_stripped, user_id, message_id, _ctx):
             return
 
         if handle_system_commands(text_lower, text_stripped, user_id, message_id, _ctx):

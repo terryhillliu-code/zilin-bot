@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class PersonaService:
     """个人画像服务"""
 
-    DEFAULT_PATH = "70-79_个人笔记_Personal/Skills.md"
+    DEFAULT_PATH = "70-79_个人笔记/Skills.md"
 
     def __init__(self, obsidian_client=obsidian_client):
         self.client = obsidian_client
@@ -41,7 +41,7 @@ class PersonaService:
         # 2. 如果失败，尝试在大分类目录下搜索
         if not result.get("success"):
             logger.warning(f"直接读取失败，尝试搜索 'Skills'...")
-            search_result = self.client.search_vault("Skills", folder="70-79_个人笔记_Personal", limit=1)
+            search_result = self.client.search_vault("Skills", folder="70-79_个人笔记", limit=1)
             if search_result.get("total", 0) > 0:
                 best_match = search_result["results"][0]["path"]
                 logger.info(f"找到备选路径: {best_match}")

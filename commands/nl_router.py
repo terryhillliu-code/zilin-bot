@@ -15,8 +15,9 @@ INTENT_PROMPT = """你是飞书机器人「知微」的意图识别层。根据�
 
 意图类型:
 - knowledge_query: 查询/查找/回忆知识库中的内容（笔记、论文、以前记过的资料）
+- learn_concept: 想系统性学习/了解某个技术概念（原理、演进、横向对比），生成概念卡片沉淀进知识图谱。触发词如"学一下/我想了解/给我讲讲/梳理一下X"。注意与 knowledge_query 的区别：learn_concept 是"教我学懂这个概念"，knowledge_query 是"查我库里已有的资料"
 - capture: 要求记录/保存/记下某条信息、灵感或想法
-- research: 要求对某主题做深入调研/研究/整理报告
+- research: 要求对某主题做深入调研/研究/整理报告（一次性报告，不沉淀概念卡片）
 - status: 询问机器人或系统自身的状态/健康
 - chat: 闲聊、问候或不属于以上的任何内容
 
@@ -30,6 +31,10 @@ INTENT_PROMPT = """你是飞书机器人「知微」的意图识别层。根据�
 {"intent": "capture", "confidence": 0.92, "topic": "MLA 架构用光互连做长上下文缓存的思路值得跟进", "action_summary": "保存该想法到知识库"}
 用户: 帮我深入研究一下 CXL 内存池化
 {"intent": "research", "confidence": 0.9, "topic": "CXL 内存池化", "action_summary": "对 CXL 内存池化做扩展检索与整理"}
+用户: 学一下 Muon 这个优化器
+{"intent": "learn_concept", "confidence": 0.95, "topic": "Muon", "action_summary": "生成 Muon 概念学习卡片并接入知识图谱"}
+用户: 我想系统了解一下牛顿-舒尔茨迭代
+{"intent": "learn_concept", "confidence": 0.9, "topic": "牛顿-舒尔茨迭代", "action_summary": "生成 牛顿-舒尔茨迭代 概念学习卡片"}
 用户: 早上好
 {"intent": "chat", "confidence": 0.95, "topic": null, "action_summary": "闲聊"}"""
 
@@ -47,14 +52,15 @@ _CANCEL_WORDS = {"取消", "不", "不要", "算了", "no", "n"}
 def _parse_intent(text):
     """单轮 LLM 意图识别 → dict；失败返回 None"""
     try:
-        success, response = llm_client.call("chat", text, system_prompt=INTENT_PROMPT, timeout=15)
+        # ⭐ v70.3: 意图识别归队 format（轻量高频分类任务，原挂 chat 吃强模型浪费）
+        success, response = llm_client.call("format", text, system_prompt=INTENT_PROMPT, timeout=15)
         if not success or not response:
             return None
         m = re.search(r"(\{.*\})", response, re.DOTALL)
         if not m:
             return None
         data = json.loads(m.group(1))
-        if data.get("intent") not in ("knowledge_query", "capture", "research", "status", "chat"):
+        if data.get("intent") not in ("knowledge_query", "capture", "research", "status", "chat", "learn_concept"):
             return None
         data["confidence"] = float(data.get("confidence", 0.5))
         return data
@@ -82,6 +88,9 @@ def route_natural_language(text, user_id, message_id, ctx) -> bool:
             _PENDING.pop(user_id, None)
             if pending["kind"] == "research":
                 _confirm_research(pending["content"], user_id, message_id, ctx)
+            elif pending["kind"] == "learn":
+                from commands.learn_commands import do_learn
+                do_learn(pending["content"], user_id, message_id, ctx)
             else:
                 from commands.knowledge_commands import do_capture
                 ok, info, filename = do_capture(pending["content"], user_id, source="飞书自然语言捕获")
@@ -106,6 +115,20 @@ def route_natural_language(text, user_id, message_id, ctx) -> bool:
             from commands.knowledge_commands import do_knowledge_query
             do_knowledge_query(topic or stripped, user_id, message_id, ctx)
             return True
+
+        # 2.5) 概念学习：高置信直达（~60s 生成概念卡），中置信确认，低置信放行
+        if kind == "learn_concept":
+            concept = topic or stripped
+            if conf >= 0.75:
+                from commands.learn_commands import do_learn
+                do_learn(concept, user_id, message_id, ctx)
+                return True
+            if conf >= 0.5:
+                _PENDING[user_id] = {"kind": "learn", "content": concept}
+                ctx.reply_message(message_id,
+                                  f"要为「{concept}」生成概念学习卡片吗？（约 1 分钟，沉淀进知识图谱）回复「确认」开始。")
+                return True
+            return False
 
         # 3) 捕获：按置信度分档
         if kind == "capture":

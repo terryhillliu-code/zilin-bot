@@ -236,6 +236,21 @@ class VideoHistory:
 
             return [dict(r) for r in rows]
 
+    def get_stale_processing(self, minutes: int = 30) -> list[dict]:
+        """获取疑似被进程重启中断的任务（processing 状态超时未完成）。
+
+        背景（2026-08-03 11:53 事故）：SIGTERM 时 executor.shutdown(wait=False)
+        直接杀死在飞任务，记录永久卡在 processing。启动时扫描此列表自动补跑。
+        """
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT * FROM video_history
+                WHERE status = 'processing'
+                  AND created_at < datetime('now', 'localtime', ?)
+                ORDER BY created_at ASC
+            """, (f'-{minutes} minutes',)).fetchall()
+            return [dict(r) for r in rows]
+
     def can_retry(self, url: str) -> bool:
         """检查是否可以重试
 

@@ -261,7 +261,9 @@ def create_daily_note(pending_tasks: List[Dict], done_tasks: List[Dict]) -> str:
         笔记文件路径
     """
     vault_path = Path(os.path.expanduser("~/Documents/ZhiweiVault"))
-    notes_dir = vault_path / "80-89_Work" / "82_每日任务"
+    # 2026-07-31 修复: 原硬编码 "80-89_Work" 与 vault 规范目录 "80-89_工作文档_Work"
+    # 分裂（目录改名后代码未跟上，mkdir 每晚重建旧名目录），已合并归一
+    notes_dir = vault_path / "80-89_工作文档_Work" / "82_每日任务"
     notes_dir.mkdir(parents=True, exist_ok=True)
 
     today = datetime.now()

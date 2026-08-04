@@ -60,7 +60,10 @@ def handle_media_commands(text_lower, text_stripped, user_id, message_id, ctx):
                 reply_message(message_id, f"⚠️ 检测到重复视频\n\n📺 标题: {title}\n📅 处理时间: {processed_at}\n📁 输出文件: ...{output_name}\n\n👉 回复「继续」重新处理，或「取消」放弃")
                 return True
 
-        reply_message(message_id, "🎬 开始分析视频...\n\n⏳ 预计需要3-5分钟，完成后自动回复")
+        # 回执明确处理模式（2026-08-02：视觉分析已默认开启，告知用户免猜测）
+        from media_handler import _wants_vision
+        mode_s = "含视觉分析（图表/板书抽帧）" if _wants_vision(text_stripped) else "纯音频（已跳过视觉分析）"
+        reply_message(message_id, f"🎬 开始分析视频（{mode_s}）...\n\n⏳ 预计需要3-5分钟，完成后自动回复")
         ctx.handle_video_async(text_stripped, message_id, user_id)
         return True
 

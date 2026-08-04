@@ -105,8 +105,9 @@ class ChatHandler:
         rag_triggers = ["查一下", "搜一下", "知识库", "库里", "文档", "书中", "书里"]
         if any(keyword in text_stripped for keyword in rag_triggers):
             try:
-                from rag_bridge import get_context
-                rag_result = get_context(text_stripped)
+                # 2026-07-31: 直调 core.rag_client（rag_bridge shim 已删）
+                from core.rag_client import get_rag_client
+                rag_result = get_rag_client().get_context(text_stripped)
                 if rag_result:
                     rag_context = f"\n\n【参考资料】\n{rag_result}\n(请结合参考资料回答)"
             except ImportError:

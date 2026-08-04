@@ -38,10 +38,10 @@ CATEGORIES = {
     "AI-Hardware": "20-29_AI硬件_AI-Hardware",
     "Infra": "30-39_基础设施_Infra-Compute",
     "Networking": "40-49_网络与互联_Networking",
-    "AI-Briefs": "41_AI简报_AI-Briefs",
+    "AI-Briefs": "50-59_行业研究_Industry/54_AI简报_AI-Briefs",
     "Industry": "50-59_行业研究_Industry",
     "Business": "60-69_商业与管理_Business",
-    "Personal": "70-79_个人笔记_Personal",
+    "Personal": "70-79_个人笔记",
     "Work": "80-89_工作文档_Work",
     "System": "90-99_系统与归档_System",
     "Inbox": "Inbox"
@@ -375,7 +375,6 @@ def summarize_note(note_name: str) -> Dict:
 
     try:
         # 使用 zhiwei_common.llm
-        sys.path.insert(0, str(Path.home() / "zhiwei-common"))
         from zhiwei_common.llm import llm_client
 
         success, summary = llm_client.call("research", prompt, timeout=60)
@@ -485,7 +484,6 @@ def share_to_feishu(note_name: str, mode: str = "summary") -> Dict:
 
     # 4. 推送
     try:
-        sys.path.insert(0, str(Path.home() / "zhiwei-common"))
         from zhiwei_common.pusher import FeishuPusher
 
         pusher = FeishuPusher(

@@ -41,6 +41,9 @@ except ImportError:
 # 设置日志
 logger = logging.getLogger(__name__)
 
+# ⭐ v70.6: 任务账本（蒸馏任务全程留痕，中断可断点续跑）
+import task_journal
+
 # 导入依赖（由 ws_client.py 初始化）
 client = None
 reply_message = None
@@ -197,9 +200,10 @@ def extract_video_url(text: str) -> str:
         r'(https?://douyin\.com/video/\d+)',
         # 抖音长链（无协议前缀，需要补全）
         r'(?<![\w./])(douyin\.com/video/\d+)',
-        # YouTube
+        # YouTube（watch/短链/Shorts 2026-08-02 补）
         r'(https?://(?:www\.)?youtube\.com/watch\?v=[A-Za-z0-9_-]+)',
         r'(https?://youtu\.be/[A-Za-z0-9_-]+)',
+        r'(https?://(?:www\.)?youtube\.com/shorts/[A-Za-z0-9_-]+)',
         # B站
         r'(https?://(?:www\.)?bilibili\.com/video/[A-Za-z0-9_-]+)',
         r'(https?://b23\.tv/[A-Za-z0-9_-]+)'
@@ -275,7 +279,8 @@ def summarize_url(url: str) -> str:
         logger.info(f"🌐 正在调用 url_ingest 蒸馏网页: {url}")
         
         rag_venv = "/Users/liufang/zhiwei-rag/venv/bin/python3"
-        url_ingest_script = "/Users/liufang/zhiwei-rag/ingest/url_ingest.py"
+        # ⭐ v70.3 勘误: 真身在 scripts/ 下（原 ingest/ 路径不存在, 网页蒸馏一直静默失败）
+        url_ingest_script = "/Users/liufang/zhiwei-rag/scripts/url_ingest.py"
         
         # 调用 url_ingest 并启用蒸馏模式
         # 注意：这里我们只取 stdout 返回的摘要内容
@@ -317,15 +322,16 @@ def handle_video_async(text: str, message_id: str, user_id: str):
 
 
 def _wants_vision(text: str) -> bool:
-    """判断用户是否请求视觉分析(v3.0)
+    """是否启用视觉分析（抽帧 + VLM 图表/板书/架构图提取）
 
-    触发方式: 消息以 /video vision 开头,或消息同时含视频链接与「视觉分析」/「抽帧」关键词。
-    典型场景: 看完视频后把链接带关键词再发一次,触发抽帧+VLM 图表提取并重蒸馏。
+    2026-08-02: 默认开启（与 youtube_update 追更 job 对齐）——视频画面
+    信息本就属于分析输入；无图表画面时 VisionAnalyzer 自动跳过，不浪费
+    VLM 调用。`/video novision` 前缀或「纯音频」关键词可显式关闭。
     """
     stripped = text.strip().lower()
-    if stripped.startswith("/video vision"):
-        return True
-    return any(kw in text for kw in ("视觉分析", "抽帧"))
+    if stripped.startswith("/video novision") or "纯音频" in text:
+        return False
+    return True
 
 
 def _extract_md_section(text: str, heading: str, max_chars: int = 500) -> str:
@@ -374,7 +380,21 @@ def _build_video_digest(output_path: str, title: str) -> str:
         if fallback:
             parts.append(f"📄 摘要\n{fallback}")
 
-    parts.append(f"📁 完整笔记: {output_path}")
+    # ⭐ N3 (2026-08-02): 同步笔记为飞书文档，消息改发 feishu.cn 链接，
+    # 手机/任意设备可直接点开阅读全文；同步失败则降级回本地路径。
+    doc_url = None
+    try:
+        from feishu_note_sync import sync_note_to_feishu
+        synced = sync_note_to_feishu(output_path)
+        if synced:
+            doc_url = synced.get("doc_url")
+    except Exception as e:
+        logger.warning(f"飞书文档同步异常，降级回本地路径: {e}")
+
+    if doc_url:
+        parts.append(f"📄 完整笔记（点击阅读全文）: {doc_url}")
+    else:
+        parts.append(f"📁 完整笔记: {output_path}")
     return "\n\n".join(parts)
 
 
@@ -429,13 +449,10 @@ def process_video(text: str, message_id: str = None) -> str:
             # 抖音使用 cookies 文件
             cmd.extend(["--cookies", os.path.expanduser("~/zhiwei-bot/secrets/douyin_cookies.txt")])
         elif "youtube.com" in url or "youtu.be" in url:
-            # ⭐ v3.1: YouTube 需登录 cookies 才能过 bot 检测拿字幕列表；
+            # ⭐ 2026-08-02: youtube_cookies.txt 文件态已被服务端吊销(实测
+            # bot 检测全灭), 改为直读 Chrome 登录态(与 B站同策略, 实测通过);
             # 网络出口由 distiller 内部自动走日本 VM 的 SOCKS5 隔离(平台感知)。
-            yt_ck = os.path.expanduser("~/zhiwei-bot/secrets/youtube_cookies.txt")
-            if os.path.exists(yt_ck):
-                cmd.extend(["--cookies", yt_ck])
-            else:
-                logger.warning("YouTube cookies 缺失，字幕提取可能被 bot 检测拦截")
+            cmd.extend(["--cookies-from-browser", "chrome"])
         # 其余平台：不带 cookies（避免无谓加载抖音 cookies 而在日志里产生 "cookie" 字样干扰错误归类）
 
         logger.info(f"🎬 调用 Distiller: {' '.join(cmd[:3])}...")
@@ -787,12 +804,13 @@ def text_to_speech_reply(text: str, message_id: str) -> bool:
 # ========== 语音任务收集 ==========
 
 def handle_voice_task_async(message_id: str, file_key: str, user_id: str):
-    """异步处理语音 -> 转文字 -> 等待确认 -> 提取任务
+    """异步处理语音 -> 转文字 -> 与文字完全等价的自然语言路由
 
-    流程：
-    1. 下载语音文件
-    2. 转录为文字
-    3. 存入待确认队列，等待用户回复「确认」
+    2026-08-01 重构（用户决策）: 语音 = 文字的另一种输入形式。
+    转写后直接进统一路由（学习/查询/捕获/分析等意图与打字一致），
+    不再写入 pending_voice、不再要求「回复确认」。识别结果先回执展示，
+    识别有误可直接重说（command_handler 的 pending_voice 消费逻辑
+    因不再写入而自然空转，保护文件零改动）。
     """
     try:
         # 1. 下载语音
@@ -803,24 +821,203 @@ def handle_voice_task_async(message_id: str, file_key: str, user_id: str):
 
         # 2. 转录
         text = transcribe_audio(audio_path)
-        if not text:
+        if not text or not text.strip():
             reply_message(message_id, "❌ 语音识别失败，请重试")
             return
+        text = text.strip()
 
-        # 3. 存入待确认，等待用户回复
-        pending_voice[user_id] = {
-            "text": text,
-            "time": time.time()
-        }
+        # 3. 回执识别结果（供用户核对，误识别可立即重说）
+        reply_message(message_id, f"🎤 {text}")
 
-        # 4. 回复，等待确认
-        reply_message(message_id,
-            f"🎤 语音识别结果：\n\n{text}\n\n"
-            f"回复「确认」提取任务，或「取消」放弃"
-        )
+        # 4. 走与文字完全相同的处理路由
+        from command_handler import handle_text_async
+        handle_text_async(text, user_id, message_id)
 
-        logger.info(f"🎤 语音待确认: {user_id} - {text[:50]}...")
+        logger.info(f"🎤 语音已路由: {user_id} - {text[:50]}...")
 
     except Exception as e:
         logger.error(f"语音处理异常: {e}")
         reply_message(message_id, f"❌ 语音处理异常: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# PDF 文档蒸馏（2026-08-02 新增）
+# 飞书文件消息(PDF) → 下载 → pdf_distiller 蒸馏成 Obsidian 笔记(Inbox)
+# → 复用视频摘要回推（含 feishu_note_sync 飞书文档链接，手机可读）
+# ---------------------------------------------------------------------------
+
+def download_file_resource(message_id: str, file_key: str, suffix: str = ".pdf") -> str:
+    """下载飞书文件消息附件（与 download_audio 同一 API，type=file）"""
+    try:
+        from lark_oapi.api.im.v1 import GetMessageResourceRequest
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp_path = tmp_file.name
+        tmp_file.close()
+
+        request = GetMessageResourceRequest.builder() \
+            .message_id(message_id) \
+            .file_key(file_key) \
+            .type("file") \
+            .build()
+        response = client.im.v1.message_resource.get(request)
+
+        if response.success():
+            with open(tmp_path, "wb") as f:
+                f.write(response.file.read())
+            print(f"✅ 文件下载成功: {tmp_path} ({os.path.getsize(tmp_path)} bytes)")
+            return tmp_path
+        print(f"❌ 文件下载失败: {response.code}")
+        return None
+    except Exception as e:
+        print(f"❌ 文件下载异常: {e}")
+        return None
+
+
+def process_pdf(message_id: str, file_key: str, file_name: str) -> str:
+    """PDF 蒸馏主流程：下载 → 子进程蒸馏 → 复用 _build_video_digest 回推
+
+    v70.6: 全程 task_journal 留痕，进程中断可被看门狗断点续跑。
+    """
+    pdf_path = download_file_resource(message_id, file_key, suffix=".pdf")
+    if not pdf_path:
+        return "❌ PDF 下载失败，请重试"
+
+    journal_id = task_journal.record_start("pdf", file_name, message_id, file_key)
+    try:
+        size_mb = os.path.getsize(pdf_path) / 1024 / 1024
+        if size_mb > 50:
+            task_journal.record_failed(journal_id, f"过大 {size_mb:.0f}MB")
+            return f"❌ PDF 过大（{size_mb:.0f}MB > 50MB），暂不支持"
+
+        venv_python = os.path.expanduser("~/zhiwei-shared-venv/bin/python")
+        distiller_path = os.path.expanduser("~/zhiwei-bot/scripts/pdf_distiller.py")
+        cmd = [venv_python, distiller_path,
+               "--pdf", pdf_path,
+               "--output-dir", os.path.expanduser("~/Documents/ZhiweiVault/Inbox")]
+
+        logger.info(f"📄 调用 PDF Distiller: {file_name} ({size_mb:.1f}MB)")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        except subprocess.TimeoutExpired:
+            task_journal.record_failed(journal_id, "蒸馏超时 900s")
+            return "❌ PDF 分析超时（超过 15 分钟），文件可能过大"
+
+        if result.returncode != 0:
+            logger.error(f"PDF Distiller 失败: {result.stderr[-400:]}")
+            task_journal.record_failed(journal_id, (result.stderr or "rc!=0")[-200:])
+            if "扫描件" in result.stderr:
+                return "❌ 该 PDF 是扫描件/图片型，提取不到文字（OCR 支持后续再加）"
+            return "❌ PDF 分析失败（内部错误），已记录日志"
+
+        match = re.search(r'Output: (.+\.md)', result.stdout)
+        if match:
+            output_path = match.group(1)
+            # 复用视频摘要回推：抽取核心洞察 + 同步飞书文档给可点链接
+            digest = _build_video_digest(output_path, Path(output_path).stem)
+            task_journal.record_done(journal_id)
+            return digest
+        task_journal.record_failed(journal_id, "distiller 输出无 Output 路径")
+        return f"✅ PDF 处理完成\n\n{result.stdout[-300:]}"
+    except Exception as e:
+        task_journal.record_failed(journal_id, str(e)[:200])
+        raise
+    finally:
+        try:
+            os.remove(pdf_path)
+        except OSError:
+            pass
+
+
+def handle_pdf_async(message_id: str, file_key: str, file_name: str, user_id: str):
+    """异步处理 PDF 文档蒸馏"""
+    def _process():
+        try:
+            response = process_pdf(message_id, file_key, file_name)
+            reply_message(message_id, response)
+            TaskLogger.log_task("PDF蒸馏", "完成", file_name)
+        except Exception as e:
+            print(f"❌ PDF 异步处理异常: {e}")
+            reply_message(message_id, f"❌ PDF 处理失败: {str(e)}")
+
+    thread = threading.Thread(target=_process, daemon=True)
+    thread.start()
+
+
+# ---------------------------------------------------------------------------
+# 音频文件蒸馏（2026-08-02 新增）
+# 飞书文件消息(m4a/mp3/...) → 下载 → audio_distiller 转写+蒸馏成笔记(Inbox)
+# → 复用视频摘要回推（含 feishu_note_sync 飞书文档链接，手机可读）
+# ---------------------------------------------------------------------------
+
+AUDIO_FILE_EXTS = (".m4a", ".mp3", ".wav", ".aac", ".ogg", ".flac")
+
+
+def process_audio_file(message_id: str, file_key: str, file_name: str) -> str:
+    """音频文件蒸馏主流程：下载 → 子进程转写+蒸馏 → 复用 _build_video_digest 回推
+
+    v70.6: 全程 task_journal 留痕，进程中断可被看门狗断点续跑。
+    """
+    suffix = Path(file_name).suffix.lower() or ".m4a"
+    audio_path = download_file_resource(message_id, file_key, suffix=suffix)
+    if not audio_path:
+        return "❌ 音频下载失败，请重试"
+
+    journal_id = task_journal.record_start("audio", file_name, message_id, file_key)
+    try:
+        size_mb = os.path.getsize(audio_path) / 1024 / 1024
+        if size_mb > 100:
+            task_journal.record_failed(journal_id, f"过大 {size_mb:.0f}MB")
+            return f"❌ 音频过大（{size_mb:.0f}MB > 100MB），暂不支持"
+
+        venv_python = os.path.expanduser("~/zhiwei-shared-venv/bin/python")
+        distiller_path = os.path.expanduser("~/zhiwei-bot/scripts/audio_distiller.py")
+        cmd = [venv_python, distiller_path,
+               "--audio", audio_path,
+               "--output-dir", os.path.expanduser("~/Documents/ZhiweiVault/Inbox")]
+
+        logger.info(f"🎧 调用 Audio Distiller: {file_name} ({size_mb:.1f}MB)")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        except subprocess.TimeoutExpired:
+            task_journal.record_failed(journal_id, "处理超时 1800s")
+            return "❌ 音频处理超时（超过 30 分钟），文件可能过长"
+
+        if result.returncode != 0:
+            logger.error(f"Audio Distiller 失败: {result.stderr[-400:]}")
+            task_journal.record_failed(journal_id, (result.stderr or "rc!=0")[-200:])
+            if "转写" in result.stderr:
+                return "❌ 音频转写失败（云端和本地识别均未成功），已记录日志"
+            return "❌ 音频分析失败（内部错误），已记录日志"
+
+        match = re.search(r'Output: (.+\.md)', result.stdout)
+        if match:
+            output_path = match.group(1)
+            # 复用视频摘要回推：抽取核心洞察 + 同步飞书文档给可点链接
+            digest = _build_video_digest(output_path, Path(output_path).stem)
+            task_journal.record_done(journal_id)
+            return digest
+        task_journal.record_failed(journal_id, "distiller 输出无 Output 路径")
+        return f"✅ 音频处理完成\n\n{result.stdout[-300:]}"
+    except Exception as e:
+        task_journal.record_failed(journal_id, str(e)[:200])
+        raise
+    finally:
+        try:
+            os.remove(audio_path)
+        except OSError:
+            pass
+
+
+def handle_audio_file_async(message_id: str, file_key: str, file_name: str, user_id: str):
+    """异步处理音频文件蒸馏"""
+    def _process():
+        try:
+            response = process_audio_file(message_id, file_key, file_name)
+            reply_message(message_id, response)
+            TaskLogger.log_task("音频蒸馏", "完成", file_name)
+        except Exception as e:
+            print(f"❌ 音频文件异步处理异常: {e}")
+            reply_message(message_id, f"❌ 音频处理失败: {str(e)}")
+
+    thread = threading.Thread(target=_process, daemon=True)
+    thread.start()
