@@ -104,6 +104,21 @@ def handle_text_async(text, user_id, message_id, user_role="user"):
             except Exception as e:
                 print(f"⚠️ 图片追问异常，降级走常规流程: {e}")
 
+    # 视频重复确认消费（2026-08-04 P0.3：原 pending_video_confirm 只写不读）
+    _pvc = getattr(_ctx, 'pending_video_confirm', None)
+    if _pvc is not None and user_id in _pvc:
+        _entry = _pvc[user_id]
+        if time.time() - _entry.get("time", 0) > 600:
+            _pvc.pop(user_id, None)
+        elif text_lower in ("继续", "重新处理"):
+            _pvc.pop(user_id, None)
+            _ctx.reply_message(message_id, "🎬 好的，重新处理该视频...")
+            return _ctx.handle_video_async(_entry["text"], message_id, user_id)
+        elif text_lower in ("取消", "算了"):
+            _pvc.pop(user_id, None)
+            _ctx.reply_message(message_id, "已取消，不再重复处理。")
+            return
+
     try:
         # 1. 基础命令拦截
         if handle_dev_commands(text_lower, text_stripped, user_id, message_id, _ctx):

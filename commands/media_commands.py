@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from pathlib import Path
 from zhiwei_common.config import ZHIWEI_BOT
 
@@ -57,6 +58,12 @@ def handle_media_commands(text_lower, text_stripped, user_id, message_id, ctx):
                 output_path = dup.get('output_path', '')
                 output_name = output_path[-50:] if output_path else '未知'
 
+                _pvc = getattr(ctx, 'pending_video_confirm', None)
+                if _pvc is not None:
+                    _pvc[user_id] = {
+                        "url": url, "text": text_stripped,
+                        "message_id": message_id, "time": time.time(),
+                    }
                 reply_message(message_id, f"⚠️ 检测到重复视频\n\n📺 标题: {title}\n📅 处理时间: {processed_at}\n📁 输出文件: ...{output_name}\n\n👉 回复「继续」重新处理，或「取消」放弃")
                 return True
 

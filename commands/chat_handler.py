@@ -31,6 +31,8 @@ def _get_mem0():
 
 def _call_openclaw_agent(message: str, session_id: str, agent: str = "main", timeout: int = 120) -> tuple:
     """
+    DEPRECATED 2026-08-04: Docker/clawdbot 已退役，勿再接线。原调用点已删除，函数体保留备查。
+
     调用 OpenClaw Agent（内部函数）
 
     Returns:
@@ -123,20 +125,15 @@ class ChatHandler:
 
         enriched_message = "\n".join(enriched_parts)
 
-        # ⭐ 优先使用 OpenClaw（有 session 记忆）
-        success, response = _call_openclaw_agent(enriched_message, session_id, agent="main")
+        # ⭐ 2026-08-04 P0.1: OpenClaw(Docker/clawdbot)已退役，直接走本地 LLM + memory_manager
+        from zhiwei_common.llm import llm_client
 
-        if not success:
-            # 降级：使用本地 LLM + memory_manager
-            logger.warning(f"OpenClaw 调用失败: {response}，降级到本地 LLM")
-            from zhiwei_common.llm import llm_client
+        # 获取本地记忆上下文
+        memory = self.get_memory(user_id)
+        context_prompt = memory.build_context_prompt()
+        full_message = f"{context_prompt}\n\n{enriched_message}" if context_prompt else enriched_message
 
-            # 获取本地记忆上下文
-            memory = self.get_memory(user_id)
-            context_prompt = memory.build_context_prompt()
-            full_message = f"{context_prompt}\n\n{enriched_message}" if context_prompt else enriched_message
-
-            response = llm_client.call_with_session("chat", full_message, session_id)
+        response = llm_client.call_with_session("chat", full_message, session_id)
 
         # ⭐ 2026-07-26 H2 提速：先回复用户，记忆写入全部移到后台线程
         # （原流程记忆写入阻塞回复，最坏 ~70s 才收到答案）

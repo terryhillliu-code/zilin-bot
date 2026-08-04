@@ -312,6 +312,16 @@ def handle_video_async(text: str, message_id: str, user_id: str):
         try:
             response = process_video(text, message_id)
             reply_message(message_id, response)
+            # ⭐ 2026-08-04 P0.2: 媒体产物回写会话(过渡实现,P1.1 ConversationStore 上线后删除)
+            if response.startswith("✅"):
+                try:
+                    from zhiwei_common.llm import llm_client
+                    llm_client._append_session(
+                        f"feishu-{user_id}",
+                        f"[系统通知] 用户刚才发的视频已分析完成。结果摘要：{response[:600]}",
+                        "已记录，后续追问可基于以上内容回答")
+                except Exception as e:
+                    logger.warning(f"视频产物注入会话失败: {e}")
             TaskLogger.log_task("视频分析", "完成", extract_video_url(text))
         except Exception as e:
             print(f"❌ 视频分析异步处理异常: {e}")
