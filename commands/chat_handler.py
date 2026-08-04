@@ -139,6 +139,12 @@ class ChatHandler:
         # （原流程记忆写入阻塞回复，最坏 ~70s 才收到答案）
         self.add_to_history(user_id, "bot", response)
         self.reply_message(message_id, response)
+        # ⭐ 2026-08-04 P1.1: bot 回复回写 ConversationStore（与 add_to_history 并存，后者截断仅展示用）
+        try:
+            from core.conversation_store import conversation_store
+            conversation_store.record_turn(user_id, "assistant", response)
+        except Exception as e:
+            logger.warning(f"会话回写失败: {e}")
 
         def _save_memories_bg():
             try:

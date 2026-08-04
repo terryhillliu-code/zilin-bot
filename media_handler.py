@@ -310,18 +310,8 @@ def handle_video_async(text: str, message_id: str, user_id: str):
     """异步处理视频分析"""
     def _process():
         try:
-            response = process_video(text, message_id)
+            response = process_video(text, message_id, user_id=user_id)
             reply_message(message_id, response)
-            # ⭐ 2026-08-04 P0.2: 媒体产物回写会话(过渡实现,P1.1 ConversationStore 上线后删除)
-            if response.startswith("✅"):
-                try:
-                    from zhiwei_common.llm import llm_client
-                    llm_client._append_session(
-                        f"feishu-{user_id}",
-                        f"[系统通知] 用户刚才发的视频已分析完成。结果摘要：{response[:600]}",
-                        "已记录，后续追问可基于以上内容回答")
-                except Exception as e:
-                    logger.warning(f"视频产物注入会话失败: {e}")
             TaskLogger.log_task("视频分析", "完成", extract_video_url(text))
         except Exception as e:
             print(f"❌ 视频分析异步处理异常: {e}")
@@ -408,7 +398,7 @@ def _build_video_digest(output_path: str, title: str) -> str:
     return "\n\n".join(parts)
 
 
-def process_video(text: str, message_id: str = None) -> str:
+def process_video(text: str, message_id: str = None, user_id: str = None) -> str:
     """处理视频分析 - 调用宿主机 Distiller
 
     v2.0 新增：
@@ -543,7 +533,22 @@ def process_video(text: str, message_id: str = None) -> str:
                     video_history.record_done(url, title, output_path)
                 # ⭐ 2026-07-31 N2: 不再只回文件路径（旧行为要求用户自己去
                 # Obsidian 翻），直接把笔记里的要点摘要回推，形成闭环。
-                return _build_video_digest(output_path, title)
+                digest = _build_video_digest(output_path, title)
+                # ⭐ 2026-08-04 P1.1: 媒体产物回写 ConversationStore，供 media_followup
+                # 基于本次产物追问/重析（_build_video_digest 只调一次，避免重复同步飞书文档）
+                if user_id:
+                    try:
+                        from core.conversation_store import conversation_store
+                        conversation_store.register_artifact(
+                            user_id, "video", url=url, title=title,
+                            note_path=output_path, summary=digest[:500])
+                        conversation_store.record_turn(
+                            user_id, "system",
+                            f"视频《{title}》分析完成：{digest[:300]}",
+                            kind="artifact_notice")
+                    except Exception as e:
+                        logger.warning(f"视频产物回写 ConversationStore 失败: {e}")
+                return digest
             return f"✅ 视频处理完成\n\n{output[-500:]}"
 
         return f"⚠️ 视频处理完成但输出格式异常\n\n{output[-500:]}"

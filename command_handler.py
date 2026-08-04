@@ -162,8 +162,13 @@ def handle_text_async(text, user_id, message_id, user_role="user"):
             return
 
         # 3. 传统对话
+        # ⭐ 2026-08-04 P1.1: 兜底前回写用户消息并注入 ConversationStore 上下文
+        from core.conversation_store import conversation_store
+        conversation_store.record_turn(user_id, "user", text_stripped)
+        _conv_ctx = conversation_store.build_context(user_id)
+        _msg = f"{_conv_ctx}\n\n当前消息: {text_stripped}" if _conv_ctx else text_stripped
         handler = ChatHandler(_ctx.reply_message, _ctx.reply_card, _ctx.get_memory, _ctx.add_to_history)
-        handler.handle_chat_message(text_stripped, user_id, message_id, session_id)
+        handler.handle_chat_message(_msg, user_id, message_id, session_id)
 
     except Exception as e:
         print(f"❌ 文本处理异常: {e}")
