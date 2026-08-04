@@ -3044,8 +3044,8 @@ class KnowledgeDistiller:
         user_msg = f"请处理以下 ASR 转录文本：\n\n{transcript_text}"
 
         try:
-            success, content = self.llm_client.call(
-                role="format",
+            success, content = self.llm_client.call_by_task(
+                task="classify",
                 message=user_msg,
                 system_prompt=self.STAGE1_SYSTEM_PROMPT,
                 timeout=90
@@ -3078,8 +3078,8 @@ class KnowledgeDistiller:
         corrected_transcript 为空串，distill 的防御逻辑会自动改用原文。
         """
         try:
-            success, content = self.llm_client.call(
-                role="format",
+            success, content = self.llm_client.call_by_task(
+                task="classify",
                 message=f"请处理以下文本：\n\n{text}",
                 system_prompt=self.STAGE1_CLASSIFY_ONLY_PROMPT,
                 timeout=60,
@@ -3204,7 +3204,7 @@ class KnowledgeDistiller:
                 logger.info(f"Stage 2: analyzing chunk {i+1}/{n_chunks}")
                 chunk_prompt = f"提取此视频片段的 key_points（只需时间戳和洞察点）：\n{chunk}\n\n输出 JSON: {{\"key_points\": [{{\"timestamp\": \"MM:SS\", \"insight\": \"...\"}}]}}"
                 try:
-                    ok, resp = self.llm_client.call(role="format", message=chunk_prompt, timeout=60)
+                    ok, resp = self.llm_client.call_by_task(task="classify", message=chunk_prompt, timeout=60)
                     if ok:
                         m = re.search(r'\{[\s\S]*\}', resp)
                         if m:
@@ -3233,11 +3233,11 @@ class KnowledgeDistiller:
         logger.info(f"Stage 2: deep analysis with research role (content_type={content_type})")
 
         try:
-            success, content = self.llm_client.call(
-                role="research",
+            success, content = self.llm_client.call_by_task(
+                task="deep_analysis",
                 message=user_prompt,
                 system_prompt=stage2_prompt,
-                timeout=240  # v70.4: qwen3.8-max-preview 中位 100-166s，120s 会误触发降级
+                timeout=240  # deepseek-v4-pro 42s on 5k chars, ample margin
             )
 
             if success:

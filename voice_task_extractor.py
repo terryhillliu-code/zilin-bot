@@ -79,8 +79,8 @@ def extract_tasks(text: str) -> List[Dict]:
         user_message = f"请从以下内容中提取待办任务：\n\n{text}"
 
         # 调用 LLM
-        success, response = llm_client.call(
-            role="format",  # 使用通微角色，适合结构化输出
+        success, response = llm_client.call_by_task(
+            task="classify",
             message=user_message,
             system_prompt=system_prompt,
             timeout=30
