@@ -327,6 +327,7 @@ class ShareTextExtractor:
     # 支持的 URL 模式（按优先级排序）
     URL_PATTERNS = [
         r'https?://v\.douyin\.com/[A-Za-z0-9_/-]+',           # 抖音短链
+        r'https?://(?:www\.)?iesdouyin\.com/share/video/\d+', # ⭐ 2026-08-05: 抖音新版分享格式
         r'https?://www\.douyin\.com/video/\d+',              # 抖音长链
         r'https?://www\.tiktok\.com/@[^/]+/video/\d+',       # TikTok
         r'https?://vm\.tiktok\.com/[A-Za-z0-9]+',            # TikTok 短链
@@ -364,6 +365,11 @@ class ShareTextExtractor:
                 # 注：口令垃圾清理已由上游 rstrip 中文标点覆盖
                 # 再次清理尾部标点
                 url = url.rstrip('，。！？、；：""''）】》./')
+                # ⭐ 2026-08-05: iesdouyin 分享链接归一化为标准格式
+                # （douyin-api :8680 只认 douyin.com/video/ID，不认 share/video）
+                _m = re.match(r'https?://(?:www\.)?iesdouyin\.com/share/video/(\d+)', url)
+                if _m:
+                    url = f'https://www.douyin.com/video/{_m.group(1)}'
                 if url and url not in seen:
                     seen.add(url)
                     urls.append(url)
@@ -3242,6 +3248,23 @@ class KnowledgeDistiller:
 
             if success:
                 result = self._parse_response(content)
+                # ⭐ 2026-08-05: JSON 畸形时换 kimi-k2.5 重试一次（与主力 deepseek-v4-pro 不同供应商）
+                # minimax-m3 商业类内容 JSON 畸形 3/3（引号未转义，非网络问题），已弃用为主力
+                if result.title == "解析失败":
+                    logger.warning("Stage 2 JSON 解析失败，切换 kimi-k2.5 (Coding Plan) 重试")
+                    try:
+                        retry_ok, retry_content = self.llm_client.call(
+                            "research", user_prompt,
+                            system_prompt=stage2_prompt,
+                            timeout=240, prefer_api="coding_plan"
+                        )
+                        if retry_ok:
+                            retry_result = self._parse_response(retry_content)
+                            if retry_result.title != "解析失败":
+                                logger.info("Stage 2 重试成功 (kimi-k2.5)")
+                                result = retry_result
+                    except Exception as re_:
+                        logger.error(f"Stage 2 重试异常: {re_}")
                 # 补充分段提取的 key_points
                 if len(chunks) > 1 and all_key_points:
                     existing_ts = {p.get("timestamp") for p in result.key_points}
@@ -3270,45 +3293,57 @@ class KnowledgeDistiller:
 
         try:
             data = json.loads(json_str)
-            # 按内容类型取对应的分析字段，统一存入 technical_reconstruction
-            type_analysis = (
-                data.get("technical_reconstruction")
-                or data.get("knowledge_framework")
-                or data.get("market_analysis")
-                or data.get("workflow_sop")
-                or {"architecture": "未提取", "tooling": "未提取", "metrics": "未提取", "pitfalls": "未提取"}
-            )
-            return DistilledKnowledge(
-                title=data.get("title", "未命名"),
-                core_insight=data.get("core_insight", data.get("one_liner", "")),
-                content_tier=data.get("content_tier", "B"),
-                key_points=data.get("key_points", []),
-                summary=data.get("summary", ""),
-                target_audience=data.get("target_audience", ""),
-                use_cases=data.get("use_cases", ""),
-                tags=data.get("tags", []),
-                action_items=data.get("action_items", []),
-                references=data.get("references", []),
-                related_concepts=data.get("related_concepts", []),
-                technical_reconstruction=type_analysis,
-                implementation_guide=data.get("implementation_guide", {}),
-                author_claims=data.get("author_claims", [])
-            )
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parse error: {e}")
-            return DistilledKnowledge(
-                title="解析失败",
-                core_insight="",
-                content_tier="D",
-                key_points=[],
-                summary="",
-                target_audience="",
-                use_cases="",
-                tags=["需人工处理"],
-                action_items=[],
-                references=[],
-                related_concepts=[]
-            )
+        except json.JSONDecodeError:
+            # ⭐ 2026-08-05: JSON 容错——LLM 常在字符串内输出未转义换行/尾逗号
+            # （minimax-m3 实测会产出此类畸形 JSON，此前直接落"解析失败"模板）
+            try:
+                data = json.loads(json_str, strict=False)  # 允许字符串内控制字符
+                logger.info("JSON 容错解析成功 (strict=False)")
+            except json.JSONDecodeError:
+                try:
+                    repaired = re.sub(r',\s*([}\]])', r'\1', json_str)  # 去尾逗号
+                    data = json.loads(repaired, strict=False)
+                    logger.info("JSON 修复解析成功 (去尾逗号)")
+                except json.JSONDecodeError as e2:
+                    logger.error(f"JSON parse error: {e2}")
+                    return DistilledKnowledge(
+                        title="解析失败",
+                        core_insight="",
+                        content_tier="D",
+                        key_points=[],
+                        summary="",
+                        target_audience="",
+                        use_cases="",
+                        tags=["需人工处理"],
+                        action_items=[],
+                        references=[],
+                        related_concepts=[]
+                    )
+
+        # 按内容类型取对应的分析字段，统一存入 technical_reconstruction
+        type_analysis = (
+            data.get("technical_reconstruction")
+            or data.get("knowledge_framework")
+            or data.get("market_analysis")
+            or data.get("workflow_sop")
+            or {"architecture": "未提取", "tooling": "未提取", "metrics": "未提取", "pitfalls": "未提取"}
+        )
+        return DistilledKnowledge(
+            title=data.get("title", "未命名"),
+            core_insight=data.get("core_insight", data.get("one_liner", "")),
+            content_tier=data.get("content_tier", "B"),
+            key_points=data.get("key_points", []),
+            summary=data.get("summary", ""),
+            target_audience=data.get("target_audience", ""),
+            use_cases=data.get("use_cases", ""),
+            tags=data.get("tags", []),
+            action_items=data.get("action_items", []),
+            references=data.get("references", []),
+            related_concepts=data.get("related_concepts", []),
+            technical_reconstruction=type_analysis,
+            implementation_guide=data.get("implementation_guide", {}),
+            author_claims=data.get("author_claims", [])
+        )
 
     def _fallback_distill(self, video_info: VideoInfo, transcript: TranscriptResult) -> DistilledKnowledge:
         """降级处理：简单的文本截取"""

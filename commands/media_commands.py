@@ -58,8 +58,12 @@ def handle_media_commands(text_lower, text_stripped, user_id, message_id, ctx):
                 output_path = dup.get('output_path', '')
                 output_name = output_path[-50:] if output_path else '未知'
 
-                _pvc = getattr(ctx, 'pending_video_confirm', None)
-                if _pvc is not None:
+                # ⭐ 2026-08-05 修复接线 bug：真实 dict 在 global_pending_video_confirm
+                # （ws_client 位置参数错位，ctx.pending_video_confirm 是函数）
+                _pvc = getattr(ctx, 'global_pending_video_confirm', None)
+                if not isinstance(_pvc, dict):
+                    _pvc = getattr(ctx, 'pending_video_confirm', None)
+                if isinstance(_pvc, dict):
                     _pvc[user_id] = {
                         "url": url, "text": text_stripped,
                         "message_id": message_id, "time": time.time(),

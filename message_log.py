@@ -85,6 +85,32 @@ class MessageLog:
         except Exception as e:
             print(f"⚠️ 标记消息处理状态失败: {e}")
 
+    def get_unprocessed(self, min_age_seconds: int = 120, hours_limit: int = 6) -> list:
+        """⭐ 2026-08-05: 获取未处理的文本消息（兜底补跑用）
+
+        Args:
+            min_age_seconds: 只取 N 秒前的消息（避免与正在处理的竞争）
+            hours_limit: 只追溯 N 小时内的消息（太旧的不补）
+
+        Returns:
+            [{"message_id", "user_id", "content", "received_at"}, ...] 按时间正序
+        """
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    """SELECT message_id, user_id, content, received_at FROM message_log
+                       WHERE processed = 0 AND msg_type = 'text' AND content IS NOT NULL
+                         AND received_at <= datetime('now', 'localtime', ?)
+                         AND received_at >= datetime('now', 'localtime', ?)
+                       ORDER BY id ASC LIMIT 10""",
+                    (f"-{min_age_seconds} seconds", f"-{hours_limit} hours")
+                )
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"⚠️ 查询未处理消息失败: {e}")
+            return []
+
     def get_recent(self, limit: int = 100) -> list:
         """获取最近的消息记录"""
         with sqlite3.connect(DB_PATH) as conn:
