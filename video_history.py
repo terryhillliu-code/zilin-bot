@@ -236,20 +236,31 @@ class VideoHistory:
 
             return [dict(r) for r in rows]
 
-    def get_stale_processing(self, minutes: int = 30) -> list[dict]:
+    def get_stale_processing(self, minutes: int = 30, max_retry: int = 3) -> list[dict]:
         """获取疑似被进程重启中断的任务（processing 状态超时未完成）。
 
         背景（2026-08-03 11:53 事故）：SIGTERM 时 executor.shutdown(wait=False)
         直接杀死在飞任务，记录永久卡在 processing。启动时扫描此列表自动补跑。
+
+        ⭐ 2026-08-05：本方法带副作用（claim 语义）——返回前对每条记录 retry_count+1，
+        并过滤掉已达 max_retry 的记录。原因：调用方 ws_client._sweep_interrupted_tasks
+        依赖 retry_count<3 做闸门，但补跑路径从不 +1（实测同一 URL 09:44/10:14 各跑一次、
+        retry_count 恒为 0），导致每 30 分钟无限重复蒸馏。此处递增使闸门真正生效。
         """
         with self._connect() as conn:
             rows = conn.execute("""
                 SELECT * FROM video_history
                 WHERE status = 'processing'
                   AND created_at < datetime('now', 'localtime', ?)
+                  AND COALESCE(retry_count, 0) < ?
                 ORDER BY created_at ASC
-            """, (f'-{minutes} minutes',)).fetchall()
-            return [dict(r) for r in rows]
+            """, (f'-{minutes} minutes', max_retry)).fetchall()
+            claimed = [dict(r) for r in rows]
+            for r in claimed:
+                conn.execute(
+                    "UPDATE video_history SET retry_count = COALESCE(retry_count,0) + 1 WHERE id = ?",
+                    (r["id"],))
+        return claimed
 
     def can_retry(self, url: str) -> bool:
         """检查是否可以重试

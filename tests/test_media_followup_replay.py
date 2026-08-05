@@ -68,8 +68,9 @@ def test_reanalyze_sets_instruction():
             ctx = _make_ctx()
             r = nr.route_natural_language("代入重新分析刚才那个视频", "u1", "m1", ctx)
             last = store.get_last_artifact("u1")
-        if r and last["instruction"] == "狮驼岭=美国" and mock_reproc.called:
-            print("✅ PASS: reanalyze 调 set_instruction + reprocess_with_instruction")
+        # ⭐ 2026-08-05: 新增关键词预筛早于 _parse_intent，预筛路径下 instruction 为原句
+        if r and last["instruction"] == "代入重新分析刚才那个视频" and mock_reproc.called:
+            print("✅ PASS: reanalyze 预筛命中，instruction 为原句、reprocess 已调用")
             return True
     print(f"❌ FAIL: r={r} instruction={last.get('instruction')} called={mock_reproc.called}")
     return False

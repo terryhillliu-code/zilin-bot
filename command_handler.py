@@ -60,6 +60,15 @@ def handle_text_async(text, user_id, message_id, user_role="user"):
     """
     WebSocket 异步文本处理入口
     """
+    # ⭐ 2026-08-05: 打标必须在所有 early return 之前（语音确认/图片追问/视频确认
+    # 三个分支原本 return 在打标之前，导致这些消息永远 processed=0，
+    # 被 ws_heartbeat 兜底补跑每 5 分钟重放一次）。
+    try:
+        from message_log import message_log as _msg_log
+        _msg_log.mark_processed(message_id)
+    except Exception:
+        pass
+
     text_stripped = text.strip()
     text_lower = text_stripped.lower()
     session_id = f"feishu-{user_id}"
@@ -105,8 +114,13 @@ def handle_text_async(text, user_id, message_id, user_role="user"):
                 print(f"⚠️ 图片追问异常，降级走常规流程: {e}")
 
     # 视频重复确认消费（2026-08-04 P0.3：原 pending_video_confirm 只写不读）
-    _pvc = getattr(_ctx, 'pending_video_confirm', None)
-    if _pvc is not None and user_id in _pvc:
+    # ⭐ 2026-08-05 修复接线 bug：ws_client 位置参数错位导致 _ctx.pending_video_confirm
+    # 拿到的是 get_chat_handler 函数，真实 dict 在 global_pending_video_confirm。
+    # 此前每条消息都在下方 `user_id in _pvc` 处 TypeError 静默崩溃（try 块外，无回复）。
+    _pvc = getattr(_ctx, 'global_pending_video_confirm', None)
+    if not isinstance(_pvc, dict):
+        _pvc = getattr(_ctx, 'pending_video_confirm', None)
+    if isinstance(_pvc, dict) and user_id in _pvc:
         _entry = _pvc[user_id]
         if time.time() - _entry.get("time", 0) > 600:
             _pvc.pop(user_id, None)
@@ -150,6 +164,18 @@ def handle_text_async(text, user_id, message_id, user_role="user"):
 
         # ⭐ v57.0 飞书操作命令
         if handle_lark_commands(text_lower, text_stripped, user_id, message_id, _ctx):
+            return
+
+        # ⭐ 2026-08-05: 代称映射重析关键词预筛 — 必须在 agent_commands 之前
+        # （agent_commands 会把「代称+重新分析」误判为 Layer2 研究任务，走 RAG 而非重跑管线）
+        from commands.nl_router import is_remap_reanalyze
+        if is_remap_reanalyze(text_stripped):
+            from core.conversation_store import conversation_store
+            artifact = conversation_store.get_last_artifact(user_id)
+            if artifact:
+                from commands.nl_router import _exec_media_followup
+                return _exec_media_followup("reanalyze", artifact, text_stripped, user_id, message_id, _ctx)
+            _ctx.reply_message(message_id, "我这边没有找到最近处理过的视频/文章，请把链接重发一次，我重新处理。")
             return
 
         # 2. Agent 智能路由 (Layer 2/3)

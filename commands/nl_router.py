@@ -85,6 +85,19 @@ def _confirm_research(query, user_id, message_id, ctx):
     do_knowledge_query(query, user_id, message_id, ctx, deep=True)
 
 
+# ⭐ 2026-08-05: 代称映射 + 重析 的关键词预筛（单一真相；command_handler 也复用本函数）
+_MAP_KW = ["代称", "代入", "带入", "映射", "指的是", "是指", "代指"]
+_REDO_KW = ["重新分析", "再分析", "重新输出", "重新整理", "重做", "重新处理", "再看一遍"]
+_REF_KW = ["刚才", "那个视频", "这条链接", "那个文章", "那条", "他的那个"]
+
+
+def is_remap_reanalyze(text: str) -> bool:
+    """是否为「给代称做映射并重新分析刚才那个媒体」类请求"""
+    return (any(k in text for k in _MAP_KW)
+            and any(k in text for k in _REDO_KW)
+            and any(k in text for k in _REF_KW))
+
+
 def _exec_media_followup(action, artifact, instruction, user_id, message_id, ctx) -> bool:
     """执行媒体追问：qa 基于产物笔记回答，reanalyze 带用户指令重跑管线（2026-08-04 P1.2）"""
     from core.conversation_store import conversation_store
@@ -159,6 +172,16 @@ def route_natural_language(text, user_id, message_id, ctx) -> bool:
             ctx.reply_message(message_id, "已取消。")
             return True
 
+        # 0.5) 关键词预筛：代称映射 + 重析 → 直接命中 media_followup-reanalyze
+        # （2026-08-05: 8/4 狮驼岭场景实测 LLM 分类会把这种复杂句式误判为 RAG 检索）
+        if is_remap_reanalyze(stripped):
+            from core.conversation_store import conversation_store
+            artifact = conversation_store.get_last_artifact(user_id)
+            if artifact:
+                return _exec_media_followup("reanalyze", artifact, stripped, user_id, message_id, ctx)
+            ctx.reply_message(message_id, "我这边没有找到最近处理过的视频/文章，请把链接重发一次，我重新处理。")
+            return True
+
         # 1) 意图识别
         intent = _parse_intent(stripped)
         if not intent:
@@ -225,6 +248,21 @@ def route_natural_language(text, user_id, message_id, ctx) -> bool:
                         ctx.reply_message(message_id, f"✅ 已捕获: {filename}（卡片发送失败，文件已存）")
                 else:
                     ctx.reply_message(message_id, f"❌ 捕获失败: {info}")
+                # ⭐ 2026-08-05: 混合意图处理 — capture 后检查「另外」后的追问部分
+                _SEP = ["另外", "还有", "同时", "顺便"]
+                for sep in _SEP:
+                    if sep in stripped:
+                        remaining = stripped.split(sep, 1)[-1].strip()
+                        if remaining and len(remaining) > 4:
+                            # 递归处理剩余部分（最多一次，避免无限循环）
+                            _recur_key = f"_mixed_{user_id}"
+                            if not getattr(route_natural_language, _recur_key, False):
+                                setattr(route_natural_language, _recur_key, True)
+                                try:
+                                    route_natural_language(remaining, user_id, message_id, ctx)
+                                finally:
+                                    setattr(route_natural_language, _recur_key, False)
+                        break
                 return True
             # 中低置信度：登记待确认 + 卡片（卡片失败降级为纯文本提问）
             _PENDING[user_id] = {"kind": "capture", "content": content}

@@ -139,12 +139,40 @@ def start_connection_monitor(get_offline_recovery, load_active_user, cleanup_mem
         # 离线检测状态
         was_idle_long = False  # 上一次检查时是否长时间空闲
         cleanup_counter = 0  # 清理计数器
+        catchup_counter = 0  # ⭐ 2026-08-05: 兜底补跑计数器
         last_event_count = message_event_count  # 上次检查时的事件计数
         zombie_idle_start = None  # 僵尸连接开始时间
+        last_check_time = time.time()  # ⭐ 2026-08-05: 唤醒检测基准
+
+        def _has_active_distill() -> bool:
+            """是否有在跑的蒸馏子进程（视频/PDF/音频三类，杀掉会丢用户任务）"""
+            try:
+                import subprocess as _sp
+                return _sp.run(
+                    ["pgrep", "-f", "douyin_distiller|pdf_distiller|audio_distiller"],
+                    capture_output=True, timeout=5).returncode == 0
+            except Exception:
+                return False
 
         while True:
             time.sleep(60)  # 每分钟检查一次
             now = time.time()
+
+            # ⭐ 2026-08-05: 唤醒检测——循环间隔应约 60s，超过 180s 说明机器刚休眠醒来。
+            # 休眠必然杀死 WebSocket（半开连接），SDK keepalive 无法感知，
+            # 直接强制重启重建连接（launchd KeepAlive 拉起，兜底补跑补漏消息）。
+            # （2026-08-05 两起事故实证：04:11 与 05:10 消息均因休眠后僵尸连接丢失）
+            if now - last_check_time > 180:
+                gap_min = int((now - last_check_time) / 60)
+                if _has_active_distill():
+                    print(f"⏰ 检测到系统唤醒（间隔 {gap_min} 分钟），但有活跃蒸馏任务，推迟重启")
+                else:
+                    print(f"⏰ 检测到系统唤醒（监控间隔 {gap_min} 分钟），强制重启重建飞书连接...")
+                    with open(os.path.expanduser("~/logs/connection_monitor.log"), "a") as f:
+                        f.write(f"{datetime.now().isoformat()}: WAKE detected (gap {gap_min}min), forcing restart\n")
+                    os._exit(75)
+            last_check_time = now
+
             event_idle = now - connection_status.get("last_event", now)
 
             # ⭐ 僵尸连接检测：如果事件计数不增长
@@ -167,7 +195,41 @@ def start_connection_monitor(get_offline_recovery, load_active_user, cleanup_mem
                 with open(os.path.expanduser("~/logs/connection_monitor.log"), "a") as f:
                     f.write(f"{datetime.now().isoformat()}: ZOMBIE detected, forcing reconnect after {zombie_minutes}min\n")
 
-                # H1修复: 不再自杀重启——真实僵尸由 SDK keepalive ping 自动重连，进程死亡由 scheduler 心跳 watchdog 兜底
+                # ⭐ 2026-08-05: 恢复强制重启——2026-08-05 04:11 事故实证 SDK keepalive
+                # 无法捕获机器休眠导致的半开连接（asyncio 事件循环静默挂起 3.5 小时，
+                # 用户消息全部丢失）。H1 担心的"误杀健康空闲"实际无害：空闲期重启只是
+                # 重连一次。唯一风险是打断在跑的蒸馏，故先检查活跃任务，有则推迟。
+                _active = _has_active_distill()
+                if _active:
+                    print("⚠️ 有活跃蒸馏任务，推迟僵尸重启（下个周期再检查）")
+                else:
+                    print("🚨 无活跃任务，强制重启进程（launchd KeepAlive 自动拉起，离线恢复补漏消息）")
+                    with open(os.path.expanduser("~/logs/connection_monitor.log"), "a") as f:
+                        f.write(f"{datetime.now().isoformat()}: ZOMBIE restart executed (no active tasks)\n")
+                    os._exit(75)
+
+            # ⭐ 2026-08-05: 兜底补跑——每 5 分钟扫描 message_log 中已接收但未处理的消息
+            # （2026-08-05 04:11 事故：机器休眠竞态导致消息已收未处理，用户自然语言石沉大海。
+            #  mark_processed 由 command_handler 在处理开始时打标，此处补跑漏网消息）
+            catchup_counter += 1
+            if catchup_counter >= 5:
+                catchup_counter = 0
+                try:
+                    from message_log import message_log as _msg_log
+                    pending = _msg_log.get_unprocessed(min_age_seconds=120, hours_limit=6)
+                    if pending:
+                        print(f"🔁 兜底补跑：发现 {len(pending)} 条未处理消息")
+                        from command_handler import handle_text_async
+                        for m in pending:
+                            print(f"   📨 补跑: {m['received_at']} {str(m['content'])[:40]}...")
+                            threading.Thread(
+                                target=handle_text_async,
+                                args=(m["content"], m["user_id"], m["message_id"]),
+                                daemon=True
+                            ).start()
+                            time.sleep(2)  # 串行间隔，避免并发冲击
+                except Exception as e:
+                    print(f"⚠️ 兜底补跑异常: {e}")
 
             # 写入心跳（即使空闲也写入，表示服务存活）
             write_heartbeat(status="connected")
