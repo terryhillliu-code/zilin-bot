@@ -508,21 +508,14 @@ def process_video(text: str, message_id: str = None, user_id: str = None, instru
             _timeout = 1800 if vision_mode else 900
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=_timeout)
         except subprocess.TimeoutExpired as e:
-            # ⭐ 2026-07-27: 超时时记录 partial output; 2026-08-05: kill pg
-            try:
-                import signal as _sig
-                os.killpg(os.getpgid(proc.pid), _sig.SIGTERM)
-            except Exception:
-                proc.kill()
-            proc.wait(timeout=10)
-            std2 = proc.stdout.read() if proc.stdout else ""
-            ste2 = proc.stderr.read() if proc.stderr else ""
-            if std2:
-                logger.error(f"Distiller timeout - stdout (last 2000 chars):\n{std2[-2000:]}")
-            if ste2:
-                logger.error(f"Distiller timeout - stderr (last 2000 chars):\n{ste2[-2000:]}")
-            try: Path(_track_file).unlink()
-            except OSError: pass
+            # ⭐ 2026-07-27: 超时时记录 partial output，便于定位卡在哪一步
+            # 2026-08-05: 移除 15fa62b 引入的 proc/_track_file 引用——process_video
+            # 用的是 subprocess.run，从未定义这两个名字，超时必抛 NameError（已实测）。
+            # 「子进程脱离进程组 + PID 探活」是独立改造，需另立项（见 R3）。
+            if e.stdout:
+                logger.error(f"Distiller timeout - stdout (last 2000 chars):\n{e.stdout[-2000:]}")
+            if e.stderr:
+                logger.error(f"Distiller timeout - stderr (last 2000 chars):\n{e.stderr[-2000:]}")
             raise
 
         if result.returncode != 0:
