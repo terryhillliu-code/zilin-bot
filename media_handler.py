@@ -194,6 +194,8 @@ def extract_video_url(text: str) -> str:
     patterns = [
         # 抖音短链
         r'(https?://v\.douyin\.com/[A-Za-z0-9_-]+/?)',
+        # ⭐ 2026-08-05: 抖音新版分享格式 iesdouyin.com/share/video/ID（用户实测漏识别）
+        r'(https?://(?:www\.)?iesdouyin\.com/share/video/\d+)',
         # 抖音长链（带 www）
         r'(https?://www\.douyin\.com/video/\d+)',
         # 抖音长链（无 www，新版分享格式）
@@ -215,6 +217,11 @@ def extract_video_url(text: str) -> str:
             # 补全协议前缀
             if url.startswith('douyin.com'):
                 url = 'https://' + url
+            # ⭐ 2026-08-05: iesdouyin 分享链接归一化为标准格式
+            # （下游 douyin-api :8680 只认 douyin.com/video/ID，不认 share/video）
+            _m = re.match(r'https?://(?:www\.)?iesdouyin\.com/share/video/(\d+)', url)
+            if _m:
+                url = f'https://www.douyin.com/video/{_m.group(1)}'
             return url
     return None
 
@@ -501,11 +508,21 @@ def process_video(text: str, message_id: str = None, user_id: str = None, instru
             _timeout = 1800 if vision_mode else 900
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=_timeout)
         except subprocess.TimeoutExpired as e:
-            # ⭐ 2026-07-27: 超时时记录 partial output，便于定位卡在哪一步
-            if e.stdout:
-                logger.error(f"Distiller timeout - stdout (last 2000 chars):\n{e.stdout[-2000:]}")
-            if e.stderr:
-                logger.error(f"Distiller timeout - stderr (last 2000 chars):\n{e.stderr[-2000:]}")
+            # ⭐ 2026-07-27: 超时时记录 partial output; 2026-08-05: kill pg
+            try:
+                import signal as _sig
+                os.killpg(os.getpgid(proc.pid), _sig.SIGTERM)
+            except Exception:
+                proc.kill()
+            proc.wait(timeout=10)
+            std2 = proc.stdout.read() if proc.stdout else ""
+            ste2 = proc.stderr.read() if proc.stderr else ""
+            if std2:
+                logger.error(f"Distiller timeout - stdout (last 2000 chars):\n{std2[-2000:]}")
+            if ste2:
+                logger.error(f"Distiller timeout - stderr (last 2000 chars):\n{ste2[-2000:]}")
+            try: Path(_track_file).unlink()
+            except OSError: pass
             raise
 
         if result.returncode != 0:

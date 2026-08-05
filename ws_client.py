@@ -510,13 +510,27 @@ def main():
 
     def _sweep_interrupted_tasks():
         from video_history import get_video_history
-        # 视频（v70.5）
+        # 视频（v70.5）+ ⭐ 2026-08-05: 去重——distiller 子进程已脱离 bot 存活
         try:
+            import hashlib, os as _os
+            _track_dir = _os.path.expanduser("~/zhiwei-bot/tmp/.distiller_pids")
             stale = get_video_history().get_stale_processing(minutes=30)
             for rec in stale:
-                if (rec.get("retry_count") or 0) < 3:
-                    print(f"   ▶️ 补跑视频: {rec['url'][:60]}")
-                    executor.submit(_rerun_interrupted_video, rec["url"])
+                if (rec.get("retry_count") or 0) >= 3:
+                    continue
+                url = rec["url"]
+                # 检查 distiller 是否还在跑(start_new_session 脱离进程组存活)
+                _h = hashlib.md5(url.encode()).hexdigest()[:12]
+                _tf = _os.path.join(_track_dir, _h + ".txt")
+                try:
+                    _pid = int(open(_tf).read().strip())
+                    _os.kill(_pid, 0)  # 信号0=探活, 不真杀
+                    print(f"   ⏭️ distiller 仍在运行(PID {_pid}), 跳过补跑: {url[:60]}")
+                    continue
+                except (OSError, ValueError, FileNotFoundError):
+                    pass  # PID 文件不存在或进程已死, 正常补跑
+                print(f"   ▶️ 补跑视频: {url[:60]}")
+                executor.submit(_rerun_interrupted_video, url)
             if stale:
                 print(f"🔄 视频中断恢复: {len(stale)} 个")
         except Exception as e:
