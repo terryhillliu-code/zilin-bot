@@ -588,7 +588,9 @@ def process_video(text: str, message_id: str = None, user_id: str = None, instru
     except subprocess.TimeoutExpired:
         # 记录失败（超时）
         error_type = "timeout"
-        error_message = "视频分析超时（10分钟）"
+        # ⭐ 2026-08-05: 原文案硬编码「10分钟」，与实际超时不符（普通 900s / vision 1800s），
+        # 用户看到的分钟数一直是错的。改为按 vision_mode 取真实值。
+        error_message = f"视频分析超时（{30 if vision_mode else 15} 分钟）"
         if video_history and url:
             video_history.record_failed(url, error_type, error_message)
             from video_history import VideoErrorType
