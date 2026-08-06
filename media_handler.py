@@ -328,6 +328,93 @@ def handle_video_async(text: str, message_id: str, user_id: str, instruction: st
     thread.start()
 
 
+# ============ 文章抓取与提炼（2026-08-05 共性修复：文章 URL 不再落空） ============
+
+_WECHAT_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+              "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.47")
+
+
+def fetch_wechat_article(url: str, timeout: int = 30):
+    """抓取微信公众号文章正文。返回 (success, title, text)。
+
+    用 MicroMessenger UA 绕过微信反爬墙（实测可拿到完整正文）。
+    """
+    import requests as _req
+    try:
+        resp = _req.get(url, headers={"User-Agent": _WECHAT_UA}, timeout=timeout)
+        resp.raise_for_status()
+        html = resp.text
+        if "环境异常" in html or "完成验证后即可" in html:
+            return False, "", "微信要求人机验证，暂无法自动抓取"
+        m = re.search(r'og:title"\s+content="([^"]*)"', html)
+        title = m.group(1) if m else ""
+        m = re.search(r'<div[^>]*id="js_content"[^>]*>(.*?)(?:</div>\s*<script|<script)',
+                      html, re.DOTALL)
+        if not m:
+            m = re.search(r'<div[^>]*id="js_content"[^>]*>(.*)', html, re.DOTALL)
+        body_html = m.group(1) if m else ""
+        text = re.sub(r'<script.*?</script>', '', body_html, flags=re.DOTALL)
+        text = re.sub(r'<style.*?</style>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<[^>]+>', '\n', text)
+        for ent, ch in (('&nbsp;', ' '), ('&amp;', '&'), ('&lt;', '<'),
+                        ('&gt;', '>'), ('&quot;', '"')):
+            text = text.replace(ent, ch)
+        text = re.sub(r'\n\s*\n+', '\n', text)
+        text = '\n'.join(l.strip() for l in text.split('\n') if l.strip())
+        if len(text) < 100:
+            return False, title, "抓取到的正文过短，可能被反爬拦截"
+        return True, title, text
+    except Exception as e:
+        return False, "", f"抓取异常: {e}"
+
+
+def process_article(text: str, message_id: str = None, user_id: str = None) -> str:
+    """抓取文章 + LLM 情报级提炼，返回回复文本。"""
+    url = extract_article_url(text)
+    if not url:
+        return "❌ 未识别到文章链接"
+    is_wechat = "mp.weixin.qq.com" in url.lower()
+    if is_wechat:
+        ok, title, article_text = fetch_wechat_article(url)
+    else:
+        ok, article_text = fetch_url_content(url)
+        title = ""
+    if not ok:
+        return f"❌ 文章抓取失败：{article_text}"
+    try:
+        from zhiwei_common.llm import llm_client
+        prompt = ("请对以下文章做情报级深度提炼，输出结构：\n"
+                  "1. 一句话核心论点\n2. 关键洞察3-5条（标注事实/观点/预测）\n"
+                  "3. 值得追问或存疑的点\n\n"
+                  f"标题：{title}\n\n正文：\n{article_text[:12000]}")
+        success, summary = llm_client.call_by_task(
+            "deep_analysis", message=prompt, timeout=150)
+    except Exception as e:
+        success, summary = False, str(e)
+    if success and summary and not summary.startswith("❌"):
+        head = f"📄 《{title}》\n\n" if title else "📄 文章提炼\n\n"
+        return head + summary
+    # 提炼失败兜底：给正文摘要，不空手
+    head = f"📄 《{title}》\n\n" if title else ""
+    return head + "（抓取成功，自动提炼暂不可用，先给正文节选）\n\n" + article_text[:800]
+
+
+def handle_article_async(text: str, message_id: str, user_id: str):
+    """异步处理文章：抓取 + 提炼 + 回复。"""
+    def _process():
+        try:
+            reply_message(message_id, "📖 正在读取文章并提炼，约需 30-60 秒...")
+            response = process_article(text, message_id, user_id)
+            reply_message(message_id, response)
+            if TaskLogger:
+                TaskLogger.log_task("文章提炼", "完成", extract_article_url(text))
+        except Exception as e:
+            print(f"❌ 文章处理异步异常: {e}")
+            reply_message(message_id, f"❌ 文章处理失败: {e}")
+    thread = threading.Thread(target=_process, daemon=True)
+    thread.start()
+
+
 def reprocess_with_instruction(user_id, artifact, instruction, message_id):
     """带用户指令重跑媒体管线（复用 distiller 转写缓存，不重新下载）
 
@@ -673,6 +760,41 @@ def download_audio(message_id: str, file_key: str) -> str:
         return None
 
 
+def collapse_asr_repeats(text: str, min_cycles: int = 4):
+    """折叠 ASR 解码循环(mimo/whisper 遇音频尾部静音/含糊音时常见)。
+
+    检测「同一组句子(周期1-8)连续重复>=min_cycles 次」的循环段, 只保留一个周期。
+    返回 (clean_text, was_corrupted)。
+    2026-08-06 实例: 末 3 句重复 35 次污染转录→蒸馏链(C4-C8 被迫降级)。
+    """
+    if not text:
+        return text, False
+    sents = re.split(r'(?<=[。？！!?])', text)
+    # 归一化比较(忽略标点/空白差异)
+    norm = [re.sub(r'\W+', '', s) for s in sents]
+    n = len(sents)
+    for k in range(1, 9):
+        i = 0
+        out_idx = []
+        collapsed = False
+        while i < n:
+            c = 1
+            while (i + (c + 1) * k <= n
+                   and norm[i + c*k:i + (c+1)*k] == norm[i:i+k]
+                   and any(norm[i:i+k])):
+                c += 1
+            if c >= min_cycles:
+                out_idx.extend(range(i, i + k))
+                collapsed = True
+                i += c * k
+            else:
+                out_idx.append(i)
+                i += 1
+        if collapsed:
+            return ''.join(sents[j] for j in out_idx), True
+    return text, False
+
+
 def transcribe_audio(audio_path: str) -> str:
     """转录语音文件为文字
 
@@ -691,8 +813,12 @@ def transcribe_audio(audio_path: str) -> str:
                 tr = MimoASRTranscriber(cfg.mimo_api_key, cfg.mimo_api_base, cfg.mimo_asr_model)
                 res = tr.transcribe(audio_obj)
                 if res and res.full_text:
-                    logger.info(f"飞书语音 mimo-asr 成功: {len(res.full_text)} 字")
-                    return res.full_text
+                    clean, corrupted = collapse_asr_repeats(res.full_text)
+                    if corrupted:
+                        logger.warning(f"⚠️ mimo-asr 解码循环: {len(res.full_text)}→{len(clean)} 字, 重复段已折叠")
+                    else:
+                        logger.info(f"飞书语音 mimo-asr 成功: {len(res.full_text)} 字")
+                    return clean
                 logger.warning("mimo-asr 空结果, 降级本地 MLX")
             except Exception as e:
                 logger.warning(f"mimo-asr 失败: {e}, 降级本地 MLX")
@@ -704,8 +830,12 @@ def transcribe_audio(audio_path: str) -> str:
                 if local.is_available():
                     res = local.transcribe(audio_obj)
                     if res and res.full_text:
-                        logger.info(f"飞书语音 本地 MLX 成功: {len(res.full_text)} 字")
-                        return res.full_text
+                        clean, corrupted = collapse_asr_repeats(res.full_text)
+                        if corrupted:
+                            logger.warning(f"⚠️ 本地 MLX 解码循环: {len(res.full_text)}→{len(clean)} 字, 重复段已折叠")
+                        else:
+                            logger.info(f"飞书语音 本地 MLX 成功: {len(res.full_text)} 字")
+                        return clean
             except Exception as e:
                 logger.error(f"本地 MLX 也失败: {e}")
 
