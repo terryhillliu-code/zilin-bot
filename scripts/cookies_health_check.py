@@ -33,8 +33,11 @@ PROBE_URL = "https://www.youtube.com/watch?v=LIPzl4OnlTo"
 # 必超时失败(叠加缺 import os, 自愈从未真正生效过)。socks5h = DNS 也走代理。
 _YT_REFRESH_PROXY = os.getenv("ZHIWEI_VIDEO_PROXY", "socks5://127.0.0.1:18081")
 _YT_REFRESH_PROXY = _YT_REFRESH_PROXY.replace("socks5://", "socks5h://", 1)
+# ⭐ 2026-08-09: 登录态在 Profile 1(Default 从未登录), 必须指定配置文件,
+# 否则永远导出空会话(自愈第三处 bug)
+_YT_CHROME_PROFILE = os.getenv("ZHIWEI_YT_CHROME_PROFILE", "Profile 1")
 REFRESH_CMD = (f"~/zhiwei-shared-venv/bin/yt-dlp --proxy {_YT_REFRESH_PROXY} "
-               "--cookies-from-browser chrome "
+               f'--cookies-from-browser "chrome:{_YT_CHROME_PROFILE}" '
                "--cookies ~/zhiwei-bot/secrets/youtube_cookies.txt --skip-download "
                '"https://www.youtube.com/watch?v=aqz-KE-bpKQ"')
 
