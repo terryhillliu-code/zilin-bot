@@ -12,6 +12,7 @@
 被 scheduler 的 cookies_health_check job 以 subprocess 调用(shared venv)。
 """
 import json
+import os  # 2026-08-09: 补齐——try_self_heal_youtube 用到, 缺失导致自愈从未生效
 import subprocess
 import sys
 import time
@@ -28,7 +29,12 @@ YTDLP = str(Path.home() / "zhiwei-shared-venv" / "bin" / "yt-dlp")
 # 换成实测需要有效登录态才能解锁的视频, 确保探测严格。
 PROBE_URL = "https://www.youtube.com/watch?v=LIPzl4OnlTo"
 
-REFRESH_CMD = ("~/zhiwei-shared-venv/bin/yt-dlp --cookies-from-browser chrome "
+# ⭐ 2026-08-09: 加 --proxy——本机直连 youtube.com 不通, 此前自愈命令
+# 必超时失败(叠加缺 import os, 自愈从未真正生效过)。socks5h = DNS 也走代理。
+_YT_REFRESH_PROXY = os.getenv("ZHIWEI_VIDEO_PROXY", "socks5://127.0.0.1:18081")
+_YT_REFRESH_PROXY = _YT_REFRESH_PROXY.replace("socks5://", "socks5h://", 1)
+REFRESH_CMD = (f"~/zhiwei-shared-venv/bin/yt-dlp --proxy {_YT_REFRESH_PROXY} "
+               "--cookies-from-browser chrome "
                "--cookies ~/zhiwei-bot/secrets/youtube_cookies.txt --skip-download "
                '"https://www.youtube.com/watch?v=aqz-KE-bpKQ"')
 
