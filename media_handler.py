@@ -615,10 +615,11 @@ def process_video(text: str, message_id: str = None, user_id: str = None, instru
             # 抖音使用 cookies 文件
             cmd.extend(["--cookies", os.path.expanduser("~/zhiwei-bot/secrets/douyin_cookies.txt")])
         elif "youtube.com" in url or "youtu.be" in url:
-            # ⭐ 2026-08-02: youtube_cookies.txt 文件态已被服务端吊销(实测
-            # bot 检测全灭), 改为直读 Chrome 登录态(与 B站同策略, 实测通过);
+            # ⭐ 2026-08-09 反转: 本机 Chrome 会话已失效(无法自动导出有效登录态),
+            # 改回用 cookies 文件(用户浏览器扩展导出+yt_cookies_import 维护, 实测
+            # 通过 bot 检测); 08-02 曾因此文件被吊销改读 Chrome, 现 Chrome 亦死。
             # 网络出口由 distiller 内部自动走日本 VM 的 SOCKS5 隔离(平台感知)。
-            cmd.extend(["--cookies-from-browser", "chrome"])
+            cmd.extend(["--cookies", os.path.expanduser("~/zhiwei-bot/secrets/youtube_cookies.txt")])
         elif any(d in url for d in ("xiaohongshu.com", "xhslink.com", "kuaishou.com",
                                     "weibo.com", "weibo.cn", "tiktok.com",
                                     "x.com", "twitter.com")):
