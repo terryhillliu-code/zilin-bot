@@ -209,6 +209,55 @@ def _append_vision_frames(doc_id: str, frames: list) -> int:
     return ok
 
 
+def _split_images_section(body: str, note_dir: Path) -> tuple:
+    """切出「原图」区（图文笔记，2026-08-09 新增），返回 (主体正文, 图片列表)。
+
+    图片列表项: {"alt": "图 1", "img_path": 绝对路径, "remote": bool}
+    背景：图文笔记的原图是本地相对链接，正文预处理会被当死链剔除，
+    需单独切出走 media-insert 同步（与视频关键画面同机制）。
+    """
+    m = re.search(r"^## 原图\s*\n(.*?)(?=^## |\Z)", body, re.M | re.S)
+    if not m:
+        return body, []
+    section = m.group(1)
+    main = body[:m.start()] + body[m.end():]
+    images = []
+    for im in re.finditer(r"!\[([^\]]*)\]\(([^)]+)\)", section):
+        alt, rel = im.group(1).strip() or "原图", im.group(2).strip()
+        remote = rel.startswith(("http://", "https://"))
+        path = rel if remote else str((note_dir / rel).resolve())
+        images.append({"alt": alt, "img_path": path, "remote": remote})
+    return main, images
+
+
+def _append_original_images(doc_id: str, images: list) -> int:
+    """追加「原图」区到飞书文档：标题 + 逐张 media-insert。单图失败跳过。"""
+    if not images:
+        return 0
+    _run_lark(["docs", "+update", "--doc", doc_id, "--mode", "append",
+               "--markdown", "\n## 原图\n"])
+    ok = 0
+    for it in images:
+        try:
+            img = it.get("img_path") or ""
+            if it.get("remote"):
+                continue  # 外链图片 media-insert 不支持，跳过（本地笔记仍保留）
+            if img and Path(img).exists():
+                r = _run_lark(["docs", "+media-insert", "--doc", doc_id,
+                               "--file", Path(img).name,
+                               "--caption", str(it["alt"])[:50],
+                               "--align", "center"],
+                              cwd=str(Path(img).parent))
+                if r["ok"] or r.get("code0"):
+                    ok += 1
+                else:
+                    logger.warning(f"原图插入失败: {Path(img).name} {r.get('raw','')[:120]}")
+        except Exception as e:
+            logger.warning(f"原图追加失败(跳过): {str(it.get('alt',''))[:20]}: {e}")
+    logger.info(f"原图同步: {ok}/{len(images)} 张图片已插入")
+    return ok
+
+
 def _preprocess(meta: dict, body: str, note_dir: Path = None) -> tuple:
     """把 Obsidian 笔记正文转成 Lark-flavored Markdown。
 
@@ -216,9 +265,11 @@ def _preprocess(meta: dict, body: str, note_dir: Path = None) -> tuple:
     （飞书不支持且 ASR 原文太长）、[[wikilink]] 转纯文本、本地相对链接
     转纯文本（在飞书里是死链）。
     2026-08-02: 切出「关键画面与图表」区单独返回（帧截图走 media-insert
-    同步到文档），返回 (content, frames)。
+    同步到文档）；2026-08-09: 同机制切出图文笔记「原图」区。
+    返回 (content, frames, images)。
     """
     body, frames = _split_vision_section(body, note_dir or Path.home())
+    body, images = _split_images_section(body, note_dir or Path.home())
     # 去掉开头的一级标题（docs +create 的 --title 已是文档标题，禁止重复）
     body = re.sub(r"^\s*# [^\n]+\n", "", body, count=1)
 
@@ -256,7 +307,7 @@ def _preprocess(meta: dict, body: str, note_dir: Path = None) -> tuple:
                   + "\n".join(meta_lines)
                   + "\n</callout>\n\n")
 
-    return header + body.strip() + "\n", frames
+    return header + body.strip() + "\n", frames, images
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +363,7 @@ def sync_note_to_feishu(md_path: str):
 
     meta, body = _parse_frontmatter(text)
     title = meta.get("title") or Path(md_path).stem
-    content, frames = _preprocess(meta, body, Path(md_path).parent)
+    content, frames, images = _preprocess(meta, body, Path(md_path).parent)
 
     store = _load_map()
     notes = store.setdefault("notes", {})
@@ -327,8 +378,9 @@ def sync_note_to_feishu(md_path: str):
             # 2026-08-02: 帧截图图文交错追加（图片同步失败不影响文档主体）
             try:
                 _append_vision_frames(entry["doc_id"], frames)
+                _append_original_images(entry["doc_id"], images)
             except Exception as e:
-                logger.warning(f"关键画面追加异常(不影响文档): {e}")
+                logger.warning(f"图片追加异常(不影响文档): {e}")
             entry.update({"title": title})
             notes[md_path] = entry
             _save_map(store)
@@ -351,8 +403,9 @@ def sync_note_to_feishu(md_path: str):
     # 2026-08-02: 帧截图图文交错追加（图片同步失败不影响文档主体）
     try:
         _append_vision_frames(res["doc_id"], frames)
+        _append_original_images(res["doc_id"], images)
     except Exception as e:
-        logger.warning(f"关键画面追加异常(不影响文档): {e}")
+        logger.warning(f"图片追加异常(不影响文档): {e}")
     notes[md_path] = {"doc_id": res["doc_id"], "doc_url": res["doc_url"], "title": title}
     _save_map(store)
     logger.info(f"✅ 飞书文档已创建: {res['doc_url']}")
