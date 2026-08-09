@@ -94,17 +94,21 @@ def _gen_and_reply(prompt: str, user_id: str, message_id: str, ctx):
         wf_path = _build_workflow_file(prompt)
         transfer_mode = _transfer_mode()
 
-        # 总预算内等信号量（GPU 单槽，排队太久不如早告知）
-        acquired = _GEN_SEM.acquire(timeout=TOTAL_TIMEOUT)
+        # ⭐ 2026-08-09: 总预算改剩余预算语义——排队等待与 submit 共享
+        # TOTAL_TIMEOUT 一份预算(原先两段串联最坏 ~30min)
+        remaining = TOTAL_TIMEOUT - (time.time() - t0)
+        acquired = _GEN_SEM.acquire(timeout=max(0, remaining))
         if not acquired:
             _log_metrics("queued_timeout", time.time() - t0, transfer_mode, job_id)
-            ctx.reply_message(message_id, "❌ 生图队列已排满（等待超 15 分钟），请稍后再试。")
+            ctx.reply_message(message_id, "❌ 生图队列已排满（等待耗尽总预算 15 分钟），请稍后再试。")
             return
 
+        # submit 用剩余预算, 下限 60s(低于此出图必超时不如快速失败), 上限 SUBMIT_TIMEOUT
+        submit_timeout = min(SUBMIT_TIMEOUT, max(60, int(TOTAL_TIMEOUT - (time.time() - t0))))
         result = gpu_offload.submit(
             "comfyui", inputs=[wf_path],
-            params={"timeout": SUBMIT_TIMEOUT},
-            mode="async", timeout=SUBMIT_TIMEOUT)
+            params={"timeout": submit_timeout},
+            mode="async", timeout=submit_timeout)
         job_id = result.get("job_id") if isinstance(result, dict) else None
 
         if result is None:
@@ -136,7 +140,14 @@ def _gen_and_reply(prompt: str, user_id: str, message_id: str, ctx):
         dur = time.time() - t0
         _log_metrics("done", dur, transfer_mode, job_id)
 
-        if not reply_image(message_id, str(dest)):
+        if reply_image(message_id, str(dest)):
+            # ⭐ 2026-08-09: 回图成功后清理 /tmp 产物, 避免累积
+            try:
+                dest.unlink(missing_ok=True)
+            except Exception:
+                pass
+        else:
+            # 上传失败留存本地文件(文案已告知路径, 便于手动取回)
             ctx.reply_message(
                 message_id,
                 f"🎨 图片已生成（{dur/60:.1f} 分钟）但飞书上传失败。\n"
@@ -187,6 +198,12 @@ def reply_image(message_id: str, image_path: str) -> bool:
         if not upload_resp.success():
             print(f"❌ 图片上传失败: {upload_resp.code} - {upload_resp.msg}")
             return False
+        # ⭐ 2026-08-09: 上传成功即记账(record_call 无枚举限制, 自由类型字符串)
+        try:
+            from feishu_quota import record_call
+            record_call("image_upload")
+        except Exception as e:
+            print(f"⚠️ image_upload 配额记账异常(不阻断回图): {e}")
         image_key = upload_resp.data.image_key
         if not image_key:
             print("❌ 图片上传成功但未返回 image_key")
