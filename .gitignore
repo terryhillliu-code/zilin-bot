@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 data/*.db
 *.db
+data/feishu_note_docs.json
 
 # Cookies 文件
 secrets/
