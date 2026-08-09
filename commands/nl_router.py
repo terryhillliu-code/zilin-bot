@@ -19,6 +19,7 @@ INTENT_PROMPT = """你是飞书机器人「知微」的意图识别层。根据�
 - capture: 要求记录/保存/记下某条信息、灵感或想法
 - research: 要求对某主题做深入调研/研究/整理报告（一次性报告，不沉淀概念卡片）
 - image_gen: 要求生成/画/绘制一张图片（文生图）。触发词如"帮我画一张…/生成一张…图片/画个…"。注意与图片分析严格区分："分析/描述/看看这张图"是对已有图片的理解，不是 image_gen；image_gen 必须是"从无到有创造图片"的请求
+- video_gen: 要求生成/制作一段视频（文生视频）。触发词如"帮我生成一段…视频/做个…的片子/来一段…视频"。注意与视频分析严格区分："分析/总结这个视频"是对已有视频的理解（配链接），不是 video_gen；video_gen 必须是"从无到有创造视频"的请求
 - status: 询问机器人或系统自身的状态/健康
 - media_followup: 针对「刚才发的视频/文章/播客」的追问、修正或要求重做。
   识别标志：出现"刚才/那个视频/这条链接/重新分析/代入/你没理解"等回指词，且消息中不含新链接。
@@ -45,6 +46,8 @@ INTENT_PROMPT = """你是飞书机器人「知微」的意图识别层。根据�
 {"intent": "image_gen", "confidence": 0.95, "topic": "在月光下读书的猫", "action_summary": "用 FLUX 生成一张图片"}
 用户: 生成一张赛博朋克城市夜景的图片
 {"intent": "image_gen", "confidence": 0.95, "topic": "赛博朋克城市夜景", "action_summary": "用 FLUX 生成一张图片"}
+用户: 帮我生成一段黄昏时海边灯塔的视频
+{"intent": "video_gen", "confidence": 0.95, "topic": "黄昏时海边灯塔", "action_summary": "用 H3 生成一段视频"}
 用户: 帮我分析这张图片里讲了什么
 {"intent": "chat", "confidence": 0.6, "topic": "图片内容分析", "action_summary": "分析已有图片（非生图）"}
 用户: 早上好
@@ -76,7 +79,7 @@ def _parse_intent(text):
         if not m:
             return None
         data = json.loads(m.group(1))
-        if data.get("intent") not in ("knowledge_query", "capture", "research", "status", "chat", "learn_concept", "media_followup", "image_gen"):
+        if data.get("intent") not in ("knowledge_query", "capture", "research", "status", "chat", "learn_concept", "media_followup", "image_gen", "video_gen"):
             return None
         data["confidence"] = float(data.get("confidence", 0.5))
         # media_followup 的 action 仅允许 qa/reanalyze，非法值置 None
@@ -151,6 +154,14 @@ def route_natural_language(text, user_id, message_id, ctx) -> bool:
         stripped = text.strip()
         low = stripped.lower()
 
+        # ⭐ 2026-08-09: video_gen 待补充输入消费（引导提问/修改流，优先于一切路由）
+        try:
+            import video_gen
+            if video_gen.consume_user_input(stripped, user_id, message_id, ctx):
+                return True
+        except Exception as e:
+            print(f"⚠️ video_gen pending 消费异常: {e}")
+
         # 0) 待确认动作的关键词通道（与卡片按钮双通道）
         pending = _PENDING.get(user_id)
         if pending and low in _CONFIRM_WORDS:
@@ -220,6 +231,12 @@ def route_natural_language(text, user_id, message_id, ctx) -> bool:
                                   f"要为「{gen_prompt[:60]}」生成一张图片吗？（GPU 出图约 2-4 分钟）回复「确认」开始。")
                 return True
             return False
+
+        # ⭐ 2026-08-09: video_gen 视频生成：任何置信度都走草稿确认（用户明确要求不自主执行）
+        if kind == "video_gen":
+            import video_gen
+            video_gen.handle_video_gen_request(topic or stripped, user_id, message_id, ctx)
+            return True
 
         # 2.5) 概念学习：高置信直达（~60s 生成概念卡），中置信确认，低置信放行
         if kind == "learn_concept":

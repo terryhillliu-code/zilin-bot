@@ -100,6 +100,20 @@ def do_p2_card_action_trigger_v1(data) -> None:
             reply_message(message_id, "已取消。")
             return
 
+        # ⭐ 2026-08-09: H3 视频生成草稿卡回调（确认/修改/取消）
+        elif action_type in ("video_gen_confirm", "video_gen_modify", "video_gen_cancel"):
+            import video_gen
+            from types import SimpleNamespace
+            from feishu_api import reply_message as _rm, reply_card as _rc
+            _vg_ctx = SimpleNamespace(reply_message=_rm, reply_card=_rc)
+            if action_type == "video_gen_confirm":
+                video_gen.action_confirm(user_id, message_id, _vg_ctx)
+            elif action_type == "video_gen_modify":
+                video_gen.action_modify(user_id, message_id, _vg_ctx)
+            else:
+                video_gen.action_cancel(user_id, message_id, _vg_ctx)
+            return
+
         elif action_type == "show_config_form":
             # TODO: 显示详细配置表单
             reply_message(message_id, "⚙️ 详细配置功能开发中...")
