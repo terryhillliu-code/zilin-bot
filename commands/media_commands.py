@@ -45,6 +45,27 @@ def handle_media_commands(text_lower, text_stripped, user_id, message_id, ctx):
             reply_message(message_id, "✅ 已关闭语音回复\n\n后续消息将仅使用文字回复")
         return True
 
+    # 0.5 图文链接（小红书/知乎，2026-08-09 新增）：必须前置在视频分支之前，
+    # 小红书域名在视频白名单里会被 is_video_url 误吞；视频类笔记由适配器内部回退视频管线
+    try:
+        from webnote_distiller import extract_web_note_url, handle_web_note_async
+        wn_url, wn_source = extract_web_note_url(text_stripped)
+        if wn_url:
+            # 重复链接检查（与视频链路共用 video_history）
+            if _video_history:
+                dup = _video_history.check_duplicate(wn_url)
+                if dup:
+                    title = dup.get('title', '未知')[:50]
+                    processed_at = dup.get('processed_at', '未知')[:10]
+                    reply_message(message_id, f"⚠️ 检测到重复链接\n\n📝 标题: {title}\n📅 处理时间: {processed_at}\n\n👉 回复「继续」重新处理，或重新发送原链接强制重跑")
+                    return True
+            src_s = {"xiaohongshu": "小红书", "zhihu": "知乎"}.get(wn_source, "图文")
+            reply_message(message_id, f"📝 检测到{src_s}链接，开始解析图文（预计1-2分钟）...")
+            handle_web_note_async(text_stripped, message_id, user_id)
+            return True
+    except ImportError as e:
+        print(f"⚠️ webnote_distiller 导入失败，降级原链路: {e}")
+
     # 1. 视频链接
     if ctx.is_video_url(text_stripped):
         url = ctx.extract_video_url(text_stripped)

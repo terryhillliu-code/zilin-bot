@@ -337,7 +337,8 @@ class ShareTextExtractor:
         r'https?://www\.bilibili\.com/video/[A-Za-z0-9]+',   # B站
         r'https?://b23\.tv/[A-Za-z0-9]+',                    # B站短链
         r'https?://xhslink\.com/[A-Za-z0-9/]+',              # 小红书短链
-        r'https?://www\.xiaohongshu\.com/explore/[a-f0-9]+', # 小红书长链
+        # ⭐ 2026-08-09: 补 discovery/item 格式（鸿蒙/微信分享实测漏识别，仅视频笔记会走到这里）
+        r'https?://www\.xiaohongshu\.com/(?:explore|discovery/item)/[a-f0-9]+', # 小红书长链
         r'https?://v\.kuaishou\.com/[A-Za-z0-9]+',           # 快手
         r'https?://www\.kuaishou\.com/short-video/[A-Za-z0-9]+',
         r'https?://(?:www\.)?youtube\.com/watch\?v=[A-Za-z0-9_-]+', # YouTube
