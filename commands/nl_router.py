@@ -18,6 +18,7 @@ INTENT_PROMPT = """你是飞书机器人「知微」的意图识别层。根据�
 - learn_concept: 想系统性学习/了解某个技术概念（原理、演进、横向对比），生成概念卡片沉淀进知识图谱。触发词如"学一下/我想了解/给我讲讲/梳理一下X"。注意与 knowledge_query 的区别：learn_concept 是"教我学懂这个概念"，knowledge_query 是"查我库里已有的资料"
 - capture: 要求记录/保存/记下某条信息、灵感或想法
 - research: 要求对某主题做深入调研/研究/整理报告（一次性报告，不沉淀概念卡片）
+- image_gen: 要求生成/画/绘制一张图片（文生图）。触发词如"帮我画一张…/生成一张…图片/画个…"。注意与图片分析严格区分："分析/描述/看看这张图"是对已有图片的理解，不是 image_gen；image_gen 必须是"从无到有创造图片"的请求
 - status: 询问机器人或系统自身的状态/健康
 - media_followup: 针对「刚才发的视频/文章/播客」的追问、修正或要求重做。
   识别标志：出现"刚才/那个视频/这条链接/重新分析/代入/你没理解"等回指词，且消息中不含新链接。
@@ -40,6 +41,12 @@ INTENT_PROMPT = """你是飞书机器人「知微」的意图识别层。根据�
 {"intent": "learn_concept", "confidence": 0.95, "topic": "Muon", "action_summary": "生成 Muon 概念学习卡片并接入知识图谱"}
 用户: 我想系统了解一下牛顿-舒尔茨迭代
 {"intent": "learn_concept", "confidence": 0.9, "topic": "牛顿-舒尔茨迭代", "action_summary": "生成 牛顿-舒尔茨迭代 概念学习卡片"}
+用户: 帮我画一张在月光下读书的猫
+{"intent": "image_gen", "confidence": 0.95, "topic": "在月光下读书的猫", "action_summary": "用 FLUX 生成一张图片"}
+用户: 生成一张赛博朋克城市夜景的图片
+{"intent": "image_gen", "confidence": 0.95, "topic": "赛博朋克城市夜景", "action_summary": "用 FLUX 生成一张图片"}
+用户: 帮我分析这张图片里讲了什么
+{"intent": "chat", "confidence": 0.6, "topic": "图片内容分析", "action_summary": "分析已有图片（非生图）"}
 用户: 早上好
 {"intent": "chat", "confidence": 0.95, "topic": null, "action_summary": "闲聊"}
 用户: 这个博主的狮驼岭是指美国，凤仙郡是指中国，请代入重新分析刚才那个视频
@@ -69,7 +76,7 @@ def _parse_intent(text):
         if not m:
             return None
         data = json.loads(m.group(1))
-        if data.get("intent") not in ("knowledge_query", "capture", "research", "status", "chat", "learn_concept", "media_followup"):
+        if data.get("intent") not in ("knowledge_query", "capture", "research", "status", "chat", "learn_concept", "media_followup", "image_gen"):
             return None
         data["confidence"] = float(data.get("confidence", 0.5))
         # media_followup 的 action 仅允许 qa/reanalyze，非法值置 None
@@ -153,6 +160,9 @@ def route_natural_language(text, user_id, message_id, ctx) -> bool:
             elif pending["kind"] == "learn":
                 from commands.learn_commands import do_learn
                 do_learn(pending["content"], user_id, message_id, ctx)
+            elif pending["kind"] == "image_gen":
+                from commands.image_commands import handle_image_gen_async
+                handle_image_gen_async(pending["content"], user_id, message_id, ctx)
             elif pending["kind"] == "media_followup":
                 c = pending["content"]
                 from core.conversation_store import conversation_store
@@ -196,6 +206,20 @@ def route_natural_language(text, user_id, message_id, ctx) -> bool:
             from commands.knowledge_commands import do_knowledge_query
             do_knowledge_query(topic or stripped, user_id, message_id, ctx)
             return True
+
+        # 2.4) 生图：高置信直达（GPU 异步生成），中置信确认，低置信放行
+        if kind == "image_gen":
+            gen_prompt = topic or stripped
+            if conf >= 0.75:
+                from commands.image_commands import handle_image_gen_async
+                handle_image_gen_async(gen_prompt, user_id, message_id, ctx)
+                return True
+            if conf >= 0.5:
+                _PENDING[user_id] = {"kind": "image_gen", "content": gen_prompt}
+                ctx.reply_message(message_id,
+                                  f"要为「{gen_prompt[:60]}」生成一张图片吗？（GPU 出图约 2-4 分钟）回复「确认」开始。")
+                return True
+            return False
 
         # 2.5) 概念学习：高置信直达（~60s 生成概念卡），中置信确认，低置信放行
         if kind == "learn_concept":
