@@ -246,8 +246,10 @@ def extract_video_url(text: str) -> str:
 def extract_article_url(text: str) -> str:
     """提取文章 URL（非视频）"""
     # ⭐ 2026-08-08 P4: 视频域名按 hostname 后缀匹配（子串匹配会误伤 unix.com 类域名）
+    # ⭐ 2026-08-09: 移除 xiaohongshu/xhslink——小红书改由 webnote_distiller 专管
+    # （图文笔记走图文管线，视频笔记由适配器内部回退视频管线）
     video_domains = ('douyin.com', 'youtube.com', 'youtu.be', 'bilibili.com', 'b23.tv',
-                     'xiaohongshu.com', 'xhslink.com', 'kuaishou.com',
+                     'kuaishou.com',
                      'weibo.com', 'weibo.cn', 'tiktok.com', 'x.com', 'twitter.com')
     url_pattern = r'(https?://[^\s<>"{}|\^`\[\]]+)'
     match = re.search(url_pattern, text)
@@ -424,6 +426,17 @@ def process_article(text: str, message_id: str = None, user_id: str = None) -> s
         title = ""
     if not ok:
         return f"❌ 文章抓取失败：{article_text}"
+    # ⭐ 2026-08-09: 图文页面升级——正文图片 ≥3 张时改走图文管线（VLM 读图 + 蒸馏入库），
+    # 使公众号/普通网页的图文相间内容不再丢图；探测/升级失败均回退纯文本提炼
+    try:
+        import webnote_distiller as _wnd
+        probe = (_wnd.adapt_wechat_html(None, url) if is_wechat
+                 else _wnd.adapt_generic_html(url))
+        if len(probe.image_urls) >= 3:
+            logger.info(f"📷 检测到图文页面（{len(probe.image_urls)} 张图），升级图文管线")
+            return _wnd._run_pipeline_for_note(probe, user_id)
+    except Exception as e:
+        logger.info(f"图文管线升级跳过（继续纯文本提炼）: {str(e)[:80]}")
     try:
         from zhiwei_common.llm import llm_client
         prompt = ("请对以下文章做情报级深度提炼，输出结构：\n"
@@ -497,14 +510,15 @@ def _extract_md_section(text: str, heading: str, max_chars: int = 500) -> str:
     return body[:max_chars].rstrip()
 
 
-def _build_video_digest(output_path: str, title: str) -> str:
-    """⭐ N2 (2026-07-31): 视频处理完成后直接回推要点摘要
+def _build_video_digest(output_path: str, title: str, kind: str = "视频") -> str:
+    """⭐ N2 (2026-07-31): 媒体产物完成后直接回推要点摘要
 
     背景：旧行为只回“文件已生成 + 请到 Obsidian 查看”，而粘链接是用户
     88% 的真实用途（入站消息统计），每次都要自己去翻笔记，闭环断在最后一步。
     现从生成的笔记中抽“核心洞察/摘要/行动建议”回推；读文件失败则降级为原行为。
+    kind: 2026-08-09 新增，文案适配（"视频"/"图文"），默认视频保持旧行为。
     """
-    header = f"✅ 视频知识笔记已生成\n\n📝 **{title}**"
+    header = f"✅ {kind}知识笔记已生成\n\n📝 **{title}**"
     try:
         content = Path(output_path).read_text(errors="ignore")
     except Exception as e:

@@ -4,8 +4,12 @@
 覆盖（对应计划验收项）：
 1. 9 平台 x 正常/变体链接命中视频路由
 2. 非视频 URL / 文章链接不被误判为视频（负例必测）
-3. 新平台视频域名不再被文章路由捕获
+3. 视频域名不被文章路由捕获
 4. unix.com 类域名不被 x.com 误伤（hostname 后缀匹配验证）
+5. ⭐ 2026-08-09 行为变更：小红书移交图文管线——xhs/xhslink 链接由 webnote_distiller
+   前置分支接管（commands/media_commands.py 0.5 分支，先于视频判断），且
+   extract_article_url 不再排除小红书域名（process_article 内可按图片数升级图文管线）；
+   extract_video_url 保留 xhs 正则仅作适配器内部回退视频管线用，不再决定入口路由
 
 运行：~/zhiwei-shared-venv/bin/python3 -m unittest tests.test_media_platform_routing -v
 """
@@ -40,11 +44,29 @@ class TestVideoUrlExtraction(unittest.TestCase):
         self.assertVideo("https://www.bilibili.com/video/BV1xx411c7mD", "BV1xx411c7mD")
         self.assertVideo("https://b23.tv/abc123", "b23.tv")
 
-    # ---- P4 新增 5 平台 ----
-    def test_xiaohongshu(self):
-        self.assertVideo("https://www.xiaohongshu.com/explore/6590abcdef?xsec_token=abc", "xiaohongshu.com")
-        self.assertVideo("http://xhslink.com/a/AbCdEf", "xhslink.com")
-        self.assertVideo("推荐 https://xiaohongshu.com/discovery/item/6590abcdef 给你", "xiaohongshu.com")
+    # ---- ⭐ 2026-08-09 行为变更：小红书移交图文管线（webnote_distiller 专管） ----
+    # 入口路由由 commands/media_commands.py 的 0.5 前置分支决定（先于视频分支），
+    # 不再由 extract_video_url/is_video_url 吞掉；视频类笔记由适配器内部回退视频管线。
+    def test_xiaohongshu_routes_to_webnote(self):
+        from webnote_distiller import extract_web_note_url
+        for text in ["https://www.xiaohongshu.com/explore/6590abcdef?xsec_token=abc",
+                     "推荐 https://xiaohongshu.com/discovery/item/6590abcdef 给你"]:
+            url, source = extract_web_note_url(text)
+            self.assertIsNotNone(url, f"webnote 分支应捕获: {text}")
+            self.assertEqual(source, "xiaohongshu")
+        url, source = extract_web_note_url("http://xhslink.com/a/AbCdEf")
+        self.assertIsNotNone(url, "xhslink 短链应被 webnote 分支捕获")
+        self.assertEqual(source, "xiaohongshu")
+        # 文章路由不再排除小红书域名（process_article 内图片≥3 时可升级图文管线）
+        self.assertEqual(extract_article_url("https://www.xiaohongshu.com/explore/6590abc"),
+                         "https://www.xiaohongshu.com/explore/6590abc")
+
+    def test_zhihu_routes_to_webnote(self):
+        from webnote_distiller import extract_web_note_url
+        url, source = extract_web_note_url("https://www.zhihu.com/question/12345")
+        self.assertIsNotNone(url)
+        self.assertEqual(source, "zhihu")
+        self.assertNotVideo("https://www.zhihu.com/question/12345")
 
     def test_kuaishou(self):
         self.assertVideo("https://www.kuaishou.com/short-video/3xf8abc", "kuaishou.com")
@@ -74,9 +96,9 @@ class TestVideoUrlExtraction(unittest.TestCase):
         self.assertNotVideo("https://weibo.com/u/1234567890")
 
     def test_article_route_not_steal_video_domains(self):
-        """新平台视频链接不再被文章路由捕获"""
-        for text in ["https://www.xiaohongshu.com/explore/6590abc",
-                     "https://v.kuaishou.com/AbCd",
+        """视频域名链接不被文章路由捕获（⭐ 2026-08-09 起小红书已移出该断言，
+        移交图文管线，见 test_xiaohongshu_routes_to_webnote）"""
+        for text in ["https://v.kuaishou.com/AbCd",
                      "https://x.com/user/status/180123"]:
             self.assertIsNone(extract_article_url(text), f"文章路由不应捕获: {text}")
             self.assertTrue(is_video_url(text))
