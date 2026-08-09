@@ -18,7 +18,7 @@ import tempfile
 import subprocess
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -45,6 +45,9 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# RAG promotion 失败计数（2026-08-08: 原实现纯静默，失败不可观测）
+PROMOTION_STATS = {"failed": 0}
 
 
 # ============================================================================
@@ -520,6 +523,42 @@ class ProcessedStore:
         return {"total_processed": count}
 
 
+class JobIdStore:
+    """--job-id 幂等存储（迁移设计约束 2，2026-08-08）
+
+    跨机任务重投时同 job_id 命中缓存秒返，不重复消耗 ASR/VLM。
+    与 ProcessedStore 分库，不动既有表结构。
+    """
+    DEFAULT_DB_PATH = os.path.expanduser("~/zhiwei-bot/data/distiller_jobs.db")
+
+    def __init__(self, db_path: str = None):
+        import sqlite3
+        self.db_path = Path(db_path or self.DEFAULT_DB_PATH).expanduser()
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''CREATE TABLE IF NOT EXISTS job_runs (
+                job_id TEXT PRIMARY KEY,
+                output_path TEXT,
+                title TEXT,
+                completed_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )''')
+
+    def get(self, job_id: str) -> Optional[dict]:
+        """查询已完成的 job，返回 {job_id, output_path, title, completed_at} 或 None"""
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute('SELECT * FROM job_runs WHERE job_id=?', (job_id,)).fetchone()
+            return dict(row) if row else None
+
+    def mark(self, job_id: str, output_path: str, title: str = ""):
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('INSERT OR REPLACE INTO job_runs (job_id, output_path, title) VALUES (?,?,?)',
+                         (job_id, str(output_path), title))
+        logger.info(f"Job marked completed: {job_id}")
+
+
 # ============================================================================
 # URL 解析器
 # ============================================================================
@@ -545,7 +584,23 @@ class URLResolver:
         })
 
     def resolve(self, url: str) -> VideoInfo:
-        """解析 URL，追踪重定向，提取视频信息"""
+        """解析 URL，追踪重定向，提取视频信息
+
+        ⭐ 2026-08-08 P6: local://<路径> 哨兵格式支持本地文件（微信视频号等，
+        无 URL 体系的兜底入口），不走网络解析。
+        """
+        if url.startswith("local://"):
+            path = Path(url[len("local://"):]).expanduser()
+            if not path.exists():
+                raise FileNotFoundError(f"本地文件不存在: {path}")
+            logger.info(f"Local file mode: {path}")
+            return VideoInfo(
+                original_url=url,
+                resolved_url=str(path),
+                platform="local",
+                title=path.stem,
+            )
+
         logger.info(f"Resolving URL: {url}")
 
         # 追踪重定向
@@ -774,6 +829,10 @@ class MediaExtractor:
         v3.1: B站走官方 API(yt-dlp 网页解析必 412); YouTube 走代理+cookies
               且容忍 format 不可用(PO Token 风控下字幕仍可取)
         """
+        # ⭐ 2026-08-08 P6: 本地文件无平台字幕，直走 ASR
+        if video_info.platform == "local":
+            return None
+
         # ⭐ 抖音平台：使用本地 API 获取文案作为字幕
         if video_info.platform == "douyin":
             return self._extract_douyin_subtitle(video_info)
@@ -1089,6 +1148,13 @@ class MediaExtractor:
         Returns:
             是否成功
         """
+        # ⭐ 2026-08-08 P6: 本地文件直接复制（vision 抽帧用）
+        if video_info.platform == "local":
+            import shutil
+            shutil.copy2(video_info.resolved_url, output_path)
+            logger.info(f"Local video copied: {output_path}")
+            return True
+
         # 抖音平台：使用本地 API
         if video_info.platform == "douyin":
             return self._download_douyin_video(video_info, output_path)
@@ -1188,6 +1254,19 @@ class MediaExtractor:
         Raises:
             ValueError: 抖音 API 调用失败时抛出，包含详细错误信息
         """
+        # ⭐ 2026-08-08 P6: 本地文件（微信视频号等）直接 ffmpeg 抽音轨
+        if video_info.platform == "local":
+            mp3_path = output_path.with_suffix(".mp3")
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", video_info.resolved_url,
+                 "-vn", "-acodec", "libmp3lame", "-q:a", "2", str(mp3_path)],
+                capture_output=True, text=True, timeout=600)
+            if result.returncode != 0 or not mp3_path.exists():
+                logger.error(f"本地文件抽音轨失败: {(result.stderr or '')[-300:]}")
+                return False
+            logger.info(f"Local audio extracted: {mp3_path}")
+            return True
+
         # 抖音平台：使用本地 API
         if video_info.platform == "douyin":
             return self._extract_douyin_audio(video_info, output_path)
@@ -3486,6 +3565,9 @@ rag: {rag_flag}
 ## 行动建议
 {action_items_section}
 
+## 问答参考
+暂无
+
 {references_section}
 
 ## 关联资产
@@ -3742,12 +3824,15 @@ def _trigger_rag_ingest(note_path) -> None:
     """
     try:
         rag_python = Path.home() / "zhiwei-rag" / "venv" / "bin" / "python"
-        ingest_script = Path.home() / "zhiwei-rag" / "scripts" / "ingest_incremental.py"
-        if not rag_python.exists() or not ingest_script.exists():
+        rag_root = Path.home() / "zhiwei-rag"
+        if not rag_python.exists() or not rag_root.exists():
             logger.warning(f"[RAG] 入库环境缺失，跳过: {note_path}")
             return
+        # 2026-08-05 统一入库契约 P4：收口到 ingest_unified（doc_class=transcript；
+        # 无 --force → 尊重 DKI 隔离，75_视频笔记维持不入库）。
         # 入库完成后刷新检索索引（2026-08-01: 消除 lance MVCC 快照导致的搜索断层）
-        cmd = (f'"{rag_python}" "{ingest_script}" --file "{note_path}" --no-archive '
+        cmd = (f'cd "{rag_root}" && "{rag_python}" -m ingest.ingest_unified '
+               f'--file "{note_path}" --class transcript '
                f'&& curl -s -X POST http://localhost:8765/admin/refresh >/dev/null')
         subprocess.Popen(
             ["/bin/bash", "-c", cmd],
@@ -3755,6 +3840,134 @@ def _trigger_rag_ingest(note_path) -> None:
         logger.info(f"[RAG] 已触发增量入库: {Path(note_path).name}")
     except Exception as e:
         logger.warning(f"[RAG] 触发入库失败(不影响主流程): {e}")
+
+
+def _stage_dir_for(config: AppConfig, video_info, args, video_id: str) -> Path:
+    """分段执行中间产物目录（--stage-dir 优先，否则 output_dir/Stages/日期_标题）"""
+    if getattr(args, 'stage_dir', None):
+        d = Path(args.stage_dir).expanduser()
+    else:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        safe_title = re.sub(r'[<>:"/\\|?*]', '', video_info.title or f"Video_{video_id or 'unknown'}")[:50]
+        d = config.output_dir / "Stages" / f"{date_str}_{safe_title}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _run_stage(stage: str, url: str, config: AppConfig, args, store: ProcessedStore) -> int:
+    """--stage 分段执行（迁移设计约束 3，2026-08-08）：单段运行 + 中间产物落盘
+
+    为将来在笔记本从机上分段跑、Mac 上组装预留接口；本期只实现接口与落盘格式。
+    中间产物（stage_dir）：
+      meta.json            视频元信息 + 分段状态
+      audio.*              音轨（download 段）
+      transcript_full.txt  转录全文（transcribe 段）
+      knowledge.json       蒸馏结果 JSON（analyze 段）
+      vision_frames.json   关键帧 + VLM 描述（vision 段）
+    """
+    resolver = URLResolver()
+    try:
+        video_info = resolver.resolve(url)
+    except Exception as e:
+        print(json.dumps({"error_type": "resolve_failed", "error_message": str(e)},
+                         ensure_ascii=False), file=sys.stderr)
+        return 1
+
+    video_id = ProcessedStore.extract_video_id(video_info.resolved_url)
+    stage_dir = _stage_dir_for(config, video_info, args, video_id)
+
+    meta_path = stage_dir / "meta.json"
+    meta = {}
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+    meta.update({
+        "url": url, "resolved_url": video_info.resolved_url,
+        "platform": video_info.platform, "video_id": video_id or "",
+        "title": video_info.title, "author": video_info.author,
+        "duration": video_info.duration, "last_stage": stage,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    })
+
+    cookies_browser = getattr(args, 'cookies_from_browser', None)
+    cookies_file = getattr(args, 'cookies', None)
+
+    try:
+        if stage == "download":
+            provider = TranscriptProvider(config, cookies_browser, cookies_file)
+            ok = provider.media_extractor.extract_audio(video_info, stage_dir / "audio")
+            if not ok:
+                raise RuntimeError("音轨提取失败")
+            audio_files = sorted(stage_dir.glob("audio.*"))
+            if not audio_files:
+                raise RuntimeError("音轨提取后未找到音频文件")
+            meta["audio_path"] = str(audio_files[0])
+
+        elif stage == "transcribe":
+            provider = TranscriptProvider(config, cookies_browser, cookies_file)
+            save_audio = Path(meta["audio_path"]) if meta.get("audio_path") else (stage_dir / "audio")
+            transcript = provider.get_transcript(video_info, save_audio_path=save_audio)
+            if not transcript.full_text:
+                raise RuntimeError(transcript.error_details or "ASR 返回空")
+            transcript = TranscriptPostProcessor().clean(transcript)
+            (stage_dir / "transcript_full.txt").write_text(transcript.full_text, encoding="utf-8")
+            meta["transcript_chars"] = len(transcript.full_text)
+            meta["asr_engine"] = transcript.source
+
+        elif stage == "analyze":
+            t_path = stage_dir / "transcript_full.txt"
+            if not t_path.exists():
+                print(json.dumps({"error_type": "stage_missing",
+                                  "error_message": "缺少 transcript_full.txt，请先跑 --stage transcribe"},
+                                 ensure_ascii=False), file=sys.stderr)
+                return 1
+            full_text = t_path.read_text(encoding="utf-8")
+            transcript = TranscriptResult(segments=[], full_text=full_text,
+                                          source=meta.get("asr_engine", "stage_cache"))
+            # 用户指令注入（与全流程同通道）
+            instruction_context = ""
+            _instruction_file = getattr(args, 'instruction_file', None)
+            if _instruction_file:
+                try:
+                    _inst_text = Path(_instruction_file).expanduser().read_text(encoding='utf-8').strip()
+                    if _inst_text:
+                        instruction_context = (
+                            "**用户指定背景/还原指令（最高优先级）：**\n"
+                            f"{_inst_text}\n"
+                            "请在分析与摘要中严格执行上述还原与映射。")
+                except Exception as e:
+                    logger.warning(f"读取 instruction-file 失败: {e}")
+            knowledge = KnowledgeDistiller(config).distill(video_info, transcript,
+                                                           extra_context=instruction_context)
+            (stage_dir / "knowledge.json").write_text(
+                json.dumps(asdict(knowledge), ensure_ascii=False, indent=2), encoding="utf-8")
+            meta["knowledge_title"] = knowledge.title
+            meta["content_tier"] = knowledge.content_tier
+
+        elif stage == "vision":
+            provider = TranscriptProvider(config, cookies_browser, cookies_file)
+            frames = VisionAnalyzer(config).analyze(video_info, provider.media_extractor)
+            payload = [{"index": f.index, "timestamp": f.timestamp,
+                        "path": f.path, "description": f.description} for f in frames]
+            (stage_dir / "vision_frames.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            meta["vision_frames"] = len(payload)
+
+        meta.setdefault("stages_done", [])
+        if stage not in meta["stages_done"]:
+            meta["stages_done"].append(stage)
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info(f"[stage:{stage}] 产物已落盘 -> {stage_dir}")
+        print(json.dumps({"status": "stage_ok", "stage": stage,
+                          "stage_dir": str(stage_dir)}, ensure_ascii=False))
+        return 0
+    except Exception as e:
+        print(json.dumps({"error_type": "stage_failed", "stage": stage,
+                          "error_message": str(e)}, ensure_ascii=False), file=sys.stderr)
+        logger.error(f"[stage:{stage}] 失败: {e}")
+        return 1
 
 
 def process_single_video(url: str, config: AppConfig, args, store: ProcessedStore) -> int:
@@ -3769,6 +3982,24 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
     失败时输出 JSON 格式错误信息到 stderr:
     {"error_type": "xxx", "error_message": "xxx"}
     """
+    # --stage 分段执行：不走全流程（迁移设计约束 3）
+    if getattr(args, 'stage', None):
+        return _run_stage(args.stage, url, config, args, store)
+
+    # --job-id 幂等：同 ID 已完成则秒返缓存产物（迁移设计约束 2）
+    job_id = getattr(args, 'job_id', None)
+    job_store = JobIdStore() if job_id else None
+    if job_id:
+        hit = job_store.get(job_id)
+        if hit:
+            logger.info(f"⏭️ job_id={job_id} 已完成，返回缓存产物")
+            print(f"✅ Done! Output: {hit.get('output_path', 'N/A')}")
+            if getattr(args, 'json', False):
+                print(json.dumps({"status": "cached", "job_id": job_id,
+                                  "output_path": hit.get("output_path", ""),
+                                  "title": hit.get("title", "")}, ensure_ascii=False))
+            return 0
+
     resolver = URLResolver()
 
     # 1. 解析 URL
@@ -3788,6 +4019,17 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
 
     # 去重检查（video_id 优先）
     video_id = ProcessedStore.extract_video_id(video_info.resolved_url)
+    # ⭐ 2026-08-08 P6: 本地文件用内容 hash 作去重键（R7）
+    if not video_id and video_info.platform == "local":
+        import hashlib
+        try:
+            h = hashlib.sha1()
+            with open(video_info.resolved_url, 'rb') as f:
+                for chunk in iter(lambda: f.read(1 << 20), b''):
+                    h.update(chunk)
+            video_id = f"local_{h.hexdigest()[:16]}"
+        except Exception as e:
+            logger.warning(f"本地文件 hash 失败, 退化为路径去重: {e}")
     if video_id:
         logger.info(f"Video ID: {video_id}")
     if store.is_processed(video_info.resolved_url, video_id=video_id) and not getattr(args, 'force', False):
@@ -3801,6 +4043,9 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
             if getattr(args, 'json', False):
                 print(json.dumps({"status": "skipped", "output_path": str(output_path),
                                   "title": record.get('title', '')}, ensure_ascii=False))
+            # 去重跳过也算 job 完成，保证同 job_id 重投秒返
+            if job_id and job_store:
+                job_store.mark(job_id, output_path, record.get('title', ''))
         return 2
 
     # 2. 获取转录
@@ -3987,14 +4232,25 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
                     # 在副本中标记 rag: true
                     dest_content = dest.read_text(encoding="utf-8")
                     dest_content = dest_content.replace("rag: false", "rag: true", 1)
+                    # ⭐ 2026-08-08 promotion 净化：剥除内嵌 ASR 全文（体积大，
+                    # 原件与 Assets 仍在 75_视频笔记）与断链的关联资产段
+                    dest_content = re.sub(
+                        r"<details>\s*<summary>ASR 转录原文</summary>.*?</details>",
+                        "", dest_content, flags=re.DOTALL)
+                    dest_content = re.sub(
+                        r"## 关联资产\n(?:- .+\n)+", "", dest_content)
+                    dest_content = re.sub(r"\n{3,}", "\n\n", dest_content)
                     dest.write_text(dest_content, encoding="utf-8")
                     logger.info(f"Promoted to JD directory: {dest}")
                 else:
-                    logger.warning(f"JD directory not found: {jd_dir}")
+                    PROMOTION_STATS["failed"] += 1
+                    logger.warning(f"JD directory not found: {jd_dir} (promotion 累计失败 {PROMOTION_STATS['failed']})")
             else:
-                logger.warning(f"Classify API returned {classify_resp.status_code}")
+                PROMOTION_STATS["failed"] += 1
+                logger.warning(f"Classify API returned {classify_resp.status_code} (promotion 累计失败 {PROMOTION_STATS['failed']})")
         except Exception as e:
-            logger.warning(f"RAG promotion failed (non-fatal): {e}")
+            PROMOTION_STATS["failed"] += 1
+            logger.warning(f"RAG promotion failed (non-fatal, 累计失败 {PROMOTION_STATS['failed']}): {e}")
 
     # 标记已处理(v3.0: 附转写缓存 + 成本估算)
     # 成本为粗估: 中文约 2 字符/token,百炼混合费率按 ~0.002 USD/1K tokens 计
@@ -4005,6 +4261,8 @@ def process_single_video(url: str, config: AppConfig, args, store: ProcessedStor
     store.mark_processed(video_info.resolved_url, output_path, knowledge.title, video_id=video_id,
                          transcript=transcript.full_text, asr_engine=transcript.source,
                          tokens_used=tokens_est, cost_usd=cost_est)
+    if job_id and job_store:
+        job_store.mark(job_id, output_path, knowledge.title)
 
     # ⭐ v3.0: 触发 RAG 增量入库(含 --vision 的 VLM 描述文本,图表信息可被检索)
     # 仅 A/B 级: C/D 级笔记 rag:false 会被 DKI 隔离(0 chunk),省去无效子进程
@@ -4050,6 +4308,9 @@ def main():
     input_group.add_argument("--from-text", type=str, help="直接处理一段分享文本")
     input_group.add_argument("--stdin", action="store_true", help="从标准输入读取分享文本")
     input_group.add_argument("--input-file", type=str, help="从文件读取，每行一条分享文本")
+    # ⭐ 2026-08-08 P6: 本地文件入口（微信视频号等无 URL 场景；跨机兼容任意路径）
+    input_group.add_argument("--local-file", type=str, metavar="PATH",
+                             help="本地视频文件路径(mp4/mov 等)，跳过 URL 解析直接走蒸馏全链路")
 
     # 处理参数
     parser.add_argument("--extract-only", action="store_true", help="仅提取并打印 URL，不执行蒸馏")
@@ -4069,6 +4330,13 @@ def main():
     parser.add_argument("--json", action="store_true", help="JSON 格式输出结果")
     parser.add_argument("--instruction-file", type=str, metavar="PATH",
                         help="用户指令文件(代称映射/还原指令),并入蒸馏 prompt 最高优先级")
+    # ⭐ 2026-08-08 迁移设计预留（笔记本从机分段执行与幂等重投）
+    parser.add_argument("--job-id", type=str, metavar="ID",
+                        help="幂等任务 ID: 同 ID 重跑直接返回缓存产物(跨机任务重投不重复消耗 ASR/VLM)")
+    parser.add_argument("--stage", type=str, choices=["download", "transcribe", "analyze", "vision"],
+                        help="分段执行: 只跑指定阶段并落盘中间产物(配合 --stage-dir)")
+    parser.add_argument("--stage-dir", type=str, metavar="DIR",
+                        help="分段执行中间产物目录(默认 output_dir/Stages/日期_标题)")
 
     args = parser.parse_args()
 
@@ -4101,19 +4369,33 @@ def main():
     elif args.url:
         raw_text = args.url  # 兼容原有用法
 
-    if not raw_text:
-        print("错误：请提供 URL 或使用 --from-text / --stdin / --input-file")
-        return 1
+    # ⭐ 2026-08-08 P6: 本地文件入口——跳过 URL 提取，构造 local:// 哨兵
+    if getattr(args, 'local_file', None):
+        _lp = Path(args.local_file).expanduser()
+        if not _lp.exists():
+            print(f"错误：本地文件不存在: {_lp}")
+            return 1
+        urls = [f"local://{_lp.resolve()}"]
+        print(f"📁 本地文件模式: {_lp.name}")
+    else:
+        if not raw_text:
+            print("错误：请提供 URL 或使用 --from-text / --stdin / --input-file / --local-file")
+            return 1
 
-    # 提取 URL
-    extractor = ShareTextExtractor()
-    urls = extractor.extract(raw_text)
+        # 提取 URL
+        extractor = ShareTextExtractor()
+        urls = extractor.extract(raw_text)
 
-    if not urls:
-        print("未从输入中检测到视频链接")
-        return 1
+        if not urls:
+            print("未从输入中检测到视频链接")
+            return 1
 
     print(f"📋 检测到 {len(urls)} 个视频链接")
+
+    # --job-id 幂等语义针对单任务: 多 URL 时只处理第一个并告警
+    if getattr(args, 'job_id', None) and len(urls) > 1:
+        logger.warning(f"--job-id 与多链接共用时仅处理第一个链接（共 {len(urls)} 个）")
+        urls = urls[:1]
 
     # 仅提取模式
     if args.extract_only:

@@ -61,6 +61,13 @@ class ConversationStore:
             CREATE INDEX IF NOT EXISTS idx_turns_user ON turns(user_id, id);
             CREATE INDEX IF NOT EXISTS idx_artifacts_user ON artifacts(user_id, id);
             """)
+            # ⭐ 2026-08-08 双向追问改造 P3: 追更产物登记需要的列（旧记录兼容:
+            # source 默认 manual，feishu_url 可空）
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(artifacts)")}
+            if "source" not in cols:
+                conn.execute("ALTER TABLE artifacts ADD COLUMN source TEXT DEFAULT 'manual'")
+            if "feishu_url" not in cols:
+                conn.execute("ALTER TABLE artifacts ADD COLUMN feishu_url TEXT")
 
     @contextmanager
     def _connect(self):
@@ -92,36 +99,45 @@ class ConversationStore:
         except Exception as e:
             logger.warning(f"record_turn 失败: {e}")
 
-    def register_artifact(self, user_id, kind, url=None, title=None, note_path=None, summary=None):
-        """登记一个媒体产物，返回 artifact_id（int）；no-op 时返回 None"""
+    def register_artifact(self, user_id, kind, url=None, title=None, note_path=None,
+                          summary=None, source="manual", feishu_url=None):
+        """登记一个媒体产物，返回 artifact_id（int）；no-op 时返回 None
+
+        source: manual=用户主动会话产物 / scheduled=定时追更产物（2026-08-08 P3）
+        """
         if not self._enabled:
             return None
         try:
             with self._connect() as conn:
                 cur = conn.execute(
-                    "INSERT INTO artifacts (user_id, kind, url, title, note_path, summary) "
-                    "VALUES (?,?,?,?,?,?)",
-                    (user_id, kind, url, title, note_path, summary))
+                    "INSERT INTO artifacts (user_id, kind, url, title, note_path, summary, "
+                    "source, feishu_url) VALUES (?,?,?,?,?,?,?,?)",
+                    (user_id, kind, url, title, note_path, summary, source, feishu_url))
                 return cur.lastrowid
         except Exception as e:
             logger.warning(f"register_artifact 失败: {e}")
             return None
 
     def get_last_artifact(self, user_id, kind=None):
-        """返回最近一个产物(dict，含全部列)或 None"""
+        """返回最近一个产物(dict，含全部列)或 None
+
+        排序优先用户主动会话产物（source != 'scheduled'，含历史 NULL/manual 记录），
+        同优先级内取最新——避免定时追更产物淹没用户刚发的链接（2026-08-08 P3）
+        """
         if not self._enabled:
             return None
+        _ORDER = ("ORDER BY CASE WHEN source='scheduled' THEN 1 ELSE 0 END, id DESC LIMIT 1")
         try:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
                 if kind:
                     row = conn.execute(
-                        "SELECT * FROM artifacts WHERE user_id=? AND kind=? "
-                        "ORDER BY id DESC LIMIT 1", (user_id, kind)).fetchone()
+                        f"SELECT * FROM artifacts WHERE user_id=? AND kind=? {_ORDER}",
+                        (user_id, kind)).fetchone()
                 else:
                     row = conn.execute(
-                        "SELECT * FROM artifacts WHERE user_id=? "
-                        "ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
+                        f"SELECT * FROM artifacts WHERE user_id=? {_ORDER}",
+                        (user_id,)).fetchone()
                 return dict(row) if row else None
         except Exception as e:
             logger.warning(f"get_last_artifact 失败: {e}")

@@ -78,6 +78,23 @@ def handle_media_commands(text_lower, text_stripped, user_id, message_id, ctx):
         ctx.handle_video_async(text_stripped, message_id, user_id)
         return True
 
+    # 1.2 通用兜底（2026-08-08 P4，R6）：白名单未识别的链接且文章路由也不接受时，
+    # 用 distiller 探测可解析性，通过则当视频处理，失败继续往下走
+    if not ctx.is_article_url(text_stripped):
+        import re as _re
+        _m = _re.search(r'https?://[^\s<>"{}|\^`\[\]]+', text_stripped)
+        if _m:
+            from media_handler import probe_generic_video_url
+            if probe_generic_video_url(_m.group(0).rstrip('.,;:!?)')):
+                reply_message(message_id, "🎬 检测到白名单外的视频链接，尝试分析（预计3-10分钟）...")
+                ctx.handle_video_async(_m.group(0), message_id, user_id)
+                return True
+
+    # 1.5 文章 URL 处理（2026-08-05 共性修复：公众号/网页文章不再落空，抓取+提炼）
+    if ctx.is_article_url(text_stripped):
+        ctx.handle_article_async(text_stripped, message_id, user_id)
+        return True
+
     # 2. 待办任务自动提取 (关键词触发)
     TODO_KEYWORDS = ["要做的", "要完成", "需要", "得去", "记得", "别忘了", "待办", "记得做", "还要", "要去"]
     if any(kw in text_stripped for kw in TODO_KEYWORDS):

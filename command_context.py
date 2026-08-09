@@ -43,6 +43,7 @@ class CommandContext:
     is_video_url: Callable[[str], bool] = None
     summarize_url: Callable[[str], str] = None
     handle_video_async: Callable[[str, str, str], None] = None
+    handle_article_async: Callable[[str, str, str], None] = None
     extract_video_url: Callable[[str], str] = None
     extract_article_url: Callable[[str], str] = None
 
@@ -135,6 +136,7 @@ def init_context_from_globals(
     is_video_url=None,
     summarize_url=None,
     handle_video_async=None,
+    handle_article_async=None,
     extract_video_url=None,
     extract_article_url=None,
     TaskLogger=None,
@@ -167,6 +169,7 @@ def init_context_from_globals(
         is_video_url=is_video_url,
         summarize_url=summarize_url,
         handle_video_async=handle_video_async,
+        handle_article_async=handle_article_async,
         extract_video_url=extract_video_url,
         extract_article_url=extract_article_url,
         TaskLogger=TaskLogger,

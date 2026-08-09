@@ -190,6 +190,8 @@ def extract_video_url(text: str) -> str:
     - douyin.com/video/xxx (无协议前缀，抖音新分享格式)
     - https://douyin.com/video/xxx (无 www)
     - B站、YouTube 等
+    - ⭐ 2026-08-08 P4: 小红书/快手/微博/TikTok/X 全平台放行
+      （下载由 distiller 内 yt-dlp 承接，解析失败有明确错误回复）
     """
     patterns = [
         # 抖音短链
@@ -208,7 +210,22 @@ def extract_video_url(text: str) -> str:
         r'(https?://(?:www\.)?youtube\.com/shorts/[A-Za-z0-9_-]+)',
         # B站
         r'(https?://(?:www\.)?bilibili\.com/video/[A-Za-z0-9_-]+)',
-        r'(https?://b23\.tv/[A-Za-z0-9_-]+)'
+        r'(https?://b23\.tv/[A-Za-z0-9_-]+)',
+        # ⭐ 2026-08-08 P4: 小红书（explore/discovery 页 + xhslink 短链）
+        r'(https?://(?:www\.)?xiaohongshu\.com/[^\s<>"]+)',
+        r'(https?://xhslink\.com/[A-Za-z0-9/_-]+)',
+        # 快手（short-video 页 + v.kuaishou 短链）
+        r'(https?://(?:www\.)?kuaishou\.com/[^\s<>"]+)',
+        r'(https?://v\.kuaishou\.com/[A-Za-z0-9_-]+)',
+        # 微博视频页（tv/show 与状态页，含 m. 等子域）
+        r'(https?://(?:[A-Za-z0-9-]+\.)*weibo\.com/tv/show/[^\s<>"]+)',
+        r'(https?://(?:[A-Za-z0-9-]+\.)*weibo\.com/\d+/[A-Za-z0-9]+[^\s<>"]*)',
+        r'(https?://(?:[A-Za-z0-9-]+\.)*weibo\.cn/[^\s<>"]+)',
+        # TikTok（视频页 + vm 短链）
+        r'(https?://(?:www\.)?tiktok\.com/@[^\s<>"]+/video/\d+)',
+        r'(https?://vm\.tiktok\.com/[A-Za-z0-9_-]+)',
+        # X / Twitter 状态页（含视频）
+        r'(https?://(?:www\.)?(?:x|twitter)\.com/\w+/status/\d+[^\s<>"]*)',
     ]
     for pattern in patterns:
         match = re.search(pattern, text)
@@ -228,13 +245,24 @@ def extract_video_url(text: str) -> str:
 
 def extract_article_url(text: str) -> str:
     """提取文章 URL（非视频）"""
-    video_patterns = ['douyin.com', 'youtube.com', 'youtu.be', 'bilibili.com', 'b23.tv']
+    # ⭐ 2026-08-08 P4: 视频域名按 hostname 后缀匹配（子串匹配会误伤 unix.com 类域名）
+    video_domains = ('douyin.com', 'youtube.com', 'youtu.be', 'bilibili.com', 'b23.tv',
+                     'xiaohongshu.com', 'xhslink.com', 'kuaishou.com',
+                     'weibo.com', 'weibo.cn', 'tiktok.com', 'x.com', 'twitter.com')
     url_pattern = r'(https?://[^\s<>"{}|\^`\[\]]+)'
     match = re.search(url_pattern, text)
     if match:
         url = match.group(1).rstrip('.,;:!?)')
-        if not any(v in url.lower() for v in video_patterns):
+        try:
+            from urllib.parse import urlparse
+            host = (urlparse(url).hostname or '').lower()
+        except Exception:
+            host = ''
+        if host and not any(host == d or host.endswith('.' + d) for d in video_domains):
             return url
+        if not host:  # 解析失败退回旧逻辑（子串匹配），保守放行文章路由
+            if not any(v in url.lower() for v in video_domains):
+                return url
     return None
 
 
@@ -246,6 +274,21 @@ def is_article_url(text: str) -> bool:
 def is_video_url(text: str) -> bool:
     """判断是否为视频 URL"""
     return extract_video_url(text) is not None
+
+
+def probe_generic_video_url(url: str) -> bool:
+    """通用视频探测（2026-08-08 P4 兜底，R6）：白名单未覆盖的域名链接，
+    用 distiller URLResolver 探测可解析性，通过则当视频处理，失败降级文章路由。
+    仅在 extract_article_url 也不匹配时由调用方触发，避免误吞文章链接。
+    """
+    try:
+        from scripts.douyin_distiller import URLResolver
+        vi = URLResolver().resolve(url)
+        logger.info(f"[探测] 通用视频探测通过: {url[:60]} -> {vi.platform}")
+        return bool(vi.resolved_url)
+    except Exception as e:
+        logger.info(f"[探测] 通用视频探测失败(降级文章): {str(e)[:80]}")
+        return False
 
 
 def fetch_url_content(url: str, timeout: int = 30) -> tuple[bool, str]:
@@ -515,6 +558,11 @@ def process_video(text: str, message_id: str = None, user_id: str = None, instru
     url = None
     try:
         url = extract_video_url(text)
+        # ⭐ 2026-08-08 P4 兜底：白名单外链接探测通过则直接使用（与 media_commands 探测同逻辑）
+        if not url:
+            _m = re.search(r'https?://[^\s<>"{}|\^`\[\]]+', text or "")
+            if _m and probe_generic_video_url(_m.group(0).rstrip('.,;:!?)')):
+                url = _m.group(0).rstrip('.,;:!?)')
         if not url:
             return "❌ 未找到有效的视频链接"
         logger.info(f"🎬 视频链接: {url}")
@@ -557,6 +605,12 @@ def process_video(text: str, message_id: str = None, user_id: str = None, instru
             # bot 检测全灭), 改为直读 Chrome 登录态(与 B站同策略, 实测通过);
             # 网络出口由 distiller 内部自动走日本 VM 的 SOCKS5 隔离(平台感知)。
             cmd.extend(["--cookies-from-browser", "chrome"])
+        elif any(d in url for d in ("xiaohongshu.com", "xhslink.com", "kuaishou.com",
+                                    "weibo.com", "weibo.cn", "tiktok.com",
+                                    "x.com", "twitter.com")):
+            # ⭐ 2026-08-08 P4: 新增平台统一 Chrome 登录态（小红书/快手/微博反爬需登录态；
+            # TikTok/X 由 distiller 平台感知自动走日本隧道）
+            cmd.extend(["--cookies-from-browser", "chrome"])
         # 其余平台：不带 cookies（避免无谓加载抖音 cookies 而在日志里产生 "cookie" 字样干扰错误归类）
 
         # ⭐ 2026-08-04 P1.3: 用户指令注入(代称映射/还原)
@@ -592,7 +646,8 @@ def process_video(text: str, message_id: str = None, user_id: str = None, instru
 
         try:
             # ⭐ v3.0: vision 模式含视频下载+抽帧+逐帧 VLM,耗时更长
-            _timeout = 1800 if vision_mode else 900
+            # ⭐ 2026-08-08 P5: 240 分钟长视频放宽超时
+            _timeout = 3600 if vision_mode else 1800
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=_timeout)
         except subprocess.TimeoutExpired as e:
             # ⭐ 2026-07-27: 超时时记录 partial output，便于定位卡在哪一步
@@ -1129,14 +1184,114 @@ def handle_pdf_async(message_id: str, file_key: str, file_name: str, user_id: st
 # ---------------------------------------------------------------------------
 
 AUDIO_FILE_EXTS = (".m4a", ".mp3", ".wav", ".aac", ".ogg", ".flac")
+# ⭐ 2026-08-08 P6: 视频文件扩展名（微信视频号等无 URL 场景的本地文件入口）
+VIDEO_FILE_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".m4v")
+
+
+def process_local_video_file(message_id: str, file_key: str, file_name: str) -> str:
+    """本地视频文件蒸馏主流程（2026-08-08 P6）：下载 → distiller --local-file 全链路
+    → 飞书文档同步 → artifact 注册（可被文档评论追问）→ 摘要回推
+    """
+    suffix = Path(file_name).suffix.lower() or ".mp4"
+    video_path = download_file_resource(message_id, file_key, suffix=suffix)
+    if not video_path:
+        return "❌ 视频文件下载失败，请重试"
+
+    journal_id = task_journal.record_start("video_file", file_name, message_id, file_key)
+    try:
+        size_mb = os.path.getsize(video_path) / 1024 / 1024
+        if size_mb > 2048:
+            task_journal.record_failed(journal_id, f"过大 {size_mb:.0f}MB")
+            return f"❌ 视频过大（{size_mb:.0f}MB > 2GB），暂不支持"
+
+        venv_python = os.path.expanduser("~/zhiwei-shared-venv/bin/python")
+        distiller_path = os.path.expanduser("~/zhiwei-bot/scripts/douyin_distiller.py")
+        cmd = [venv_python, distiller_path, "--local-file", video_path,
+               "--output-dir", os.path.expanduser("~/Documents/ZhiweiVault/70-79_个人笔记/75_视频笔记_Video-Distill"),
+               "--json", "--vision"]
+
+        logger.info(f"🎬 本地视频蒸馏: {file_name} ({size_mb:.1f}MB)")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        except subprocess.TimeoutExpired:
+            task_journal.record_failed(journal_id, "处理超时 3600s")
+            return "❌ 视频处理超时（超过 60 分钟），文件可能过长"
+
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "")[-300:]
+            task_journal.record_failed(journal_id, err[:200])
+            return f"❌ 视频蒸馏失败：{err[:200]}"
+
+        note_path, title = "", Path(file_name).stem
+        try:
+            out = json.loads(result.stdout.strip().splitlines()[-1])
+            note_path = out.get("output_path", "")
+            title = out.get("title", title)
+        except (json.JSONDecodeError, IndexError):
+            pass
+
+        # 飞书文档同步 + artifact 注册（失败降级不阻断；文档同步后即获得评论追问能力）
+        feishu_url = ""
+        if note_path:
+            try:
+                from feishu_note_sync import sync_note_to_feishu
+                synced = sync_note_to_feishu(note_path)
+                if synced:
+                    feishu_url = synced.get("doc_url", "")
+            except Exception as e:
+                logger.warning(f"本地视频飞书同步降级: {e}")
+            try:
+                from core.conversation_store import conversation_store
+                conversation_store.register_artifact(
+                    "local_file", "video", url=f"file://{video_path}", title=title,
+                    note_path=note_path, source="manual", feishu_url=feishu_url or None)
+            except Exception as e:
+                logger.warning(f"本地视频 artifact 注册降级: {e}")
+
+        task_journal.record_done(journal_id)
+        digest = _build_video_digest(note_path, title) if note_path else f"✅ 视频笔记已生成：{title}"
+        if feishu_url:
+            digest += f"\n\n📄 飞书文档：{feishu_url}\n（可在文档内评论追问，答案自动沉淀进笔记）"
+        return digest
+    except Exception as e:
+        try:
+            task_journal.record_failed(journal_id, str(e)[:200])
+        except Exception:
+            pass
+        return f"❌ 视频处理异常：{e}"
+    finally:
+        try:
+            if video_path and os.path.exists(video_path):
+                os.remove(video_path)
+        except Exception:
+            pass
+
+
+def handle_local_video_file_async(message_id: str, file_key: str, file_name: str, user_id: str):
+    """异步处理本地视频文件蒸馏（兼容入口：音频通道也会先走这里判扩展名）"""
+    def _process():
+        try:
+            response = process_local_video_file(message_id, file_key, file_name)
+            reply_message(message_id, response)
+            TaskLogger.log_task("视频文件蒸馏", "完成", file_name)
+        except Exception as e:
+            print(f"❌ 视频文件异步处理异常: {e}")
+            reply_message(message_id, f"❌ 视频处理失败: {str(e)}")
+
+    thread = threading.Thread(target=_process, daemon=True)
+    thread.start()
 
 
 def process_audio_file(message_id: str, file_key: str, file_name: str) -> str:
     """音频文件蒸馏主流程：下载 → 子进程转写+蒸馏 → 复用 _build_video_digest 回推
 
     v70.6: 全程 task_journal 留痕，进程中断可被看门狗断点续跑。
+    ⭐ 2026-08-08 P6: 兼容入口——视频扩展名转本地视频链路（ws_client 受保护，
+    视频文件消息需经音频通道接入，此处按扩展名分流）。
     """
     suffix = Path(file_name).suffix.lower() or ".m4a"
+    if suffix in VIDEO_FILE_EXTS:
+        return process_local_video_file(message_id, file_key, file_name)
     audio_path = download_file_resource(message_id, file_key, suffix=suffix)
     if not audio_path:
         return "❌ 音频下载失败，请重试"
