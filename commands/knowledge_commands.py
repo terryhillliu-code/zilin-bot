@@ -1,6 +1,10 @@
 from zhiwei_common.llm import llm_client
+import logging
+import threading
 import time
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # ============ 共享函数（NL 路由器与斜杠命令共用，2026-07-26 P1） ============
 
@@ -10,7 +14,7 @@ def do_capture(content: str, user_id: str, source: str = "飞书 /insight") -> t
 
     Returns: (success, filepath_or_error, filename)
     """
-    vault_path = Path.home() / "KarpathyVault" / "_raw"
+    vault_path = Path.home() / "Documents" / "KarpathyVault" / "_raw"
     vault_path.mkdir(parents=True, exist_ok=True)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -123,7 +127,8 @@ def do_knowledge_query(query: str, user_id: str, message_id: str, ctx, deep: boo
     ctx.reply_message(message_id, "🔍 正在检索知识库...")
 
     from core.rag_client import get_rag_client
-    context = get_rag_client().get_context(query, top_k=10 if deep else 5)
+    # 2026-08-13: 单次 HTTP 同时拿回拼接上下文与原始 results（问答沉淀用）
+    context, results = get_rag_client().context_with_sources(query, top_k=10 if deep else 5)
 
     if not context:
         ctx.reply_message(message_id, "💡 知识库中未找到相关直接内容，知微将尝试根据通用知识回答。")
@@ -137,12 +142,63 @@ def do_knowledge_query(query: str, user_id: str, message_id: str, ctx, deep: boo
     # （deep=True 为用户主动触发的交互式深度分析，属交互式场景，用 Coding Plan 合规）。
     # 此前曾切 token_plan(preview)、又切 LongCat-2.0，现均不挂；
     # llm.py 里 longcat/token_plan 显式通道保留，待用户重新决定 LongCat 用法。
-    response = llm_client.call_by_task_with_session("context_qa", prompt, f"ask-{user_id}")
+    # ⭐ 2026-08-14: deep 档升级 extreme 任务（research 角色，prefer_api=token_plan →
+    # qwen3.8-max，补测输出 2850字/9.3条洞察是 kimi 的 2 倍；失败自动落 auto 链 kimi-k2.5）。
+    # 合规：用户主动点“深入分析”属交互式单次触发，符合 Token Plan 条款。
+    # 成本：~3-5次/天 × ~10 Credits ≈ 250/周，占 Standard 10000/周 的 2.5%。
+    # 回滚：task 名改回 "deep_analysis" 一行。
+    if deep:
+        ctx.reply_message(message_id, "📚 检索完成，深度分析中（约 30-90 秒）...")
+    task = "extreme" if deep else "context_qa"
+    response = llm_client.call_by_task_with_session(task, prompt, f"ask-{user_id}")
     ctx.reply_message(message_id, response)
 
     # ⭐ F4: 若检索命中图表 chunk，额外回传原图（失败不影响上方回答）
     _send_matched_figures(query, message_id, ctx, top_k=10 if deep else 5)
+
+    # ⭐ 2026-08-13: 问答沉淀一期（失败静默，不影响回答）
+    _maybe_append_qa(query, response, results, deep=deep)
     return True
+
+
+# ============ 问答沉淀（2026-08-13 一期） ============
+
+_QA_APPEND_LOCK = threading.Lock()  # qa_appender 读-改-写无锁，调用侧加锁防并发丢条目
+_MAX_ANSWER_CHARS = 1200            # 沉淀答案截断上限
+
+
+def _maybe_append_qa(query: str, answer: str, results: list, deep: bool = False):
+    """把 RAG 命中的问答追加进 top-1 来源笔记的「## 问答参考」区（后台线程）
+
+    一期保守规则：仅浅档（深度研究报告进笔记问答区噪音大）；仅当 top-1
+    来源为 .md 且文件存在；任何失败静默跳过，不影响已回答内容。
+    """
+    try:
+        if deep or not results or not answer or str(answer).startswith("❌"):
+            return
+        top_source = (results[0] or {}).get("source", "")
+        if not top_source.endswith(".md"):
+            return
+        note_path = Path(top_source)
+        if not note_path.exists():
+            return
+        answer_trim = answer[:_MAX_ANSWER_CHARS]
+        threading.Thread(
+            target=_append_qa_worker,
+            args=(note_path, query, answer_trim),
+            daemon=True,
+        ).start()
+    except Exception as e:
+        logger.warning(f"问答沉淀跳过: {e}")
+
+
+def _append_qa_worker(note_path, query, answer):
+    try:
+        from qa_appender import append_qa
+        with _QA_APPEND_LOCK:
+            append_qa(str(note_path), query, answer, source="feishu-chat")
+    except Exception as e:
+        logger.warning(f"问答沉淀失败（不影响回答）: {e}")
 
 
 # ============ 斜杠命令（行为不变，委托共享函数） ============
