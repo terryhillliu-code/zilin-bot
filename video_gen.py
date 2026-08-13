@@ -124,15 +124,39 @@ def handle_video_gen_request(request_text: str, user_id: str, message_id: str, c
     _make_draft_and_send(request_text, user_id, message_id, ctx)
 
 
+_CONFIRM_WORDS = {"确认", "确认生成", "确定", "好", "好的", "可以", "开始", "ok", "yes", "y"}
+_CANCEL_WORDS = {"取消", "算了", "不要了", "no", "n"}
+
+
 def consume_user_input(text: str, user_id: str, message_id: str, ctx) -> bool:
-    """pending awaiting_input 时消费用户补充。返回 True=已消费"""
+    """pending 状态消费（与卡片按钮双通道，防按钮回调失联）。返回 True=已消费
+
+    awaiting_input：用户补充内容 → 合并出草稿
+    awaiting_confirm：确认词→执行；取消词→取消；其他文本→视为修改意见合并重出草稿
+    """
     rec = _get_pending(user_id)
-    if not rec or rec.get("stage") != "awaiting_input":
+    if not rec:
         return False
-    prev = rec.get("request", "")
-    merged = text if len(_strip_trigger(prev)) < 6 else f"{prev}；{text}"
-    _make_draft_and_send(merged, user_id, message_id, ctx)
-    return True
+    stage = rec.get("stage")
+    low = text.strip().lower()
+    if stage == "awaiting_confirm":
+        if low in _CONFIRM_WORDS:
+            action_confirm(user_id, message_id, ctx)
+            return True
+        if low in _CANCEL_WORDS:
+            action_cancel(user_id, message_id, ctx)
+            return True
+        # 其他文本 → 视为修改意见：合并进原需求重新扩写
+        prev_req = rec.get("request", "")
+        merged = f"{prev_req}；修改意见：{text}"
+        _make_draft_and_send(merged, user_id, message_id, ctx)
+        return True
+    if stage == "awaiting_input":
+        prev = rec.get("request", "")
+        merged = text if len(_strip_trigger(prev)) < 6 else f"{prev}；{text}"
+        _make_draft_and_send(merged, user_id, message_id, ctx)
+        return True
+    return False
 
 
 # ========== 草稿生成 ==========

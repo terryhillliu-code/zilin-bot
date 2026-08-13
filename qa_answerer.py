@@ -35,7 +35,7 @@ def build_answer(note_text: str, question: str, title: str) -> str:
         "3. 笔记中没有的信息要明确说明「笔记未覆盖」，不要编造；\n"
         "4. 控制在 500 字以内。"
     )
-    # deep_analysis auto 链（Coding Plan 包月主力 kimi-k2.5 → 火山包月 → deepseek-v4-pro 兜底）
+    # deep_analysis auto 链（Coding Plan 包月主力 kimi-k2.5 → deepseek-v4-pro 兜底；火山包月已退役 2026-08-12）
     # 用户主动交互场景；with_session 变体直接返回字符串（失败以 ❌ 开头）
     client = LLMClient()
     answer = client.call_by_task_with_session(

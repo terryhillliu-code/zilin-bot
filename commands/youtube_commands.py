@@ -19,10 +19,11 @@ from .podcast_commands import _load_config, _save_config, _backup_config
 
 YT_FEED_TEMPLATE = "https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
 
-# v71.1: 本机直连 youtube.com 不通，走阿里云日本 VM 隧道(com.zhiwei.jp-tunnel)
+# v71.1: 本机直连 youtube.com 不通，走出海代理；2026-08-12 P1 收敛后原阿里云
+# 日本 VM 隧道(com.zhiwei.jp-tunnel, 18081)已退役，改走 hysteria2 出海出口 18090
 # socks5h: DNS 交给代理端解析
 import os
-_PROXY = os.getenv("ZHIWEI_VIDEO_PROXY", "socks5://127.0.0.1:18081").replace("socks5://", "socks5h://", 1)
+_PROXY = os.getenv("ZHIWEI_VIDEO_PROXY", "socks5h://127.0.0.1:18090").replace("socks5://", "socks5h://", 1)
 _PROXIES = {"http": _PROXY, "https": _PROXY}
 
 

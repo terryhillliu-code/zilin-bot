@@ -48,7 +48,7 @@ import task_journal
 from media_handler import (
     download_image, compress_image_base64, handle_image_async,
     extract_video_url, extract_article_url, is_article_url, is_video_url, summarize_url,
-    handle_video_async, process_video, process_pdf, process_audio_file,
+    handle_video_async, handle_article_async, process_video, process_pdf, process_audio_file,
     download_audio, transcribe_audio, handle_voice_task_async, handle_pdf_async,
     handle_audio_file_async
 )
@@ -208,7 +208,8 @@ init_command_handler(
     chat_history, pending_voice, pending_image, pending_review,
     MAX_HISTORY, RATE_LIMIT_SECONDS, user_last_request, memory_cache,
     get_chat_handler,  # V2-203: 新增 chat_handler
-    global_pending_video_confirm=pending_video_confirm  # 视频重复确认
+    global_pending_video_confirm=pending_video_confirm,  # 视频重复确认
+    handle_article_async=handle_article_async  # 2026-08-05 文章URL处理
 )
 
 # ========== 消息分发 ==========
@@ -442,6 +443,19 @@ def main():
             print(f"🔄 WebSocket 配置已锁定：ping={cli._ping_interval}s, 重连={cli._reconnect_interval}s, 重试=无限")
             _configure_logged[0] = True
     cli._configure = _patched_configure
+
+    # ⭐ 2026-08-05: 修复 lark SDK _connect 的 asyncio.Lock 泄漏（1.6.8/1.7.1 均有）
+    # 原代码: `await self._lock.acquire(); if self._conn is not None: return`
+    #         —— 提前 return 在 try 之外，finally 的 release() 不执行 → 锁永久持有。
+    # 后果链: 锁泄漏 → ping_loop(_write_message) 与重连(_connect) 全卡在等锁
+    #         → ping 发不出 → keepalive timeout → asyncio 事件循环死锁 → bot 静默收不到消息。
+    # 修法: 预判 _conn，已连接则直接返回(不触碰锁)，避开泄漏路径；未连接才走原逻辑。
+    _original_connect = cli._connect
+    async def _patched_connect():
+        if cli._conn is not None:
+            return
+        await _original_connect()
+    cli._connect = _patched_connect
 
     print("🤖 知微 v2.1 启动 (RAG 增强版)")
     print("   新增：知识库检索 (/ask 或 '查一下')")

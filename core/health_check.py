@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 """
-知微系统健康检查工具类 (v1.3.0 - 缓存增强版)
+知微系统健康检查工具类 (v1.4.0 - Docker 检查退役)
+
+Docker 检查于 2026-08-09 随 Docker.app 整体退役（AGENTS.md 登记），
+本模块不再探测容器状态，状态播报不再含容器段。
 """
 
 import subprocess
-import json
-import os
-from pathlib import Path
-from datetime import datetime
-import shutil
-
-# Docker 路径 (针对 Cron/Launchd 环境)
-DOCKER_BIN = "/usr/local/bin/docker"
-if not Path(DOCKER_BIN).exists():
-    DOCKER_BIN = shutil.which("docker") or "docker"
 
 def get_system_health_dict() -> dict:
     """获取系统健康状态字典"""
     status = {
         "services": {},
+        # Docker 2026-08-09 整体退役（AGENTS.md 登记），状态播报不再含容器段
         "docker": {}
     }
 
@@ -71,56 +65,6 @@ def get_system_health_dict() -> dict:
     except Exception as e:
         status["services"]["error"] = str(e)
 
-    # 2. 检查 Docker (优先使用缓存以规避 P0 级假死风险)
-    cache_path = Path.home() / ".cache" / "docker_status.json"
-    used_cache = False
-    
-    if cache_path.exists():
-        try:
-            with open(cache_path, "r") as f:
-                cache_data = json.load(f)
-            
-            # 校验缓存时效性 (120秒内视为有效)
-            updated_at_str = cache_data.get("updated_at", "")
-            if updated_at_str:
-                updated_at = datetime.fromisoformat(updated_at_str)
-                # 处理可能带时区的情况
-                now = datetime.now()
-                if updated_at.tzinfo:
-                    from datetime import timezone
-                    now = datetime.now(timezone.utc)
-                
-                if (now - updated_at).total_seconds() < 120:
-                    for name, info in cache_data.get("containers", {}).items():
-                        # 转换格式以匹配原有输出：Up 10m (healthy)
-                        status_str = f"{info.get('status', 'unknown')}"
-                        if info.get('health') and info.get('health') != "N/A":
-                            status_str += f" ({info.get('health')})"
-                        if info.get('uptime') and info.get('uptime') != "N/A":
-                            status_str = f"Up {info.get('uptime')} / {status_str}"
-                        
-                        status["docker"][name] = status_str
-                    status["docker_checked_at"] = updated_at_str
-                    used_cache = True
-        except Exception:
-            pass
-
-    if not used_cache:
-        try:
-            # 只有在缓存失效时才尝试直接查询，且严格限制 2s 超时
-            result = subprocess.run(
-                [DOCKER_BIN, "ps", "--format", "{{.Names}}\t{{.Status}}"],
-                capture_output=True, text=True, timeout=2,
-                env={**os.environ, "DOCKER_API_VERSION": "1.41"}
-            )
-            if result.returncode == 0:
-                for line in result.stdout.strip().split("\n"):
-                    if line:
-                        parts = line.split("\t")
-                        if len(parts) >= 2: status["docker"][parts[0]] = parts[1]
-        except Exception as e:
-            status["docker"]["error"] = f"Timeout or Error (>2s 断路保护): {str(e)}"
-
     return status
 
 def format_health_status(status: dict) -> str:
@@ -134,26 +78,7 @@ def format_health_status(status: dict) -> str:
         s = info.get("status", "unknown")
         emoji = "✅" if s in ["healthy", "running"] else "⚠️" if s == "degraded" else "❌"
         lines.append(f"  • {emoji} {name.replace('com.zhiwei.', '')}: {s}")
-    
-    # Docker
-    docker = status.get("docker", {})
-    if docker and "error" not in docker:
-        checked_at = status.get("docker_checked_at", "实时")
-        if "T" in checked_at:
-            checked_at = checked_at.split("T")[1][:5] # 提取时间部分 HH:MM
-        
-        lines.append(f"\n**容器状态 ({checked_at}):**")
-        for name, s in docker.items():
-            if "disabled" in s:
-                emoji = "⏸️"
-            elif "Up" in s or "running" in s:
-                emoji = "✅"
-            else:
-                emoji = "❌"
-            lines.append(f"  • {emoji} {name}: {s}")
-    elif "error" in docker:
-        lines.append(f"\n⚠️ **Docker 检查失败**: {docker['error']}")
-        
+
     return "\n".join(lines)
 
 if __name__ == "__main__":

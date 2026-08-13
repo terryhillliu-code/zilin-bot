@@ -2,7 +2,7 @@
 """媒体链路 cookies/隧道健康检查 (v71.3, 2026-07-31)
 
 检查项:
-1. jp-tunnel SOCKS5 隧道可用性(YouTube 可达)
+1. hysteria2 出海出口(socks5h://127.0.0.1:18090)可用性(YouTube 可达)
 2. VM POT 服务(bgutil, 经隧道 14416)
 3. YouTube cookies 功能探测(yt-dlp 实际取标题, 最可靠)
 4. YouTube 关键 cookie 剩余寿命(__Secure-1PSIDTS ~2周轮换, 提前预警)
@@ -18,8 +18,8 @@ import sys
 import time
 from pathlib import Path
 
-PROXY = "socks5://127.0.0.1:18081"
-PROXY_H = "socks5h://127.0.0.1:18081"
+PROXY = "socks5h://127.0.0.1:18090"
+PROXY_H = "socks5h://127.0.0.1:18090"
 POT_URL = "http://127.0.0.1:14416/ping"
 YT_COOKIES = Path.home() / "zhiwei-bot" / "secrets" / "youtube_cookies.txt"
 DY_COOKIES = Path.home() / "zhiwei-bot" / "secrets" / "douyin_cookies.txt"
@@ -31,7 +31,7 @@ PROBE_URL = "https://www.youtube.com/watch?v=LIPzl4OnlTo"
 
 # ⭐ 2026-08-09: 加 --proxy——本机直连 youtube.com 不通, 此前自愈命令
 # 必超时失败(叠加缺 import os, 自愈从未真正生效过)。socks5h = DNS 也走代理。
-_YT_REFRESH_PROXY = os.getenv("ZHIWEI_VIDEO_PROXY", "socks5://127.0.0.1:18081")
+_YT_REFRESH_PROXY = os.getenv("ZHIWEI_VIDEO_PROXY", "socks5h://127.0.0.1:18090")
 _YT_REFRESH_PROXY = _YT_REFRESH_PROXY.replace("socks5://", "socks5h://", 1)
 # ⭐ 2026-08-09: 登录态在 Profile 1(Default 从未登录), 必须指定配置文件,
 # 否则永远导出空会话(自愈第三处 bug)
@@ -176,7 +176,7 @@ def main():
 
     advice = []
     if not checks["tunnel"]["ok"]:
-        advice.append("隧道异常: launchctl kickstart -k gui/$(id -u)/com.zhiwei.jp-tunnel")
+        advice.append("出海出口异常(hysteria2 18090): launchctl kickstart -k gui/$(id -u)/com.zhiwei.jp-hysteria")
     if not checks["pot_server"]["ok"]:
         advice.append("POT 服务异常: ssh root@47.79.87.32 'systemctl restart bgutil-pot'")
     if not checks["youtube_cookies"]["ok"] or not checks["youtube_cookie_lifetime"]["ok"]:

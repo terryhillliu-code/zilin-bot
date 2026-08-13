@@ -2,8 +2,9 @@
 """
 ASR 服务健康检查
 
-检查项目（v3.3 重排: mimo-asr 为主用引擎）：
-1. mimo-asr 云端可用性(小米 MiMo, 当前主用)
+检查项目（mimo 为 ASR_PREFERRED_ENGINE 控制的首选引擎，受每日预算闸门保护；
+飞书语音链始终 mimo 首选）：
+1. mimo-asr 云端可用性(小米 MiMo, 当前配置首选)
 2. 本地 MLX Whisper 可用性(兜底)
 3. DashScope ASR 可用性(已退居次要, key 可能 401)
 4. API Key 配置状态
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 def check_mimo_asr() -> dict:
-    """检查 mimo-asr 云端可用性(v3.3 主用引擎)
+    """检查 mimo-asr 云端可用性(ASR_PREFERRED_ENGINE 控制的首选引擎)
 
     实测探测: 用系统自带短音频转 16k 单声道 wav, 真调一次 mimo-asr。
     比单测连通性更可靠——能真拿到转写才算健康。
@@ -192,7 +193,7 @@ def run_health_check(json_output: bool = False) -> dict:
         "checks": []
     }
 
-    # 1. mimo-asr 云端(主用引擎)
+    # 1. mimo-asr 云端（ASR_PREFERRED_ENGINE 控制的首选引擎）
     results["checks"].append(check_mimo_asr())
 
     # 2. DashScope ASR(已退居次要)
@@ -204,7 +205,7 @@ def run_health_check(json_output: bool = False) -> dict:
     # 4. API Keys
     results["checks"].append(check_api_keys())
 
-    # 汇总状态: mimo-asr 或本地 Whisper 可用即健康(主链路+兜底)
+    # 汇总状态: mimo-asr 或本地 Whisper 任一可用即健康(首选与兜底任一在线)
     # DashScope 已退居次要, 不影响健康判定
     asr_available = any(
         c.get("available") for c in results["checks"]

@@ -559,6 +559,25 @@ def _build_video_digest(output_path: str, title: str, kind: str = "视频") -> s
     return "\n\n".join(parts)
 
 
+def _log_distiller_failure(url: str, error_type: str, stderr_tail: str = "", stdout_tail: str = "") -> None:
+    """⭐ 2026-08-13: Distiller 失败现场留痕(JSONL 追加; 写文件失败不影响主流程)"""
+    try:
+        import json as _json
+        from datetime import datetime as _dt
+        _fail_log = Path.home() / "logs" / "distiller_failures.jsonl"
+        _fail_log.parent.mkdir(parents=True, exist_ok=True)
+        with open(_fail_log, "a", encoding="utf-8") as _f:
+            _f.write(_json.dumps({
+                "ts": _dt.now().isoformat(timespec="seconds"),
+                "url": url,
+                "error_type": error_type,
+                "stderr_tail": (stderr_tail or "")[-2000:],
+                "stdout_tail": (stdout_tail or "")[-2000:],
+            }, ensure_ascii=False) + "\n")
+    except Exception as _log_e:
+        logger.warning(f"distiller_failures.jsonl 留痕失败: {_log_e}")
+
+
 def process_video(text: str, message_id: str = None, user_id: str = None, instruction: str = None) -> str:
     """处理视频分析 - 调用宿主机 Distiller
 
@@ -618,13 +637,13 @@ def process_video(text: str, message_id: str = None, user_id: str = None, instru
             # ⭐ 2026-08-09 反转: 本机 Chrome 会话已失效(无法自动导出有效登录态),
             # 改回用 cookies 文件(用户浏览器扩展导出+yt_cookies_import 维护, 实测
             # 通过 bot 检测); 08-02 曾因此文件被吊销改读 Chrome, 现 Chrome 亦死。
-            # 网络出口由 distiller 内部自动走日本 VM 的 SOCKS5 隔离(平台感知)。
+            # 网络出口由 distiller 内部自动走 hysteria2 出海出口 socks5h://127.0.0.1:18090(平台感知)。
             cmd.extend(["--cookies", os.path.expanduser("~/zhiwei-bot/secrets/youtube_cookies.txt")])
         elif any(d in url for d in ("xiaohongshu.com", "xhslink.com", "kuaishou.com",
                                     "weibo.com", "weibo.cn", "tiktok.com",
                                     "x.com", "twitter.com")):
             # ⭐ 2026-08-08 P4: 新增平台统一 Chrome 登录态（小红书/快手/微博反爬需登录态；
-            # TikTok/X 由 distiller 平台感知自动走日本隧道）
+            # TikTok/X 由 distiller 平台感知自动走 hysteria2 出海出口 18090）
             cmd.extend(["--cookies-from-browser", "chrome"])
         # 其余平台：不带 cookies（避免无谓加载抖音 cookies 而在日志里产生 "cookie" 字样干扰错误归类）
 
@@ -659,6 +678,32 @@ def process_video(text: str, message_id: str = None, user_id: str = None, instru
         except Exception as _e:
             logger.warning(f"Distiller 依赖预检查异常，降级继续执行: {_e}")
 
+        # ⭐ 2026-08-13: 海外平台代理预探活——端口未监听时快速失败,
+        # 避免 distiller 在下游卡到超时才报错(与 distiller 同源: ZHIWEI_VIDEO_PROXY)
+        # hostname 后缀匹配(非全子串), 防 fox.com/max.com 等误中 x.com
+        from urllib.parse import urlparse
+        _overseas_host = (urlparse(url).hostname or "").lower()
+        if any(_overseas_host == d or _overseas_host.endswith("." + d)
+               for d in ("youtube.com", "youtu.be", "tiktok.com", "x.com", "twitter.com")):
+            import socket
+            _proxy_url = os.getenv("ZHIWEI_VIDEO_PROXY", "socks5h://127.0.0.1:18090")
+            _pu = urlparse(_proxy_url)
+            # 畸形代理 URL(无 scheme/空串 → hostname 为空): warning 后跳过探活放行, 不误杀
+            if not _pu.hostname:
+                logger.warning(f"ZHIWEI_VIDEO_PROXY 格式异常, 跳过预探活: {_proxy_url!r}")
+            else:
+                try:
+                    with socket.create_connection((_pu.hostname, _pu.port or 1080), timeout=2):
+                        pass
+                except (OSError, ValueError) as _pe:
+                    logger.error(f"出海代理端口未监听: {_pu.hostname}:{_pu.port} ({_pe})")
+                    _log_distiller_failure(url, "proxy_unavailable",
+                                           f"出海代理端口未监听: {_pu.hostname}:{_pu.port} ({_pe})")
+                    if video_history:
+                        video_history.record_failed(url, "network_error",
+                                                    f"出海代理端口未监听: {_pu.hostname}:{_pu.port}")
+                    return "❌ 出海代理端口未监听，请联系管理员"
+
         try:
             # ⭐ v3.0: vision 模式含视频下载+抽帧+逐帧 VLM,耗时更长
             # ⭐ 2026-08-08 P5: 240 分钟长视频放宽超时
@@ -673,11 +718,17 @@ def process_video(text: str, message_id: str = None, user_id: str = None, instru
                 logger.error(f"Distiller timeout - stdout (last 2000 chars):\n{e.stdout[-2000:]}")
             if e.stderr:
                 logger.error(f"Distiller timeout - stderr (last 2000 chars):\n{e.stderr[-2000:]}")
+            _log_distiller_failure(url, "timeout",
+                                   (e.stderr or "") if isinstance(e.stderr, str) else "",
+                                   (e.stdout or "") if isinstance(e.stdout, str) else "")
             raise
 
         if result.returncode != 0:
             # 解析错误信息
             error_type, error_message = _parse_distiller_error(result.stderr)
+
+            # ⭐ 2026-08-13: 失败现场留痕(JSONL 追加; 写文件失败不影响主流程)
+            _log_distiller_failure(url, error_type, result.stderr, result.stdout)
 
             # 记录失败
             if video_history:
@@ -702,6 +753,12 @@ def process_video(text: str, message_id: str = None, user_id: str = None, instru
             friendly_msg = {
                 "timeout": "❌ 视频分析超时（超过 15 分钟），请检查链接是否有效",
                 "network_error": "❌ 视频下载失败（网络错误），请检查链接是否有效后重试",
+                "cookie_expired": "❌ 平台登录态（cookies）已过期，请联系管理员更新后重试",
+                "video_not_found": "❌ 视频不存在或已被删除，请检查链接是否有效",
+                "video_private": "❌ 视频为私密状态，无法访问，请检查链接或权限",
+                "asr_failed": "❌ 视频语音转写失败（可能网络或识别异常），请稍后重试",
+                "llm_failed": "❌ 视频内容分析（LLM）失败，请稍后重试",
+                "api_error": "❌ 上游接口报错（服务暂时不可用），请稍后重试",
                 "module_error": "❌ 视频分析模块异常，请联系管理员",
                 "unknown": "❌ 视频处理失败（内部错误），已记录日志",
             }.get(error_type, "❌ 视频处理失败，请稍后重试")
@@ -748,6 +805,7 @@ def process_video(text: str, message_id: str = None, user_id: str = None, instru
         # ⭐ 2026-08-05: 原文案硬编码「10分钟」，与实际超时不符（普通 900s / vision 1800s），
         # 用户看到的分钟数一直是错的。改为按 vision_mode 取真实值。
         error_message = f"视频分析超时（{30 if vision_mode else 15} 分钟）"
+        _log_distiller_failure(url, "timeout", stderr_tail=error_message)
         if video_history and url:
             video_history.record_failed(url, error_type, error_message)
             from video_history import VideoErrorType
@@ -756,6 +814,7 @@ def process_video(text: str, message_id: str = None, user_id: str = None, instru
 
     except Exception as e:
         # 记录失败（未知错误）
+        _log_distiller_failure(url, "exception", stderr_tail=f"{type(e).__name__}: {e}")
         if video_history and url:
             video_history.record_failed(url, "unknown", str(e))
         logger.error(f"视频处理异常: {e}")
@@ -790,7 +849,8 @@ def _parse_distiller_error(stderr: str) -> tuple[str, str]:
 
     if any(kw in stderr_lower for kw in ["cookie", "登录过期", "请先登录"]):
         return "cookie_expired", stderr[:500]
-    elif any(kw in stderr_lower for kw in ["network", "connection", "timeout"]):
+    elif any(kw in stderr_lower for kw in ["network", "connection", "timeout", "refused",
+                                            "proxy connection failed", "cannot connect to proxy"]):
         return "network_error", stderr[:500]
     elif any(kw in stderr_lower for kw in ["404", "not found", "不存在"]):
         return "video_not_found", stderr[:500]

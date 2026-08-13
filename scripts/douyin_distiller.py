@@ -264,7 +264,10 @@ class AppConfig:
 
         # ⭐ v3.3 (2026-07-31): mimo-asr 云端语音识别(小米 MiMo)
         # 背景: 原云端 ASR 走 DashScope, 但 DASHSCOPE_API_KEY 已 401 失效;
-        # mimo-asr 实测 4.7s/60s 音频、中英混合准确, 作为云端首选。
+        # mimo-asr 实测 4.7s/60s 音频、中英混合准确。首选引擎由
+        # ASR_PREFERRED_ENGINE 决定——代码默认 local(未设置时), 如需 mimo
+        # 首选须显式设置该环境变量(当前 ~/.secrets/global.env 设为 mimo)。
+        # mimo 链路受每日预算闸门保护。
         # OpenAI 兼容协议, chat/completions + input_audio(base64)。
         self.mimo_api_key = os.getenv("MIMO_API_KEY", "")
         self.mimo_api_base = os.getenv("MIMO_API_BASE", "https://token-plan-cn.xiaomimimo.com").rstrip("/")
@@ -281,9 +284,10 @@ class AppConfig:
         self.assets_dir = self.output_dir / "Assets"
 
         # ⭐ v3.1 (2026-07-31): 海外平台代理与 cookies
-        # 本机直连 youtube.com DNS 不通; 靠阿里云日本 VM 的 SSH SOCKS5 隔离中转。
+        # 本机直连 youtube.com DNS 不通; 靠 hysteria2 出海出口(socks5h://127.0.0.1:18090)。
+        # 2026-08-12 P1 收敛后原阿里云日本 VM SSH SOCKS5 中转(18081)已退役, 海外流量全走 18090。
         # 平台感知: 仅海外站点走代理, 抖音/B站直连(走代理反而慢且可能触发风控)。
-        self.overseas_proxy = os.getenv("ZHIWEI_VIDEO_PROXY", "socks5://127.0.0.1:18081")
+        self.overseas_proxy = os.getenv("ZHIWEI_VIDEO_PROXY", "socks5h://127.0.0.1:18090")
         self.youtube_cookies = os.getenv(
             "YOUTUBE_COOKIES_FILE",
             str(Path.home() / "zhiwei-bot" / "secrets" / "youtube_cookies.txt"))
@@ -753,12 +757,13 @@ class MediaExtractor:
     def _net_opts(self, platform: str) -> dict:
         """构造平台感知的 yt-dlp 网络选项(代理 + cookies)
 
-        v3.1: 海外平台走 SOCKS5(日本 VM 隔离); YouTube 优先用专属 cookies 文件。
+        v3.1: 海外平台走 SOCKS5(hysteria2 出海出口); YouTube 优先用专属 cookies 文件。
         v3.2: YouTube 音视频流解锁三件套——
           1. POT: VM 上 bgutil provider(systemd bgutil-pot, 经隧道 14416→4416)生成
              Proof-of-Origin Token, 绕过"Sign in to confirm you're not a bot"风控。
-             POT 必须与下载出口同 IP 生成, 故跑在 VM 侧(VM 本地 microsocks:18081
-             镜像本机隧道端口, 使 yt-dlp 透传的 --proxy 参数在两端都可解析)。
+             POT 必须与下载出口同 IP 生成, 故跑在 VM 侧。(历史: VM 本地曾有
+             microsocks:18081 镜像 jp-tunnel 隧道端口, 该链路 2026-08-12 已退役,
+             现出海统一走 hysteria2 socks5h://127.0.0.1:18090)
           2. EJS: 允许从 GitHub 拉 n-challenge 求解脚本(缺它拿不到可用 format URL)。
           3. cookies: 登录态过 bot 检测。
         """
@@ -2512,7 +2517,7 @@ class TranscriptProvider:
             config.dashscope_api_key,
             config.asr_model
         )
-        # v3.3: mimo-asr 云端首选(DashScope 已 401 失效)
+        # v3.3: mimo-asr 云端 ASR(DashScope 已 401 失效); 首选/兜底顺序由 ASR_PREFERRED_ENGINE 决定
         self.mimo_transcriber = MimoASRTranscriber(
             getattr(config, "mimo_api_key", ""),
             getattr(config, "mimo_api_base", ""),
@@ -2639,43 +2644,63 @@ class TranscriptProvider:
             # 确保使用带后缀的路径进行识别 (MediaExtractor.extract_audio 会自动补全 .mp3)
             actual_audio_path = audio_path.with_suffix(".mp3")
 
-            # 策略(2026-08-03 统一): 本地 MLX 首选(免费,medium 模型已预拉) → mimo 云端兜底(受预算闸门)
-            # 此前 v3.4 是 mimo 优先,理由"MLX 首次依赖 HF 下载"已因 medium 模型经隧道预拉而过时。
+            # 策略: 首选引擎由 ASR_PREFERRED_ENGINE 决定——代码默认 local(未设置时),
+            # 当前 ~/.secrets/global.env 显式设为 mimo；预算闸门兜底不变。
+            # 历史背景：2026-08-03 曾统一为本地 MLX 首选(免费,medium 模型已预拉) → mimo 云端兜底；
+            # 2026-08-11 经用户批准恢复 mimo 首选（默认 local 与原行为逐行等价）。
             # 与播客链路 transcribe_audio.py 对齐,两条链路共用 zhiwei_common.asr_budget 账本。
             transcript_result = None
+            preferred = os.getenv("ASR_PREFERRED_ENGINE", "local").strip().lower()
+            if preferred not in ("", "local", "mimo"):
+                logger.warning(f"未知 ASR_PREFERRED_ENGINE={preferred}, 回退默认 local")
+                preferred = "local"
 
-            # 1. 本地 MLX Whisper 首选(免费)
-            if self.local_transcriber.is_available():
-                logger.info("尝试本地 MLX Whisper ASR(首选)...")
-                try:
-                    transcript_result = self.local_transcriber.transcribe(actual_audio_path)
-                    if transcript_result and transcript_result.full_text:
-                        logger.info(f"本地 MLX 成功: {len(transcript_result.full_text)} 字符")
-                        return transcript_result
-                    logger.warning("本地 MLX 返回空, 降级 mimo 云端")
-                except Exception as e:
-                    logger.warning(f"本地 MLX 失败: {e}, 降级 mimo 云端")
+            def _try_local_mlx() -> Optional[TranscriptResult]:
+                # 本地 MLX Whisper(免费)
+                if self.local_transcriber.is_available():
+                    logger.info("尝试本地 MLX Whisper ASR...")
+                    try:
+                        result = self.local_transcriber.transcribe(actual_audio_path)
+                        if result and result.full_text:
+                            logger.info(f"本地 MLX 成功: {len(result.full_text)} 字符")
+                            return result
+                        logger.warning("本地 MLX 返回空, 降级下一引擎")
+                    except Exception as e:
+                        logger.warning(f"本地 MLX 失败: {e}, 降级下一引擎")
+                else:
+                    logger.info("本地 MLX Whisper 不可用(模型未拉取?), 跳过")
+                return None
 
-            # 2. mimo 云端兜底(受每日预算闸门保护)
-            if self.mimo_transcriber.is_available():
-                try:
-                    from zhiwei_common import asr_budget
-                    est = asr_budget.estimate_minutes(actual_audio_path)
-                    if not asr_budget.budget_ok(est):
-                        logger.warning(
-                            f"mimo 日预算不足(已用{asr_budget.used_today():.0f}+{est:.0f}min), 跳过云端")
-                    else:
-                        logger.info("降级 mimo-asr 云端 ASR...")
-                        transcript_result = self.mimo_transcriber.transcribe(actual_audio_path)
-                        if transcript_result and transcript_result.full_text:
-                            asr_budget.budget_record(est)
-                            logger.info(f"mimo-asr 成功: {len(transcript_result.full_text)} 字符")
-                            return transcript_result
-                        logger.warning("mimo-asr 返回空结果")
-                except Exception as e:
-                    logger.error(f"mimo-asr 也失败: {e}")
+            def _try_mimo() -> Optional[TranscriptResult]:
+                # mimo 云端(受每日预算闸门保护)
+                if self.mimo_transcriber.is_available():
+                    try:
+                        from zhiwei_common import asr_budget
+                        est = asr_budget.estimate_minutes(actual_audio_path)
+                        if not asr_budget.budget_ok(est):
+                            logger.warning(
+                                f"mimo 日预算不足(已用{asr_budget.used_today():.0f}+{est:.0f}min), 跳过云端")
+                        else:
+                            logger.info("尝试 mimo-asr 云端 ASR...")
+                            result = self.mimo_transcriber.transcribe(actual_audio_path)
+                            if result and result.full_text:
+                                asr_budget.budget_record(est)
+                                logger.info(f"mimo-asr 成功: {len(result.full_text)} 字符")
+                                return result
+                            logger.warning("mimo-asr 返回空结果")
+                    except Exception as e:
+                        logger.error(f"mimo-asr 失败: {e}")
+                else:
+                    logger.info("mimo-asr 不可用(API key 未配置?), 跳过")
+                return None
 
-            # 3. 无可用服务
+            engine_chain = [_try_mimo, _try_local_mlx] if preferred == "mimo" else [_try_local_mlx, _try_mimo]
+            for attempt in engine_chain:
+                transcript_result = attempt()
+                if transcript_result:
+                    return transcript_result
+
+            # 无可用服务
             logger.error("No ASR service available (云端和本地都失败)")
             return TranscriptResult()
 
