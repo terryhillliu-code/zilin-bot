@@ -9,6 +9,7 @@ import tempfile
 import base64
 import threading
 import subprocess
+import shutil
 import logging
 import sys
 from pathlib import Path
@@ -181,6 +182,42 @@ def handle_image_async(message_id: str, image_key: str, user_id: str):
 
 # ========== 视频链接 ==========
 
+
+def _extract_douyin_share_id(text: str) -> str | None:
+    """从抖音 App 分享文本中提取视频 ID 编码（无 URL 时的降级策略）
+
+    抖音 App 新版分享格式（2024 年起）：
+    '6.43 复制打开抖音，看看【...】 06/30 vFH:/'
+    末尾的 'vFH' 是视频 ID 编码，需要拼成短链 https://v.douyin.com/vFH/
+
+    前置条件：文本必须包含抖音特征词，避免误伤非抖音内容
+
+    返回：拼接后的 URL 字符串，或 None
+    """
+    # 前置条件：文本必须包含抖音特征词，避免误伤
+    if not any(kw in text for kw in ('复制打开抖音', '抖音', 'douyin')):
+        return None
+
+    # 提取末尾的 ID 编码（3-20 位字母数字下划线，可带 :/ 后缀）
+    # 例：'06/30 vFH:/' → 'vFH'
+    #      'abc123DEF:/' → 'abc123DEF'
+    m = re.search(r'\b([A-Za-z0-9_-]{3,20}):?/?\s*$', text.strip())
+    if not m:
+        return None
+
+    candidate = m.group(1)
+
+    # 过滤明显误匹配的 ID（如纯数字、常见英文单词）
+    if candidate.isdigit():
+        return None
+    # 过滤过短的 ID（抖音 ID 编码通常 >= 3 位）
+    if len(candidate) < 3:
+        return None
+
+    # 拼接为抖音短链（下游 douyin_distiller 会解析）
+    return f'https://v.douyin.com/{candidate}/'
+
+
 def extract_video_url(text: str) -> str:
     """提取视频 URL
 
@@ -240,6 +277,10 @@ def extract_video_url(text: str) -> str:
             if _m:
                 url = f'https://www.douyin.com/video/{_m.group(1)}'
             return url
+    # ⭐ 2026-08-17: 抖音分享文本无 URL 时，降级提取 ID 编码
+    fallback = _extract_douyin_share_id(text)
+    if fallback:
+        return fallback
     return None
 
 
@@ -293,24 +334,89 @@ def probe_generic_video_url(url: str) -> bool:
         return False
 
 
+def _fetch_via_jina_fallback(url: str, timeout: int = 45) -> tuple[bool, str]:
+    """Jina Reader 降级抓取（2026-08-13）：defuddle 失败后尝试。
+
+    r.jina.ai 是第三方网页转 Markdown 服务，可绕过部分站点反爬
+    （如 openai.com 对 defuddle 返回 403）。复用 zhiwei-rag 的
+    web_reader 模块（已内置 18082 SOCKS 桥探活与直连回退策略）。
+    返回 (success, 净化后正文)；Jina 元信息头部（Title/URL Source/
+    Markdown Content 行）会被剥离。
+    """
+    try:
+        import sys as _sys
+        _rag_root = os.path.expanduser("~/zhiwei-rag")
+        if _rag_root not in _sys.path:
+            _sys.path.insert(0, _rag_root)
+        from ingest.web_reader import get_web_markdown
+        content = get_web_markdown(url)
+        if not content or len(content.strip()) < 100:
+            logger.warning(f"⚠️ Jina 降级抓取空或过短: {url[:60]}")
+            return False, ""
+        # 剥离 Jina 元信息头部
+        lines = content.strip().splitlines()
+        body_start = 0
+        for i, ln in enumerate(lines):
+            if ln.startswith("Markdown Content"):
+                body_start = i + 1
+                break
+        body = "\n".join(lines[body_start:]).strip()
+        if len(body) < 100:
+            logger.warning(f"⚠️ Jina 正文过短: {url[:60]}")
+            return False, ""
+        # ⭐ 净化防护：登录页/拦截页常以图片为主（如飞书 applink 落地页），
+        # 剥离图片与链接语法后纯文字过短即判定无效
+        import re as _re_jina
+        _text_only = _re_jina.sub(r'!\[[^\]]*\]\([^)]*\)', '', body)
+        _text_only = _re_jina.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', _text_only)
+        if len(_text_only.strip()) < 200:
+            logger.warning(f"⚠️ Jina 内容以图片/链接为主或实质文字过少，判定无效: {url[:60]}")
+            return False, ""
+        logger.info(f"✅ Jina 降级抓取成功: {url[:50]} ({len(body)} 字符)")
+        return True, body
+    except Exception as e:
+        logger.warning(f"⚠️ Jina 降级抓取异常: {str(e)[:100]}")
+        return False, ""
+
+
 def fetch_url_content(url: str, timeout: int = 30) -> tuple[bool, str]:
     """
-    抓取 URL 内容，使用宿主机 defuddle
+    抓取 URL 内容，使用宿主机 defuddle；失败自动降级 Jina Reader
     返回: (success, content)
     """
     try:
+        # ⭐ 2026-08-19 修复: GUI 子进程 PATH 缺 /opt/homebrew/bin，裸命令名 subprocess 调用
+        # defuddle 会抛 FileNotFoundError 被误报「未安装」；改为解析绝对路径并显式补 PATH
+        defuddle_bin = shutil.which("defuddle")
+        if not defuddle_bin:
+            _brew_defuddle = "/opt/homebrew/bin/defuddle"
+            if os.path.isfile(_brew_defuddle):
+                defuddle_bin = _brew_defuddle
+        if not defuddle_bin:
+            logger.error("❌ defuddle 未安装，请运行: /opt/homebrew/bin/npm install -g defuddle")
+            return False, "❌ defuddle 未安装，请运行: /opt/homebrew/bin/npm install -g defuddle"
+        env = dict(os.environ)
+        env["PATH"] = "/opt/homebrew/bin:" + env.get("PATH", "")
         result = subprocess.run(
-            ["defuddle", "parse", url, "--md"],
+            [defuddle_bin, "parse", url, "--md"],
             capture_output=True,
             text=True,
-            timeout=timeout
+            timeout=timeout,
+            env=env
         )
         if result.returncode == 0 and result.stdout.strip():
             logger.info(f"✅ defuddle 抓取成功: {url[:50]}")
             return True, result.stdout.strip()
         else:
-            logger.error(f"❌ defuddle 抓取失败: {result.stderr[:200] if result.stderr else '无输出'}")
-            return False, f"❌ 网页抓取失败"
+            # ⭐ 2026-08-13 降级链：defuddle 失败 → Jina Reader 再试一次
+            if result.stderr:
+                logger.warning(f"⚠️ defuddle 抓取失败: {result.stderr[:200]}")
+            else:
+                logger.warning(f"⚠️ defuddle 抓取失败: 无输出 ({url[:80]})")
+            ok2, content2 = _fetch_via_jina_fallback(url)
+            if ok2:
+                return True, content2
+            return False, f"❌ 网页抓取失败（已尝试 defuddle 与 Jina Reader，均失败）: {url[:80]}"
     except subprocess.TimeoutExpired:
         logger.error(f"❌ defuddle 超时: {url[:50]}")
         return False, "❌ 网页抓取超时"
@@ -768,6 +874,19 @@ def process_video(text: str, message_id: str = None, user_id: str = None, instru
         # 解析输出
         output = result.stdout
         if "✅ Done!" in output:
+            # ⭐ 2026-08-16 P1-b: 部分成功留痕——distiller rc==0 但 vision 抽帧失败
+            # (如 YouTube 风控拦截视频流), stderr 含 error_type=vision_failed 标记
+            _vf_reason = _extract_vision_failed(result.stderr)
+            if _vf_reason:
+                _log_distiller_failure(url, "vision_failed", result.stderr, result.stdout)
+                logger.warning(f"Distiller 部分成功但 vision 失败: {_vf_reason[:200]}")
+                if video_history:
+                    try:
+                        from video_history import VideoErrorType
+                        video_history.send_alert(VideoErrorType.VISION_FAILED, url,
+                                                 _vf_reason[:300])
+                    except ValueError:
+                        pass  # 枚举未同步时静默, 不阻断主流程
             # 提取输出文件路径
             match = re.search(r'Output: (.+\.md)', output)
             if match:
@@ -819,6 +938,25 @@ def process_video(text: str, message_id: str = None, user_id: str = None, instru
             video_history.record_failed(url, "unknown", str(e))
         logger.error(f"视频处理异常: {e}")
         return f"❌ 视频处理异常: {str(e)}"
+
+
+def _extract_vision_failed(stderr: str) -> str:
+    """从 distiller stderr 提取 vision_failed 标记(部分成功场景: rc==0 但抽帧失败)。
+
+    Returns:
+        空串=无标记; 非空=失败原因文案。
+    """
+    import json as _json
+    for line in (stderr or "").strip().split("\n"):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                data = _json.loads(line)
+                if data.get("error_type") == "vision_failed":
+                    return data.get("error_message", "") or line[:300]
+            except _json.JSONDecodeError:
+                continue
+    return ""
 
 
 def _parse_distiller_error(stderr: str) -> tuple[str, str]:
