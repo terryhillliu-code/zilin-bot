@@ -15,6 +15,9 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import json
+import requests
+
 # 导入统一的 API Key 获取函数
 try:
     from zhiwei_common import get_api_key
@@ -379,6 +382,165 @@ def _fetch_via_jina_fallback(url: str, timeout: int = 45) -> tuple[bool, str]:
         return False, ""
 
 
+# ========== 小红书专用抓取（2026-08-19 新增） ==========
+# 背景：小红书笔记页为 SPA，HTML 内嵌 window.__INITIAL_STATE__ JSON
+# （含标题/正文/作者/互动数据）；defuddle 抓取报「无输出」、Jina 降级
+# 也判定无效，故新增专用解析器直接读取 __INITIAL_STATE__ 提取笔记内容。
+
+_XHS_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+           "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+           "Mobile/15E148 Safari/604.1")
+_XHS_DOMAINS = ("xhslink.cn", "xiaohongshu.com", "xhslink.com")
+
+
+def _extract_xhs_initial_state(html: str) -> dict | None:
+    """稳健提取 window.__INITIAL_STATE__ 的 JSON 对象（字符串感知括号平衡）。
+
+    小红书页面内嵌对象含 JS 字面量 undefined/NaN（严格 JSON 不允许），
+    直接 json.loads 会在首个 undefined 处失败（实测 char 2690 报错），
+    解析前统一替换为 null。失败返回 None。
+    """
+    try:
+        start = html.find("window.__INITIAL_STATE__")
+        if start < 0:
+            return None
+        eq = html.find("=", start)
+        open_brace = html.find("{", eq)
+        if open_brace < 0:
+            return None
+        depth = 0
+        in_str = False
+        esc = False
+        i = open_brace
+        n = len(html)
+        while i < n:
+            ch = html[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        json_text = html[open_brace:i + 1]
+                        # 修复 JS 字面量：undefined / NaN → null
+                        json_text = re.sub(r":\s*undefined\b", ":null", json_text)
+                        json_text = re.sub(r":\s*NaN\b", ":null", json_text)
+                        return json.loads(json_text)
+            i += 1
+        return None
+    except Exception:
+        return None
+
+
+def _find_xhs_note(data: dict) -> dict:
+    """从 __INITIAL_STATE__ 顶层对象定位笔记字典（多结构兼容）。
+
+    依次尝试：note.noteDetailMap[*].note（桌面端）→
+    noteData.data.noteData（移动端/分享页）→
+    noteData.normalNotePreloadData（分享预加载）。
+    """
+    if not isinstance(data, dict):
+        return {}
+    try:  # 1) note.noteDetailMap[noteId].note
+        nm = data.get("note", {})
+        if isinstance(nm, dict):
+            dm = nm.get("noteDetailMap")
+            if isinstance(dm, dict):
+                for v in dm.values():
+                    if isinstance(v, dict) and isinstance(v.get("note"), dict):
+                        return v["note"]
+    except Exception:
+        pass
+    try:  # 2) noteData.data.noteData
+        nd = data.get("noteData")
+        if isinstance(nd, dict):
+            inner = nd.get("data")
+            if isinstance(inner, dict) and isinstance(inner.get("noteData"), dict):
+                return inner["noteData"]
+    except Exception:
+        pass
+    try:  # 3) noteData.normalNotePreloadData
+        nd = data.get("noteData")
+        if isinstance(nd, dict) and isinstance(nd.get("normalNotePreloadData"), dict):
+            return nd["normalNotePreloadData"]
+    except Exception:
+        pass
+    return {}
+
+
+def _fetch_xiaohongshu(url: str, timeout: int = 20) -> tuple[bool, str]:
+    """小红书专用抓取（2026-08-19 新增）。
+
+    仅当 URL 命中小红书域名（xhslink.cn / xiaohongshu.com / xhslink.com）
+    时执行：requests 跟随短链重定向抓取笔记页，解析内嵌
+    window.__INITIAL_STATE__ JSON 提取标题/作者/正文/互动数据，
+    返回结构化 Markdown。非小红书 URL 或任何异常返回 (False, "")。
+    """
+    try:
+        if not any(d in url.lower() for d in _XHS_DOMAINS):
+            return False, ""
+        headers = {"User-Agent": _XHS_UA, "Accept-Language": "zh-CN,zh;q=0.9"}
+        resp = requests.get(url, allow_redirects=True, timeout=timeout, headers=headers)
+        if resp.status_code != 200:
+            logger.warning(f"⚠️ 小红书抓取 HTTP {resp.status_code}: {url[:60]}")
+            return False, ""
+        html = resp.text
+        # 校验落点确为小红书（短链重定向后应为 xiaohongshu.com）
+        final_url = (resp.url or "").lower()
+        if "xiaohongshu.com" not in final_url and "xiaohongshu.com" not in html:
+            logger.warning(f"⚠️ 小红书链接未指向小红书页面: {url[:60]} -> {final_url[:60]}")
+            return False, ""
+        data = _extract_xhs_initial_state(html)
+        if not data:
+            logger.warning(f"⚠️ 小红书页面无 __INITIAL_STATE__: {url[:60]}")
+            return False, ""
+        note = _find_xhs_note(data)
+        if not note:
+            logger.warning(f"⚠️ 小红书页面未找到笔记数据: {url[:60]}")
+            return False, ""
+        title = str(note.get("title") or "").strip()
+        desc = str(note.get("desc") or "").strip()
+        # 轻量清理正文：去行尾制表符/空格、折叠连续空行（json 转义后的 \n\t 残留）
+        desc = re.sub(r"[ \t]+\n", "\n", desc)
+        desc = re.sub(r"\n{3,}", "\n\n", desc)
+        if not desc:
+            return False, "❌ 小红书笔记无正文内容"
+        user = note.get("user") or {}
+        nickname = str(user.get("nickName") or user.get("nickname") or "").strip()
+        interact = note.get("interactInfo") or {}
+        liked = str(interact.get("likedCount") or "0")
+        collected = str(interact.get("collectedCount") or "0")
+        commented = str(interact.get("commentCount") or "0")
+        img_list = note.get("imageList")
+        img_count = len(img_list) if isinstance(img_list, list) else 0
+        lines = ["# " + (title or "小红书笔记")]
+        if nickname:
+            lines.append(f"作者：{nickname}")
+        lines.append("")
+        lines.append(desc)
+        lines.append("")
+        stats = f"👍 {liked} 赞 / ⭐ {collected} 收藏 / 💬 {commented} 评论"
+        if img_count:
+            stats += f"（{img_count} 图）"
+        lines.append(stats)
+        lines.append("")
+        lines.append(f"原文：{url}")
+        logger.info(f"✅ 小红书抓取成功: {url[:50]} 标题={title[:20]}")
+        return True, "\n".join(lines)
+    except Exception as e:
+        logger.warning(f"⚠️ 小红书抓取异常: {str(e)[:100]}")
+        return False, ""
+
+
 def fetch_url_content(url: str, timeout: int = 30) -> tuple[bool, str]:
     """
     抓取 URL 内容，使用宿主机 defuddle；失败自动降级 Jina Reader
@@ -416,6 +578,11 @@ def fetch_url_content(url: str, timeout: int = 30) -> tuple[bool, str]:
             ok2, content2 = _fetch_via_jina_fallback(url)
             if ok2:
                 return True, content2
+            # ⭐ 2026-08-19 新增：小红书 SPA 页面 defuddle/Jina 均无法提取，
+            # 改解析内嵌 window.__INITIAL_STATE__（_fetch_xiaohongshu 内部按域名分流）
+            ok3, content3 = _fetch_xiaohongshu(url)
+            if ok3:
+                return True, content3
             return False, f"❌ 网页抓取失败（已尝试 defuddle 与 Jina Reader，均失败）: {url[:80]}"
     except subprocess.TimeoutExpired:
         logger.error(f"❌ defuddle 超时: {url[:50]}")
